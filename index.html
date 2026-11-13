@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="TaskTok：发布企业线上任务，找到更合适的执行者，并从验收结果中持续优化推荐。"
+    />
+    <title>TaskTok · 企业线上任务平台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="site-header minimal-header">
+      <nav class="mode-switch" aria-label="主要导航">
+        <button type="button" class="mode-button is-active" data-view="home">首页</button>
+        <button type="button" class="mode-button" data-view="market">任务</button>
+        <button type="button" class="mode-button" data-view="profile">我的</button>
+        <button type="button" class="mode-button" data-view="lab">实验</button>
+      </nav>
+
+      <div class="header-actions">
+        <button type="button" class="header-publish" data-open-publish>发布任务</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="view is-active home-view" id="home-view" aria-labelledby="home-title">
+        <div class="home-stage">
+          <div class="home-brand">
+            <h1 id="home-title">TaskTok</h1>
+          </div>
+
+          <form class="home-search" id="quick-route">
+            <button
+              type="button"
+              class="search-add"
+              aria-label="发布任务"
+              data-open-publish
+            >
+              新建
+            </button>
+            <label class="sr-only" for="quick-task">描述你要完成的任务</label>
+            <input
+              id="quick-task"
+              name="quick-task"
+              type="text"
+              autocomplete="off"
+              placeholder="描述任务，帮你找到合适的人"
+            />
+            <button type="submit" class="search-submit" aria-label="开始匹配">
+              匹配
+            </button>
+          </form>
+
+          <div class="home-shortcuts" aria-label="任务类型">
+            <button type="button" class="shortcut" data-task-filter="content_creation">
+              <span class="shortcut-icon tone-blue">文</span>
+              <span>内容写作</span>
+            </button>
+            <button type="button" class="shortcut" data-task-filter="data_cleaning">
+              <span class="shortcut-icon tone-gold">数</span>
+              <span>数据整理</span>
+            </button>
+            <button type="button" class="shortcut" data-task-filter="compliance_review">
+              <span class="shortcut-icon tone-red">审</span>
+              <span>合规预审</span>
+            </button>
+            <button type="button" class="shortcut" data-task-filter="research_analysis">
+              <span class="shortcut-icon tone-green">研</span>
+              <span>资料研究</span>
+            </button>
+            <button type="button" class="shortcut" data-task-filter="product_docs">
+              <span class="shortcut-icon tone-gray">FAQ</span>
+              <span>产品文档</span>
+            </button>
+          </div>
+
+          <div class="recent-tasks">
+            <div class="recent-heading">
+              <span>最近任务</span>
+              <button type="button" class="text-button" data-view-target="market">
+                查看全部
+              </button>
+            </div>
+            <div class="recent-list" id="recent-list"></div>
+          </div>
+        </div>
+        <p class="home-hint">按 Enter 快速匹配 · 任务结果可随时验收和回滚</p>
+      </section>
+
+      <section class="view" id="market-view" aria-labelledby="task-browser-title">
+        <div class="market-intro">
+          <button type="button" class="back-link" data-view-target="home">返回</button>
+          <div>
+            <p class="eyebrow">TASK MARKET</p>
+            <h1 id="task-browser-title">任务</h1>
+          </div>
+          <div class="search-field">
+            <label class="sr-only" for="task-search">搜索任务</label>
+            <input id="task-search" type="search" placeholder="搜索任务或交付物" />
+          </div>
+        </div>
+
+        <section class="task-section" id="task-browser" aria-label="任务列表">
+          <div class="section-heading">
+            <div>
+              <h2>推荐</h2>
+              <p>选择一个任务，查看执行者建议和下一步。</p>
+            </div>
+          </div>
+
+          <div class="filter-row" id="task-filters" aria-label="任务类型筛选">
+            <button type="button" class="filter-chip is-active" data-filter="all">全部</button>
+            <button type="button" class="filter-chip" data-filter="content_creation">内容写作</button>
+            <button type="button" class="filter-chip" data-filter="data_cleaning">数据整理</button>
+            <button type="button" class="filter-chip" data-filter="compliance_review">合规预审</button>
+            <button type="button" class="filter-chip" data-filter="research_analysis">研究分析</button>
+            <button type="button" class="filter-chip" data-filter="product_docs">产品文档</button>
+          </div>
+
+          <div class="task-layout">
+            <div class="task-results">
+              <div class="results-meta">
+                <span id="results-count">12 个任务</span>
+                <span>按待处理优先排序</span>
+              </div>
+              <div class="task-list" id="task-list"></div>
+              <div class="empty-results" id="empty-results" hidden>
+                <strong>没有找到符合条件的任务</strong>
+                <span>换个关键词，或者尝试“全部”。</span>
+                <button type="button" class="text-button" id="clear-filters">清除筛选</button>
+              </div>
+            </div>
+
+            <aside class="task-detail" id="task-detail" aria-live="polite"></aside>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="profile-view" aria-labelledby="profile-title">
+        <div class="profile-intro">
+          <div class="profile-avatar" aria-hidden="true">运</div>
+          <div class="profile-copy">
+            <p class="eyebrow">MY WORKSPACE</p>
+            <h1 id="profile-title">我的工作台</h1>
+            <p>企业运营 · 内容与增长组</p>
+          </div>
+          <button type="button" class="secondary-button" data-open-publish>新建任务</button>
+        </div>
+        <div class="profile-note">
+          <span>我的任务</span>
+          <p>等待你验收的工作会优先显示在这里。</p>
+        </div>
+        <div class="progress-summary" id="progress-summary"></div>
+        <div class="progress-columns">
+          <section>
+            <div class="simple-section-heading">
+              <h2>等待你验收</h2>
+              <span id="review-count">0 个</span>
+            </div>
+            <div class="compact-task-list" id="review-list"></div>
+          </section>
+          <section>
+            <div class="simple-section-heading">
+              <h2>正在执行</h2>
+              <span id="active-count">0 个</span>
+            </div>
+            <div class="compact-task-list" id="active-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="lab-view" aria-labelledby="lab-title">
+        <div class="lab-hero">
+          <div>
+            <p class="eyebrow">COMPETITION DEMO</p>
+            <h1 id="lab-title">进化实验</h1>
+            <p>
+              这里是比赛用的验证界面。比较 v1 与 v2 的分配结果，查看规则变化、隐藏任务迁移和回滚一致性。
+            </p>
+          </div>
+          <button type="button" class="secondary-button" data-view-target="home">
+            返回首页
+          </button>
+        </div>
+
+        <div class="lab-metrics" id="lab-metrics"></div>
+
+        <div class="lab-controls">
+          <div class="lab-actions">
+            <button type="button" class="primary-button" id="run-v1">1. 运行 v1</button>
+            <button type="button" class="secondary-button" id="open-feedback" disabled>
+              2. 提交纠错
+            </button>
+            <button type="button" class="accent-button" id="generate-v2" disabled>
+              3. 生成并运行 v2
+            </button>
+            <button type="button" class="secondary-button" id="rollback-v1" disabled>
+              4. 回滚 v1
+            </button>
+            <button type="button" class="secondary-button" id="restore-v2" disabled>
+              恢复 v2
+            </button>
+          </div>
+          <button type="button" class="text-button" id="automate-lab">自动预演</button>
+        </div>
+
+        <div class="lab-layout">
+          <section class="lab-route-panel">
+            <div class="simple-section-heading">
+              <div>
+                <h2>路由结果</h2>
+                <p>隐藏任务已标记；它们不参与反馈学习。</p>
+              </div>
+              <span class="lab-version" id="lab-version">等待运行</span>
+            </div>
+            <div class="lab-table-wrap">
+              <table class="lab-table">
+                <thead>
+                  <tr>
+                    <th scope="col">任务</th>
+                    <th scope="col">v1</th>
+                    <th scope="col">v2</th>
+                    <th scope="col">变化原因</th>
+                  </tr>
+                </thead>
+                <tbody id="lab-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <aside class="lab-ledger">
+            <div class="simple-section-heading">
+              <h2>系统学到了什么</h2>
+              <span id="ledger-status">尚无新规则</span>
+            </div>
+            <div id="lab-ledger-content"></div>
+          </aside>
+        </div>
+
+        <details class="audit-details">
+          <summary>运行与版本审计</summary>
+          <div id="audit-log"></div>
+        </details>
+      </section>
+    </main>
+
+    <dialog class="dialog publish-dialog" id="publish-dialog">
+      <form method="dialog" class="dialog-form" id="publish-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">NEW TASK</p>
+            <h2>发布一个线上任务</h2>
+            <p>写清要做什么和交付什么，系统就能给出执行者建议。</p>
+          </div>
+          <button type="button" class="icon-button" data-close-dialog aria-label="关闭">关闭</button>
+        </div>
+
+        <label class="field">
+          <span>任务标题</span>
+          <input name="title" required maxlength="60" placeholder="例如：把会员权益整理成官网 FAQ" />
+        </label>
+        <label class="field">
+          <span>具体需求</span>
+          <textarea
+            name="request"
+            required
+            rows="4"
+            placeholder="说明任务对象、范围，以及是否涉及个人信息、自动续费或消费者权益。"
+          ></textarea>
+        </label>
+        <label class="field">
+          <span>交付物</span>
+          <input name="deliverable" required placeholder="例如：六问六答 FAQ，含适用版本" />
+        </label>
+
+        <div class="dialog-actions">
+          <button type="button" class="secondary-button" data-close-dialog>取消</button>
+          <button type="submit" class="primary-button">发布并查看推荐</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog feedback-dialog" id="feedback-dialog">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">STRUCTURED FEEDBACK</p>
+          <h2>提交 3 条纠错</h2>
+          <p>平台接收正确执行者、任务类型、原因和任务清晰度，不会直接改代码或提示词。</p>
+        </div>
+        <button type="button" class="icon-button" data-close-dialog aria-label="关闭">关闭</button>
+      </div>
+      <div class="feedback-list" id="feedback-list"></div>
+      <div class="dialog-actions">
+        <span class="gate-note">无反馈不能生成 v2。</span>
+        <button type="button" class="accent-button" id="submit-feedback">
+          确认提交
+        </button>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "evomatch-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TaskTok：结果驱动、可解释、可回滚的企业线上任务路由原型",
+  "scripts": {
+    "start": "node scripts/serve.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

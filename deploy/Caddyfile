@@ -1,0 +1,9 @@
+62-234-154-212.sslip.io {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:4173
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=86400"
+	}
+}

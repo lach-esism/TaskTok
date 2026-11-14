@@ -195,8 +195,15 @@ python scripts/run_demo.py
 - **评委演示**：一键跑通「推荐 → 采纳 → 评分 → 权重 diff → 拆解 → 计划 → 重规划 → 回滚」。
 - **新用户成长**：同一任务、同一用户，对比 A/B 初始偏好；再提交与初始选择相反的反馈，观察权重向真实偏好修正。
 - **20 轮对照实验**：每轮 50 次客户选择，学习组 vs 不学习组的 Top-1/Top-5 准确率曲线。
+- **学习过程（独立页）**：`frontend/learning-demo.html`，双击即可打开，无需启动后端。同一场景下左右并排展示「接单端刷到的单子」和「任务端收到的工人推荐」，逐轮播放双方的 5 张卡片、七维权重、画像数据和命中率/cosine 曲线；顶部可切换 27 个「领域标签 × worker/customer 偏好标签」场景，并显示标签对首轮排名的偏置。
+- **案例墙**：8 个跨领域任务 × worker 案例（视频、电商、UI/UX、咨询、写作、标注、培训、品牌），每个展示首轮 → 末轮真实答案排名和命中率迷你曲线。
+- **自定义案例**：在演示页底部输入任务或 worker 画像，逐轮点选候选；`POST /demo/custom/step` 用真实特征与 `OnlineWeightLearner` 返回下一轮 Top-5。需要启动后端，输入只发到本机、不落库，且没有 ground truth，因此不显示命中率。
+- **简历推送演示（独立页，抖音式单条刷屏）**：`frontend/resume-feed.html`，粘贴自然语言简历 → `/resume/analyze` 解析出 worker 画像 → 一屏一个任务，上滑/滚轮/方向键切换，接单或跳过自动切下一条；简历、我的任务、能力评价收在顶部抽屉里。**右侧常驻调试数据栏**实时显示当前请求（request_id/refresh/queue/seen/pending）、当前任务（id/rank/score/propensity/features/自动完成度/原始 JSON）、七维权重与 delta、个人权重来源/分群/置信度、事件漏斗。演示使用**独立的 2,000 任务市场**（200 workers / 12,000 assignments，全部任务有 ItemCF 历史），走完整推荐链路：`is_eligible` 硬约束（状态/等级/容量/违约/已分配）→ 语义匹配 + 接受概率模型 → `recommend_tasks` → ε-greedy 探索（返回 propensity）→ 记录 Impression；接单/跳过写入 accept/reject 事件，顶部显示曝光/接单/跳过/池/召回。**技能要求按软匹配处理**（技能仍是七维特征），以保证刷屏连续性。首次请求需拟合语义/接受模型，约 6–8 秒；之后约 0.2–0.5 秒。任务池大小可用 `RESUME_DEMO_WORKERS/TASKS/ASSIGNMENTS` 调整。
+- 页面同时展示**能力评价**：静态简历能力画像（技能广度/领域专业度/经验/聚焦度/完整度）+ 已评价任务的模拟履约评价（一次通过/验收分/按时/返工/争议），合成总分与 A–D 等级。
+- **接单保存与提交评价**：接单后任务进入「我的任务」并保存在浏览器 `localStorage`；任务卡和能力面板不再立即评价。点「提交与评价」打开独立弹窗，填写交付说明/链接、查看完成度自动初评（需求覆盖/交付质量/时效/完整度/沟通）、用滑块手动调整后「提交并评价」；只有已评价任务进入能力评价。刷新页面会恢复简历、任务和评价状态，「清空已保存数据」可重置。需要启动后端，输入不落库。
+- 重新生成学习演示页用 `python scripts/build_learning_demo.py`。
 
-前端文件：`frontend/index.html`、`frontend/styles.css`、`frontend/app.js`；根路径 `/` 会 302 到 `/ui/`。
+前端文件：`frontend/index.html`、`frontend/styles.css`、`frontend/app.js`、`frontend/learning-demo.html`、`frontend/resume-feed.html`；根路径 `/` 会 302 到 `/ui/`。
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -209,7 +216,7 @@ cd task-recommender
 python -m pytest tests/ -q
 ```
 
-当前 392 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、文档上传与解压边界（含 PDF `/Fl`、间接 `/Filter`、长字典间隔、嵌套 Form XObject 与 `/Parent` 继承资源对象模型扫描）、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、10,000 任务大规模 strict 基准、事件/曝光/漏斗（标签派生、批量/体积上限）、选择学习与权重绑定、serving-parity 严格评估与校准、调优权重激活、文档约定、前端静态托管、API 冒烟。
+当前 423 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、文档上传与解压边界（含 PDF `/Fl`、间接 `/Filter`、长字典间隔、嵌套 Form XObject 与 `/Parent` 继承资源对象模型扫描）、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、10,000 任务大规模 strict 基准、事件/曝光/漏斗（标签派生、批量/体积上限）、选择学习与权重绑定、serving-parity 严格评估与校准、调优权重激活、文档约定、前端静态托管、学习过程演示数据与变量、案例墙、自定义模拟接口、简历推送页面与接口、简历推送 serving-parity（eligibility、探索 propensity、impression/事件、个人权重）、静态+模拟履约能力评价、任务完成度自动初评与手动调整、API 冒烟。
 
 ## 离线评估
 
@@ -316,6 +323,8 @@ python scripts/evaluate_chains.py
 | GET | `/acceptance/demo` | B2B 调研验收演示任务 + 标准 + 示例交付物 |
 | POST | `/acceptance/demo/learning?rounds=5` | 连续验收并返回权重漂移 + Top-5 排序变化 |
 | GET | `/acceptance/metrics` | 平台验收指标 |
+| POST | `/demo/custom/step` | 自定义任务/worker 逐轮模拟：真实特征 + pairwise 权重更新（无状态、不落库） |
+| POST | `/demo/resume/refresh` | 自然语言简历解析后的推送 feed：seen 去重、接单更新权重、池耗尽提示（无状态、不落库） |
 | GET | `/benchmark/summary` | 1000 任务基准的元数据与逐轮结果 |
 | POST | `/benchmark/run?rounds=20` | 跑对答案学习轮次（默认 20） |
 | GET | `/tasks/{id}/acceptance-spec` | 任务验收标准 |

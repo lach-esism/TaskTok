@@ -184,3 +184,28 @@ class OnboardingRequest(BaseModel):
     declared_preferences: dict | None = None
     preferences: dict[str, float] | None = None
     reset: bool = False
+
+
+class CustomDemoRequest(BaseModel):
+    mode: str
+    preferences: dict[str, float] | None = None
+    task: dict | None = None
+    worker: dict | None = None
+    weights: dict[str, float] | None = None
+    round: int = Field(default=1, ge=1)
+    choice: str | None = None
+
+
+class ResumeFeedRequest(BaseModel):
+    draft: dict
+    weights: dict[str, float] | None = None
+    personal_samples: int = Field(default=0, ge=0)
+    seen: list[str] = Field(default_factory=list)
+    refresh: int = Field(default=0, ge=0)
+    accepted: list[str] = Field(default_factory=list)
+    accepted_history: list[str] = Field(default_factory=list)
+    completion_records: list[dict] = Field(default_factory=list)
+    skipped: list[str] = Field(default_factory=list)
+    request_id: str | None = None
+    batch_size: int = Field(default=5, ge=1, le=10)
+    retrieval_limit: int = Field(default=300, ge=10, le=2000)

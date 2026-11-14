@@ -39,6 +39,11 @@ from app.events import EventService
 from app.feedback import FeedbackService
 from app.features import candidate_features
 from app.learning.acceptance import AcceptanceModel
+from app.learning.custom_demo import simulate_custom_step
+from app.learning.resume_feed import (
+    build_resume_demo_store,
+    simulate_resume_refresh,
+)
 from app.learning.choice import (
     NEGATIVE_ACTIONS,
     POSITIVE_ACTIONS,
@@ -72,6 +77,7 @@ from app.schemas import (
     CandidateResponse,
     ClassifyRequest,
     CreateAssignmentRequest,
+    CustomDemoRequest,
     DecisionRequest,
     DecomposeRequest,
     EventsRequest,
@@ -89,6 +95,7 @@ from app.schemas import (
     RecommendWorkersRequest,
     ReplanRequest,
     ResumeAnalyzeRequest,
+    ResumeFeedRequest,
     RollbackRequest,
 )
 from app.service import RecommendationService
@@ -782,6 +789,31 @@ def create_app(
         except upload_extract.UploadError as error:
             raise HTTPException(status_code=422, detail=str(error))
 
+    @app.post("/demo/resume/refresh")
+    def resume_feed_refresh(request: ResumeFeedRequest) -> dict:
+        require_store()
+        demo_store = getattr(app.state, "resume_demo_store", None)
+        if demo_store is None:
+            demo_store = build_resume_demo_store()
+            app.state.resume_demo_store = demo_store
+            app.state.resume_exploration = ExplorationPolicy(
+                epsilon=0.1, seed=42
+            )
+            app.state.resume_events = EventService(demo_store)
+            app.state.resume_personalizer = PersonalizationService(
+                demo_store, Segmenter(seed=42), DEFAULT_WEIGHTS
+            )
+        try:
+            return simulate_resume_refresh(
+                demo_store,
+                request.model_dump(),
+                exploration=app.state.resume_exploration,
+                events=app.state.resume_events,
+                personalizer=app.state.resume_personalizer,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+
     # ------------------------------------------------------------------
     # Acceptance workflow
     # ------------------------------------------------------------------
@@ -814,6 +846,14 @@ def create_app(
     ) -> dict:
         try:
             return _acceptance().run_learning_demo(rounds=rounds)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+
+    @app.post("/demo/custom/step")
+    def custom_demo_step(request: CustomDemoRequest) -> dict:
+        current = require_store()
+        try:
+            return simulate_custom_step(current, request.model_dump())
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error))
 

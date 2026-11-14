@@ -1,0 +1,1351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TaskTok · 简历推送</title>
+<style>
+  :root{
+    --bg:#070f1a; --panel:#101b2e; --panel-2:#142239; --line:#233552;
+    --text:#e8eefc; --muted:#8ea3c4; --cyan:#4cc9f0; --green:#3ddc97;
+    --violet:#a78bfa; --amber:#ffc857; --red:#ff7b7b;
+  }
+  *{box-sizing:border-box}
+  [hidden]{display:none !important}
+  html,body{margin:0;padding:0;height:100%}
+  body{
+    background:radial-gradient(1200px 700px at 20% -10%,#123049 0%,var(--bg) 58%) fixed;
+    color:var(--text); font:14px/1.5 "Inter","Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;
+    overflow:hidden;
+  }
+  button{
+    background:var(--panel-2);color:var(--text);border:1px solid var(--line);
+    padding:7px 12px;border-radius:10px;font:inherit;font-size:12px;cursor:pointer;transition:.15s;
+  }
+  button:hover:not(:disabled){border-color:var(--cyan);transform:translateY(-1px)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:linear-gradient(120deg,#1e6f92,#2a9d8f);border-color:transparent;font-weight:600}
+  button.skip{border-color:rgba(255,123,123,.45);color:var(--red)}
+  .muted{color:var(--muted)}
+  .pill{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);background:var(--panel-2);padding:2px 8px;border-radius:999px;color:var(--muted);font-size:11px}
+  .topbar{
+    height:58px;display:flex;align-items:center;gap:12px;padding:0 clamp(12px,2.4vw,26px);
+    border-bottom:1px solid rgba(35,53,82,.7);background:rgba(7,15,26,.72);backdrop-filter:blur(12px);
+    position:relative;z-index:10;
+  }
+  .brand{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:.1em;font-size:12px;color:var(--muted);white-space:nowrap}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--cyan);box-shadow:0 0 16px var(--cyan)}
+  .brand b{color:var(--text);letter-spacing:.06em}
+  .funnel{display:flex;gap:6px;flex-wrap:wrap;margin-left:6px}
+  .funnel .stat{font-size:10.5px}
+  .stat{display:inline-flex;gap:5px;align-items:baseline;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:2px 7px}
+  .stat b{font-weight:700;font-variant-numeric:tabular-nums}
+  .top-actions{margin-left:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .top-actions button{padding:5px 9px;font-size:11px}
+  .switch{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--muted)}
+  .switch input{accent-color:var(--cyan)}
+  .workspace{display:grid;grid-template-columns:minmax(0,1fr) 380px;height:calc(100vh - 58px)}
+  .workspace.no-debug{grid-template-columns:1fr}
+  .workspace.no-debug .debug-panel{display:none}
+  .feed-stage{position:relative;height:100%;display:grid;place-items:center;padding:14px 16px 86px;min-width:0}
+  .feed-viewport{width:min(580px,94vw);height:min(78vh,720px);max-height:calc(100vh - 190px);position:relative}
+  .card{
+    position:absolute;inset:0;border-radius:24px;border:1px solid rgba(76,201,240,.18);
+    background:linear-gradient(155deg,#102a3e,#0a1728 60%,#0b1424);
+    padding:clamp(16px,3vw,26px);display:flex;flex-direction:column;gap:12px;overflow:auto;
+    box-shadow:0 24px 80px rgba(0,0,0,.45); animation:cardIn .28s cubic-bezier(.2,.8,.2,1) both;
+  }
+  @keyframes cardIn{from{opacity:0;transform:translateY(18px) scale(.985)}to{opacity:1;transform:none}}
+  .card-top{display:flex;justify-content:space-between;gap:10px;align-items:center}
+  .cat{font-size:11px;letter-spacing:.12em;color:var(--cyan);border:1px solid rgba(76,201,240,.35);border-radius:99px;padding:2px 9px}
+  .p{font-size:10px;color:var(--muted);border:1px solid var(--line);border-radius:99px;padding:2px 8px;font-variant-numeric:tabular-nums}
+  .card h1{font-size:clamp(21px,3.1vw,30px);line-height:1.25;margin:0;letter-spacing:.2px}
+  .card-meta{color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:8px}
+  .card-desc{color:#c4d2e8;font-size:13px;line-height:1.65;margin:0}
+  .score-line{display:flex;align-items:baseline;gap:8px;margin-top:auto;padding-top:8px;border-top:1px dashed var(--line)}
+  .score-line b{font-size:30px;line-height:1;font-variant-numeric:tabular-nums}
+  .score-line span{color:var(--muted);font-size:11px}
+  .reasons{display:flex;flex-wrap:wrap;gap:5px}
+  .reason{font-size:10.5px;border:1px solid var(--line);border-radius:7px;padding:2px 7px;color:var(--muted)}
+  .card-section{margin-top:4px}
+  .card-section h4{font-size:10px;color:var(--muted);font-weight:600;margin:0 0 6px;letter-spacing:.06em}
+  .reqs{display:flex;flex-wrap:wrap;gap:5px}
+  .feature-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px 12px;font-size:9.5px;color:var(--muted)}
+  .feature-row{display:grid;grid-template-columns:48px 1fr 30px;gap:5px;align-items:center}
+  .feature-track{height:4px;background:#0a1424;border-radius:99px;overflow:hidden}
+  .feature-track i{display:block;height:100%;background:linear-gradient(90deg,#2c7be5,#4cc9f0);border-radius:99px}
+  .feature-val{text-align:right;font-variant-numeric:tabular-nums}
+  .action-bar{
+    position:absolute;left:0;right:0;bottom:0;height:78px;display:flex;align-items:center;justify-content:center;gap:26px;
+    background:linear-gradient(180deg,transparent,rgba(7,15,26,.9) 40%);z-index:9;
+  }
+  .action{
+    width:64px;height:64px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;
+    border:1px solid var(--line);background:var(--panel-2);box-shadow:0 10px 30px rgba(0,0,0,.35);
+  }
+  .action.skip{color:var(--red);border-color:rgba(255,123,123,.5)}
+  .action.accept{color:#062a20;background:linear-gradient(135deg,#3ddc97,#2fc5d8);border-color:transparent;width:76px;height:76px;font-size:13px}
+  .action:disabled{opacity:.4}
+  .feed-hint{position:absolute;bottom:84px;left:0;right:0;text-align:center;color:var(--muted);font-size:10.5px;pointer-events:none}
+  .debug-panel{height:100%;overflow:auto;border-left:1px solid var(--line);background:rgba(10,20,35,.72);padding:12px;min-width:0}
+  .debug-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;position:sticky;top:0;background:rgba(10,20,35,.9);padding:4px 0 8px;z-index:2}
+  .debug-title{font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--cyan)}
+  .debug-close{display:none;background:transparent;border:none;color:var(--muted);font-size:20px;cursor:pointer}
+  .debug-block{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 9px;margin-bottom:8px}
+  .debug-block h5{font-size:9.5px;color:var(--muted);font-weight:600;margin:0 0 6px;letter-spacing:.08em}
+  .debug-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+  .debug-kv{display:flex;justify-content:space-between;gap:6px;font-size:10px;color:var(--muted)}
+  .debug-kv b{color:var(--text);font-variant-numeric:tabular-nums;text-align:right;word-break:break-all}
+  .debug-feature{display:grid;grid-template-columns:54px 1fr 32px;gap:5px;align-items:center;font-size:9.5px;color:var(--muted);margin:2px 0}
+  .debug-feature .track{height:4px;background:#0a1424;border-radius:99px;overflow:hidden}
+  .debug-feature .track i{display:block;height:100%;background:linear-gradient(90deg,#2c7be5,#4cc9f0);border-radius:99px}
+  .debug-json{white-space:pre-wrap;word-break:break-all;font:9.5px/1.45 ui-monospace,Consolas,monospace;color:#9fb4d4;background:#08111f;border:1px solid var(--line);border-radius:8px;padding:7px;max-height:220px;overflow:auto;margin:0}
+  .debug-reasons{display:flex;flex-wrap:wrap;gap:4px}
+  .debug-reasons span{font-size:9px;border:1px solid var(--line);border-radius:6px;padding:1px 5px;color:var(--muted)}
+  .learn-chart{width:100%;height:160px;display:block;background:#08111f;border:1px solid var(--line);border-radius:8px}
+  .chart-legend{display:flex;flex-wrap:wrap;gap:8px;font-size:9.5px;color:var(--muted);margin-top:5px}
+  .legend-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:3px}
+  .debug-mini{width:100%;height:72px;display:block;background:#08111f;border:1px solid var(--line);border-radius:7px;margin-top:6px}
+  .learning-table{display:grid;gap:4px;font-size:10px}
+  .learning-row{display:grid;grid-template-columns:40px 1fr 60px 48px;gap:6px;color:var(--muted);border-bottom:1px dashed var(--line);padding-bottom:3px}
+  .learning-row b{color:var(--text);font-variant-numeric:tabular-nums;font-weight:600}
+  .learning-row span:last-child{text-align:right}
+  @media (max-width:1100px){
+    .workspace{grid-template-columns:1fr}
+    .debug-panel{position:fixed;top:58px;right:0;bottom:0;width:min(390px,92vw);z-index:20;display:none;border-left:1px solid var(--line);box-shadow:-20px 0 60px rgba(0,0,0,.45)}
+    .debug-panel.open{display:block}
+    .debug-close{display:block}
+  }
+  .empty-card{display:grid;place-items:center;height:100%;text-align:center;color:var(--muted);font-size:12px;line-height:1.8;padding:30px}
+  .empty-card button{margin-top:12px}
+  .loading{display:grid;place-items:center;height:100%;color:var(--muted);font-size:12px}
+  .spinner{width:16px;height:16px;border:2px solid var(--line);border-top-color:var(--cyan);border-radius:50%;animation:spin .7s linear infinite;display:inline-block;margin-right:7px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .drawer-overlay{position:fixed;inset:0;background:rgba(3,8,16,.66);backdrop-filter:blur(3px);z-index:30}
+  .drawer{
+    position:fixed;top:0;right:0;height:100%;width:min(540px,94vw);background:linear-gradient(180deg,#0f1b2e,#0a1423);
+    border-left:1px solid var(--line);z-index:31;padding:16px;overflow:auto;box-shadow:-20px 0 60px rgba(0,0,0,.45);
+    animation:drawerIn .22s ease both;
+  }
+  @keyframes drawerIn{from{transform:translateX(30px);opacity:.4}to{transform:none;opacity:1}}
+  .drawer-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:14px}
+  .drawer-title{font-weight:700;font-size:16px}
+  .drawer-close{background:transparent;border:none;color:var(--muted);font-size:24px;line-height:1;cursor:pointer}
+  .panel-block{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:13px;margin-bottom:12px}
+  h3{font-size:11px;color:var(--muted);font-weight:600;margin:0 0 8px}
+  textarea{width:100%;min-height:170px;resize:vertical;background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px;font:12.5px/1.6 inherit;outline:none}
+  textarea:focus{border-color:var(--cyan)}
+  .actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px;align-items:center}
+  .profile{display:flex;flex-wrap:wrap;gap:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+  .chip{font-size:10px;border:1px solid var(--line);border-radius:99px;padding:1px 7px;color:var(--muted)}
+  .weights{display:grid;gap:5px;margin-top:8px}
+  .weight-row{display:grid;grid-template-columns:64px 1fr 44px 48px;gap:7px;align-items:center;font-size:10.5px}
+  .weight-name{color:var(--muted)}
+  .weight-track{height:7px;background:#0a1424;border:1px solid #1b2b46;border-radius:99px;overflow:hidden}
+  .weight-track i{display:block;height:100%;background:linear-gradient(90deg,#2c7be5,#4cc9f0);border-radius:99px}
+  .weight-val{text-align:right;font-variant-numeric:tabular-nums}
+  .delta{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+  .delta.pos{color:var(--green)} .delta.neg{color:var(--red)}
+  .task-list{display:grid;gap:6px}
+  .task-row{display:grid;grid-template-columns:1fr auto auto auto;gap:8px;align-items:center;background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:8px 9px}
+  .task-row-title{font-size:12px;font-weight:600}
+  .task-row-sub{font-size:10px;color:var(--muted)}
+  .status-badge{font-size:9px;border:1px solid var(--line);border-radius:99px;padding:2px 7px;color:var(--muted);white-space:nowrap}
+  .status-badge.accepted{color:var(--cyan);border-color:rgba(76,201,240,.45)}
+  .status-badge.evaluated{color:var(--green);border-color:rgba(61,220,151,.45)}
+  .task-score{font-size:11px;font-weight:700;min-width:34px;text-align:right;font-variant-numeric:tabular-nums}
+  .cap-head{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .cap-score{display:flex;align-items:baseline;gap:7px}
+  .cap-score b{font-size:30px;line-height:1}
+  .cap-score span{font-size:12px;font-weight:700;color:var(--amber);border:1px solid rgba(255,200,87,.45);border-radius:99px;padding:1px 7px}
+  .cap-grid{display:grid;gap:14px}
+  .cap-row{display:grid;grid-template-columns:82px 1fr 42px 34px;gap:6px;align-items:center;font-size:10px;margin:4px 0}
+  .cap-name{color:var(--muted);white-space:nowrap}
+  .cap-track{height:6px;background:#0a1424;border:1px solid #1b2b46;border-radius:99px;overflow:hidden}
+  .cap-track i{display:block;height:100%;background:linear-gradient(90deg,#2c7be5,#4cc9f0);border-radius:99px}
+  .cap-val{text-align:right;font-weight:700;font-variant-numeric:tabular-nums}
+  .cap-weight{text-align:right;color:var(--muted)}
+  .cap-badge{font-size:9px;border:1px solid rgba(255,200,87,.45);color:var(--amber);border-radius:99px;padding:1px 6px;margin-left:4px}
+  .cap-insights{display:grid;gap:5px;margin-top:8px}
+  .cap-insight{display:flex;justify-content:space-between;gap:8px;background:var(--panel-2);border:1px solid var(--line);border-radius:7px;padding:4px 7px;font-size:10.5px}
+  .cap-insight.good{border-color:rgba(61,220,151,.35)} .cap-insight.bad{border-color:rgba(255,123,123,.35)}
+  .completion-list{display:grid;gap:4px;margin-top:8px}
+  .saved-row{display:flex;justify-content:space-between;gap:8px;font-size:10.5px;border:1px solid var(--line);border-radius:7px;padding:3px 7px;background:var(--panel-2)}
+  .modal-overlay{position:fixed;inset:0;background:rgba(3,8,16,.72);backdrop-filter:blur(3px);display:grid;place-items:center;padding:18px;z-index:50}
+  .modal{width:min(640px,100%);max-height:88vh;overflow:auto;background:linear-gradient(180deg,var(--panel),#0d1728);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .modal-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:10px}
+  .modal-title{font-size:16px;font-weight:700}
+  .modal-close{background:transparent;border:none;color:var(--muted);font-size:22px;line-height:1;cursor:pointer}
+  .modal-desc{font-size:11.5px;color:#b9c8e2;line-height:1.55;margin-bottom:10px}
+  .completion-head{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center;margin-bottom:6px}
+  .completion-title{font-size:11px;font-weight:700;color:var(--muted)}
+  .completion-total{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+  .completion-row{display:grid;grid-template-columns:64px 1fr 40px 30px;gap:6px;align-items:center;font-size:10px;margin:3px 0}
+  .completion-row input[type=range]{width:100%;accent-color:var(--cyan);height:14px}
+  .completion-row .cr-value{text-align:right;font-variant-numeric:tabular-nums}
+  .completion-row .cr-weight{text-align:right;color:var(--muted)}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
+  .error{color:var(--red);font-size:11px;margin-top:7px;min-height:16px}
+  .status{color:var(--muted);font-size:11px;margin-top:6px;min-height:16px}
+  .completion-badge{font-size:9px;border-radius:99px;padding:1px 6px;border:1px solid var(--line);color:var(--muted)}
+  .completion-badge.adjusted{color:var(--amber);border-color:rgba(255,200,87,.45)}
+  .field{display:grid;gap:5px;font-size:11px;color:var(--muted)}
+  @media (max-width:760px){
+    .topbar{height:54px;gap:8px;padding:0 10px}
+    .brand b{display:none}
+    .funnel .stat:nth-child(n+3){display:none}
+    .top-actions button{padding:5px 7px}
+    .workspace{height:calc(100vh - 54px)}
+    .feed-stage{height:100%;padding:10px 10px 82px}
+    .feed-viewport{height:calc(100vh - 166px);width:100%;max-height:none}
+    .card{border-radius:20px}
+    .action{width:58px;height:58px}.action.accept{width:68px;height:68px}
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span> <b>TASKTOK</b> PUSH</div>
+  <div class="funnel" id="funnel"></div>
+  <div class="top-actions">
+    <button id="btn-sync">刷新</button>
+    <label class="switch"><input id="auto-toggle" type="checkbox"> 自动刷</label>
+    <button id="btn-debug">数据</button>
+    <button data-drawer="learning">学习</button>
+    <button data-drawer="resume">简历</button>
+    <button data-drawer="tasks">我的任务</button>
+    <button data-drawer="capability">能力</button>
+  </div>
+</header>
+
+<div class="workspace">
+<main class="feed-stage">
+  <div class="feed-viewport" id="feed-viewport">
+    <div class="loading" id="feed-loading"><span class="spinner"></span>正在准备推送…</div>
+  </div>
+  <div class="action-bar">
+    <button class="action skip" id="btn-skip">跳过</button>
+    <button class="action accept" id="btn-accept">接单</button>
+  </div>
+  <div class="feed-hint" id="feed-hint">上滑 / 滚轮 / ↓ 查看下一个 · 接单或跳过自动切下一条</div>
+</main>
+
+<aside class="debug-panel" id="debug-panel">
+  <div class="debug-head">
+    <div class="debug-title">调试数据</div>
+    <button class="debug-close" id="debug-close">×</button>
+  </div>
+  <div id="debug-body"></div>
+</aside>
+</div>
+
+<div class="drawer-overlay" id="drawer-overlay" hidden></div>
+<aside class="drawer" id="drawer" hidden>
+  <div class="drawer-head">
+    <div class="drawer-title" id="drawer-title">简历</div>
+    <button class="drawer-close" id="drawer-close">×</button>
+  </div>
+
+  <section data-panel="resume">
+    <div class="panel-block">
+      <h3>自然语言简历</h3>
+      <textarea id="resume-text">张三，5 年视频制作经验，熟练使用 Premiere、After Effects、达芬奇。
+做过品牌宣传片、短视频投放、分镜脚本和剪辑后期，服务过消费品牌。
+期望月薪 8000 元，可远程。</textarea>
+      <div class="actions">
+        <button id="btn-example">示例简历</button>
+        <button id="btn-parse" class="primary">解析简历并开始推送</button>
+      </div>
+      <div class="status" id="status">等待解析</div>
+      <div class="error" id="error"></div>
+    </div>
+    <div class="panel-block">
+      <h3>解析出的画像</h3>
+      <div id="profile" class="muted">还没有解析简历。</div>
+    </div>
+    <div class="panel-block">
+      <h3>当前七维匹配权重</h3>
+      <div class="weights" id="weights"></div>
+    </div>
+  </section>
+
+  <section data-panel="tasks" hidden>
+    <div class="panel-block">
+      <div class="cap-head">
+        <div>
+          <h3 style="margin:0">我的任务</h3>
+          <div class="status" id="my-tasks-status">接单后会保存在这里。</div>
+        </div>
+        <button id="btn-clear" class="skip">清空已保存</button>
+      </div>
+      <div class="task-list" id="my-tasks"></div>
+    </div>
+  </section>
+
+  <section data-panel="capability" hidden>
+    <div class="panel-block">
+      <div class="cap-head">
+        <div>
+          <h3 style="margin:0">能力评价</h3>
+          <div class="status" id="cap-summary">解析简历后生成。</div>
+        </div>
+        <div class="cap-score"><b id="cap-overall">—</b><span id="cap-grade">—</span></div>
+      </div>
+      <div class="cap-grid">
+        <div>
+          <h3>静态能力画像（简历）</h3>
+          <div id="cap-static"></div>
+        </div>
+        <div>
+          <h3>动态履约评价 <span class="cap-badge">模拟</span></h3>
+          <div id="cap-dynamic"></div>
+        </div>
+        <div>
+          <h3>优势 / 短板</h3>
+          <div class="cap-insights" id="cap-insights"></div>
+        </div>
+      </div>
+      <p class="status" id="cap-note"></p>
+      <div class="completion-list" id="completion-list"></div>
+    </div>
+  </section>
+
+  <section data-panel="learning" hidden>
+    <div class="panel-block">
+      <h3>七维权重演化（按刷新）</h3>
+      <svg class="learn-chart" id="chart-weights"></svg>
+      <div class="chart-legend" id="legend-weights"></div>
+    </div>
+    <div class="panel-block">
+      <h3>个人置信度 / 样本数</h3>
+      <svg class="learn-chart" id="chart-confidence"></svg>
+      <div class="chart-legend">
+        <span><i class="legend-dot" style="background:#3ddc97"></i>置信度</span>
+        <span><i class="legend-dot" style="background:#4cc9f0"></i>样本数（归一化）</span>
+      </div>
+    </div>
+    <div class="panel-block">
+      <h3>接单任务匹配分</h3>
+      <svg class="learn-chart" id="chart-accepted"></svg>
+    </div>
+    <div class="panel-block">
+      <h3>已评价完成度</h3>
+      <svg class="learn-chart" id="chart-evaluated"></svg>
+    </div>
+    <div class="panel-block">
+      <h3>刷新记录</h3>
+      <div class="learning-table" id="learning-table"></div>
+    </div>
+  </section>
+</aside>
+
+<div class="modal-overlay" id="task-modal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title" id="modal-task-title">提交与评价</div>
+        <div class="task-row-sub" id="modal-task-sub"></div>
+      </div>
+      <button id="modal-close" class="modal-close" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-desc" id="modal-task-desc"></div>
+    <label class="field">交付说明 / 链接
+      <textarea id="modal-deliverable" placeholder="写一段交付说明，或粘贴交付链接（必填）"></textarea>
+    </label>
+    <div class="completion-head">
+      <div class="completion-title">完成度评分</div>
+      <div class="actions" style="margin:0">
+        <span class="completion-badge" id="modal-badge">自动初评</span>
+        <span class="completion-total" id="modal-total">—</span>
+      </div>
+    </div>
+    <div id="modal-sliders"></div>
+    <div class="error" id="modal-error"></div>
+    <div class="modal-actions">
+      <button id="modal-cancel">取消</button>
+      <button id="modal-submit" class="primary">提交并评价</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  const FEATURE_LABELS = {
+    reputation: "信誉", skill: "技能匹配", expertise: "专业度",
+    collaborative: "协同", preference: "历史偏好", load: "负载",
+    customer_preference: "客户偏好"
+  };
+  const COMPLETION_LABELS = {
+    requirement_coverage: "需求覆盖", quality: "交付质量",
+    timeliness: "时效", completeness: "完整度", communication: "沟通"
+  };
+  const COMPLETION_WEIGHTS = {
+    requirement_coverage: 0.30, quality: 0.25, timeliness: 0.20,
+    completeness: 0.15, communication: 0.10
+  };
+  const CATEGORY_GRADIENTS = {
+    video_production: "linear-gradient(155deg,#0f3546,#071722 62%,#0b1424)",
+    ui_ux_design: "linear-gradient(155deg,#241f46,#0b1222 62%,#0b1424)",
+    ecommerce_ops: "linear-gradient(155deg,#123b34,#081a18 62%,#0b1424)",
+    consulting_research: "linear-gradient(155deg,#1d2f4e,#0a1424 62%,#0b1424)",
+    content_writing: "linear-gradient(155deg,#3b2a1c,#1a120a 62%,#0b1424)",
+    data_annotation: "linear-gradient(155deg,#182c3f,#09131f 62%,#0b1424)",
+    training_course: "linear-gradient(155deg,#2f2a45,#120f1f 62%,#0b1424)",
+    brand_design: "linear-gradient(155deg,#3a2233,#180a14 62%,#0b1424)"
+  };
+  const DEFAULT_GRADIENT = "linear-gradient(155deg,#102a3e,#0a1728 60%,#0b1424)";
+  const EXAMPLE = "张三，5 年视频制作经验，熟练使用 Premiere、After Effects、达芬奇。\n做过品牌宣传片、短视频投放、分镜脚本和剪辑后期，服务过消费品牌。\n期望月薪 8000 元，可远程。";
+  const STORAGE_KEY = "tasktok.resumeFeed.v2";
+
+  const state = {
+    draft: null, analysis: null, profile: null,
+    weights: null, personalSamples: 0, lastRequestId: null,
+    seen: [], refresh: 0,
+    queue: [], queueIndex: 0,
+    accepted: [], skipped: [],
+    myTasks: {}, evaluated: [], completionRecords: {},
+    capability: null,
+    funnel: { impressions: 0, accepts: 0, rejects: 0, clicks: 0, applies: 0 },
+    poolSize: null, retrievalPool: null, exhausted: false,
+    busy: false, auto: false, timer: null,
+    modalTaskId: null, modalDimensions: null, modalAdjusted: false
+  };
+
+  const $ = (s) => document.querySelector(s);
+  const $$ = (s) => [...document.querySelectorAll(s)];
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  };
+  const fmt = (v, d) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d === undefined ? 3 : d);
+
+  async function post(path, body) {
+    const r = await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    let data = null;
+    try { data = await r.json(); } catch (e) { data = null; }
+    if (!r.ok) throw new Error((data && data.detail) || ("请求失败 (" + r.status + ")"));
+    return data;
+  }
+
+  function saveState() {
+    if (!window.localStorage) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        resumeText: $("#resume-text") ? $("#resume-text").value : "",
+        draft: state.draft, analysis: state.analysis, profile: state.profile,
+        weights: state.weights, personalSamples: state.personalSamples,
+        lastRequestId: state.lastRequestId, seen: state.seen, refresh: state.refresh,
+        myTasks: state.myTasks, evaluated: state.evaluated,
+        completionRecords: state.completionRecords, capability: state.capability,
+        funnel: state.funnel, poolSize: state.poolSize,
+        retrievalPool: state.retrievalPool, exhausted: state.exhausted
+      }));
+    } catch (e) { /* private mode */ }
+  }
+
+  function restoreState() {
+    if (!window.localStorage) return false;
+    let data = null;
+    try { data = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"); } catch (e) { return false; }
+    if (!data || !data.draft) return false;
+    if (data.resumeText) $("#resume-text").value = data.resumeText;
+    state.draft = data.draft;
+    state.analysis = data.analysis || null;
+    state.profile = data.profile || null;
+    state.weights = data.weights || null;
+    state.personalSamples = Number(data.personalSamples || 0);
+    state.lastRequestId = data.lastRequestId || null;
+    state.seen = Array.isArray(data.seen) ? data.seen : [];
+    state.refresh = Number(data.refresh || 0);
+    state.myTasks = data.myTasks || {};
+    state.evaluated = Array.isArray(data.evaluated) ? data.evaluated : [];
+    state.completionRecords = data.completionRecords || {};
+    state.capability = data.capability || null;
+    state.funnel = data.funnel || state.funnel;
+    state.poolSize = data.poolSize === undefined ? null : data.poolSize;
+    state.retrievalPool = data.retrievalPool === undefined ? null : data.retrievalPool;
+    state.exhausted = Boolean(data.exhausted);
+    return true;
+  }
+
+  function clearSaved() {
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
+    state.draft = null; state.analysis = null; state.profile = null;
+    state.weights = null; state.personalSamples = 0; state.lastRequestId = null;
+    state.seen = []; state.refresh = 0; state.queue = []; state.queueIndex = 0;
+    state.accepted = []; state.skipped = []; state.myTasks = {}; state.evaluated = [];
+    state.completionRecords = {}; state.capability = null;
+    state.funnel = { impressions: 0, accepts: 0, rejects: 0, clicks: 0, applies: 0 };
+    state.poolSize = null; state.retrievalPool = null; state.exhausted = false;
+    renderAll(); renderCurrent();
+    $("#status").textContent = "已清空保存数据";
+  }
+
+  function currentItem() {
+    return state.queue[state.queueIndex] || null;
+  }
+
+  function addSeen(taskId) {
+    if (taskId && !state.seen.includes(taskId)) state.seen.push(taskId);
+  }
+
+  function renderFunnel() {
+    const box = $("#funnel");
+    box.textContent = "";
+    const items = [
+      ["曝光", state.funnel.impressions || 0],
+      ["接单", state.funnel.accepts || 0],
+      ["跳过", state.funnel.rejects || 0],
+      ["池", state.poolSize === null ? "—" : state.poolSize],
+      ["召回", state.retrievalPool === null ? "—" : state.retrievalPool]
+    ];
+    items.forEach(function (entry) {
+      const chip = el("span", "stat");
+      chip.appendChild(el("span", "muted", entry[0]));
+      chip.appendChild(el("b", null, entry[1]));
+      box.appendChild(chip);
+    });
+    const pending = state.accepted.length + state.skipped.length;
+    if (pending) {
+      const chip = el("span", "stat");
+      chip.appendChild(el("span", "muted", "待同步"));
+      chip.appendChild(el("b", null, "+" + pending));
+      box.appendChild(chip);
+    }
+  }
+
+  function renderCard(item) {
+    const viewport = $("#feed-viewport");
+    viewport.textContent = "";
+    if (!state.draft) {
+      const empty = el("div", "card");
+      const box = el("div", "empty-card");
+      box.appendChild(el("div", null, "先写一份自然语言简历，再开始刷单。" + "\n解析后会生成推送队列。"));
+      const btn = el("button", "primary", "写简历");
+      btn.addEventListener("click", function () { openDrawer("resume"); });
+      box.appendChild(btn);
+      empty.appendChild(box);
+      viewport.appendChild(empty);
+      setActions(false);
+      return;
+    }
+    if (!item) {
+      const empty = el("div", "card");
+      const box = el("div", "empty-card");
+      box.appendChild(el("div", null, state.exhausted
+        ? "当前任务池已经刷完。\n点「刷新」重新开始，或修改简历。"
+        : "正在准备下一条推送…"));
+      const btn = el("button", "primary", "刷新");
+      btn.addEventListener("click", function () { refreshFeed(); });
+      box.appendChild(btn);
+      empty.appendChild(box);
+      viewport.appendChild(empty);
+      setActions(false);
+      return;
+    }
+    addSeen(item.id);
+    const card = el("div", "card");
+    card.style.background = CATEGORY_GRADIENTS[item.category] || DEFAULT_GRADIENT;
+    const top = el("div", "card-top");
+    top.appendChild(el("span", "cat", item.category_label));
+    top.appendChild(el("span", "p", "p=" + (item.propensity !== undefined ? Number(item.propensity).toFixed(2) : "—")));
+    card.appendChild(top);
+    card.appendChild(el("h1", null, item.title));
+    const meta = el("div", "card-meta");
+    meta.appendChild(el("span", null, "¥" + Math.round(item.budget)));
+    meta.appendChild(el("span", null, item.subtitle.split("·").slice(-1)[0].trim()));
+    if (item.difficulty) meta.appendChild(el("span", null, "难度 " + item.difficulty));
+    if (item.estimated_hours) meta.appendChild(el("span", null, "预计 " + item.estimated_hours + "h"));
+    if (item.customer_name) meta.appendChild(el("span", null, item.customer_name));
+    card.appendChild(meta);
+    if (item.description) card.appendChild(el("p", "card-desc", item.description));
+    if (item.requirements && item.requirements.length) {
+      const section = el("div", "card-section");
+      section.appendChild(el("h4", null, "交付要求"));
+      const reqs = el("div", "reqs");
+      item.requirements.forEach(function (req) {
+        reqs.appendChild(el("span", "reason", req));
+      });
+      section.appendChild(reqs);
+      card.appendChild(section);
+    }
+    const reasons = el("div", "reasons");
+    (item.reasons || []).forEach(function (reason) {
+      reasons.appendChild(el("span", "reason", reason));
+    });
+    card.appendChild(reasons);
+    if (item.features) {
+      const section = el("div", "card-section");
+      section.appendChild(el("h4", null, "七维匹配"));
+      const grid = el("div", "feature-grid");
+      Object.keys(FEATURE_LABELS).forEach(function (key) {
+        const row = el("div", "feature-row");
+        row.appendChild(el("div", null, FEATURE_LABELS[key]));
+        const track = el("div", "feature-track");
+        const fill = el("i");
+        fill.style.width = Math.max(2, Number(item.features[key] || 0) * 100) + "%";
+        track.appendChild(fill);
+        row.appendChild(track);
+        row.appendChild(el("div", "feature-val", Number(item.features[key] || 0).toFixed(2)));
+        grid.appendChild(row);
+      });
+      section.appendChild(grid);
+      card.appendChild(section);
+    }
+    const scoreLine = el("div", "score-line");
+    scoreLine.appendChild(el("b", null, fmt(item.score)));
+    scoreLine.appendChild(el("span", null, "匹配分 · 曝光概率 " + (item.propensity !== undefined ? Number(item.propensity).toFixed(2) : "—")));
+    card.appendChild(scoreLine);
+    viewport.appendChild(card);
+    setActions(true);
+  }
+
+  function setActions(enabled) {
+    $("#btn-accept").disabled = !enabled;
+    $("#btn-skip").disabled = !enabled;
+  }
+
+  function advance() {
+    state.queueIndex += 1;
+    if (state.queueIndex < state.queue.length) {
+      renderCurrent();
+      return;
+    }
+    if (state.draft) {
+      refreshFeed();
+    }
+  }
+
+  function acceptCurrent() {
+    const item = currentItem();
+    if (!item) return;
+    state.accepted.push(item.id);
+    if (!state.myTasks[item.id]) {
+      state.myTasks[item.id] = {
+        task_id: item.id, title: item.title, subtitle: item.subtitle,
+        description: item.description, accepted_at: new Date().toISOString(),
+        auto: item.completion ? {
+          dimensions: Object.assign({}, item.completion.dimensions),
+          total: item.completion.total
+        } : null,
+        final: null, deliverable: "", status: "accepted",
+        adjusted: false, evaluated_at: null
+      };
+    }
+    addSeen(item.id);
+    saveState();
+    renderFunnel();
+    renderMyTasks();
+    advance();
+  }
+
+  function skipCurrent() {
+    const item = currentItem();
+    if (!item) return;
+    state.skipped.push(item.id);
+    addSeen(item.id);
+    saveState();
+    renderFunnel();
+    advance();
+  }
+
+  async function refreshFeed() {
+    if (!state.draft || state.busy) return;
+    state.busy = true;
+    $("#btn-sync").disabled = true;
+    const viewport = $("#feed-viewport");
+    viewport.textContent = "";
+    const loading = el("div", "card");
+    const box = el("div", "loading");
+    box.innerHTML = "<span class='spinner'></span>正在推送…";
+    loading.appendChild(box);
+    viewport.appendChild(loading);
+    setActions(false);
+    try {
+      const data = await post("/demo/resume/refresh", {
+        draft: state.draft,
+        weights: state.weights,
+        personal_samples: state.personalSamples,
+        seen: state.seen,
+        refresh: state.refresh,
+        accepted: state.accepted,
+        accepted_history: state.evaluated,
+        completion_records: state.evaluated
+          .map(function (id) { return state.completionRecords[id]; })
+          .filter(Boolean),
+        skipped: state.skipped,
+        request_id: state.lastRequestId,
+        batch_size: 10,
+        retrieval_limit: 300
+      });
+      state.weights = data.weights;
+      state.delta = data.delta;
+      state.personalSamples = data.personalization
+        ? data.personalization.sample_count : state.personalSamples;
+      state.lastRequestId = data.request_id;
+      state.refresh = data.refresh;
+      state.capability = data.capability;
+      state.funnel = data.funnel || state.funnel;
+      state.poolSize = data.pool_size;
+      state.retrievalPool = data.retrieval_pool;
+      state.exhausted = data.exhausted;
+      state.profile = data.profile || state.profile;
+      state.personalization = data.personalization || null;
+      state.queue = data.feed || [];
+      state.queueIndex = 0;
+      state.accepted = [];
+      state.skipped = [];
+      saveState();
+      renderAll();
+      renderCurrent();
+      if (!state.queue.length) {
+        $("#feed-hint").textContent = state.exhausted
+          ? "任务池已刷完"
+          : "暂无更多推荐";
+      }
+      if (
+        state.refresh === 1 &&
+        new URLSearchParams(window.location.search).get("autorun") === "1"
+      ) {
+        setTimeout(function () { acceptCurrent(); }, 400);
+        setTimeout(function () { skipCurrent(); }, 900);
+        setTimeout(function () { refreshFeed(); }, 1600);
+      }
+    } catch (error) {
+      viewport.textContent = "";
+      const card = el("div", "card");
+      const box = el("div", "empty-card");
+      box.appendChild(el("div", null, "推送失败：" + error.message));
+      const btn = el("button", "primary", "重试");
+      btn.addEventListener("click", refreshFeed);
+      box.appendChild(btn);
+      card.appendChild(box);
+      viewport.appendChild(card);
+    } finally {
+      state.busy = false;
+      $("#btn-sync").disabled = false;
+    }
+  }
+
+  function renderCurrent() {
+    renderCard(currentItem());
+    renderFunnel();
+    renderAll();
+    saveState();
+  }
+
+  /* ------------------------------ drawers ------------------------------ */
+  let drawerName = null;
+  function openDrawer(name) {
+    drawerName = name;
+    $("#drawer-title").textContent = { resume: "简历", tasks: "我的任务", capability: "能力评价" }[name] || name;
+    $$("#drawer [data-panel]").forEach(function (panel) {
+      panel.hidden = panel.dataset.panel !== name;
+    });
+    $("#drawer").hidden = false;
+    $("#drawer-overlay").hidden = false;
+    renderAll();
+  }
+  function closeDrawer() {
+    drawerName = null;
+    $("#drawer").hidden = true;
+    $("#drawer-overlay").hidden = true;
+  }
+
+  /* ---------------------------- presentation --------------------------- */
+  function renderProfile() {
+    const box = $("#profile");
+    box.textContent = "";
+    const profile = state.profile;
+    if (!profile) {
+      box.textContent = "还没有解析简历。";
+      box.className = "muted";
+      return;
+    }
+    box.className = "profile";
+    const analysisPay = state.analysis && state.analysis.expected_pay;
+    let payText = "未识别";
+    if (profile.expected_pay) payText = "¥" + Math.round(profile.expected_pay);
+    else if (analysisPay && analysisPay.value) {
+      payText = "¥" + Math.round(analysisPay.value) + (analysisPay.period ? "/" + analysisPay.period : "") + "（简历）";
+    }
+    [
+      ["姓名", profile.name], ["地区", profile.region],
+      ["等级", "L" + profile.level], ["期望报酬", payText]
+    ].forEach(function (entry) {
+      const chip = el("div", "stat");
+      chip.appendChild(el("span", "muted", entry[0]));
+      chip.appendChild(el("b", null, entry[1]));
+      box.appendChild(chip);
+    });
+    if (profile.skills && profile.skills.length) {
+      const row = el("div", "chips");
+      row.style.width = "100%";
+      profile.skills.forEach(function (pair) {
+        row.appendChild(el("span", "chip", pair[0] + " " + pair[1]));
+      });
+      box.appendChild(row);
+    }
+    if (profile.categories && profile.categories.length) {
+      const row = el("div", "chips");
+      row.style.width = "100%";
+      profile.categories.forEach(function (item) {
+        row.appendChild(el("span", "chip", item.label + " " + item.score));
+      });
+      box.appendChild(row);
+    }
+    if (state.personalization) {
+      const row = el("div", "chips");
+      row.style.width = "100%";
+      row.appendChild(el("span", "chip", "权重来源 " + state.personalization.source));
+      if (state.personalization.segment_id) {
+        row.appendChild(el("span", "chip", "分群 " + state.personalization.segment_id));
+      }
+      row.appendChild(el("span", "chip", "置信度 " + Number(state.personalization.confidence || 0).toFixed(2)));
+      box.appendChild(row);
+    }
+  }
+
+  function renderWeights() {
+    const box = $("#weights");
+    box.textContent = "";
+    if (!state.weights) {
+      box.appendChild(el("div", "muted", "解析简历后显示。"));
+      return;
+    }
+    Object.keys(FEATURE_LABELS).forEach(function (key) {
+      const value = state.weights[key] || 0;
+      const delta = (state.delta && state.delta[key]) || 0;
+      const row = el("div", "weight-row");
+      row.appendChild(el("div", "weight-name", FEATURE_LABELS[key]));
+      const track = el("div", "weight-track");
+      const fill = el("i");
+      fill.style.width = Math.max(2, (value / 0.45) * 100) + "%";
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.appendChild(el("div", "weight-val", fmt(value, 3)));
+      const cls = delta > 0.0005 ? "delta pos" : (delta < -0.0005 ? "delta neg" : "delta");
+      row.appendChild(el("div", cls, (delta > 0 ? "+" : "") + fmt(delta, 3)));
+      box.appendChild(row);
+    });
+  }
+
+  function renderMyTasks() {
+    const box = $("#my-tasks");
+    box.textContent = "";
+    const records = Object.values(state.myTasks);
+    if (!records.length) {
+      box.appendChild(el("div", "muted", "还没有接单任务。"));
+      $("#my-tasks-status").textContent = "接单后会保存在这里。";
+      return;
+    }
+    records.forEach(function (record) {
+      const row = el("div", "task-row");
+      const body = el("div");
+      body.appendChild(el("div", "task-row-title", record.title));
+      body.appendChild(el("div", "task-row-sub", record.subtitle || ""));
+      row.appendChild(body);
+      row.appendChild(el(
+        "span",
+        "status-badge " + (record.status === "evaluated" ? "evaluated" : "accepted"),
+        record.status === "evaluated" ? "已评价" : "待提交"
+      ));
+      row.appendChild(el("div", "task-score", record.final ? Number(record.final.total).toFixed(1) : "—"));
+      const btn = el("button", "primary", record.status === "evaluated" ? "查看评价" : "提交与评价");
+      btn.addEventListener("click", function () { openTaskModal(record.task_id); });
+      row.appendChild(btn);
+      box.appendChild(row);
+    });
+    $("#my-tasks-status").textContent =
+      "共 " + records.length + " 个任务 · 已评价 " + state.evaluated.length + " 个";
+  }
+
+  function renderDimensionList(container, dimensions, emptyText) {
+    container.textContent = "";
+    if (!dimensions || !dimensions.length) {
+      container.appendChild(el("div", "muted", emptyText || "暂无数据"));
+      return;
+    }
+    dimensions.forEach(function (dimension) {
+      const row = el("div", "cap-row");
+      row.appendChild(el("div", "cap-name", dimension.label));
+      const track = el("div", "cap-track");
+      const fill = el("i");
+      fill.style.width = Math.max(2, dimension.score) + "%";
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.appendChild(el("div", "cap-val", Number(dimension.score).toFixed(1)));
+      row.appendChild(el("div", "cap-weight", Math.round(dimension.weight * 100) + "%"));
+      container.appendChild(row);
+    });
+  }
+
+  function renderCompletionList() {
+    const box = $("#completion-list");
+    box.textContent = "";
+    const records = state.evaluated
+      .map(function (id) { return state.myTasks[id]; })
+      .filter(function (record) { return record && record.final; });
+    if (!records.length) return;
+    box.appendChild(el("div", "completion-title", "已评价完成度"));
+    records.forEach(function (record) {
+      const row = el("div", "saved-row");
+      row.appendChild(el("span", null, record.title + (record.adjusted ? " · 手动" : " · 自动")));
+      row.appendChild(el("b", null, Number(record.final.total).toFixed(1)));
+      box.appendChild(row);
+    });
+  }
+
+  function renderCapability() {
+    const cap = state.capability;
+    if (!cap) {
+      $("#cap-overall").textContent = "—";
+      $("#cap-grade").textContent = "—";
+      $("#cap-summary").textContent = "解析简历后生成静态能力画像，提交评价后生成模拟履约数据。";
+      renderDimensionList($("#cap-static"), [], "解析简历后显示。");
+      renderDimensionList($("#cap-dynamic"), [], "提交评价后生成。");
+      $("#cap-insights").textContent = "";
+      $("#cap-note").textContent = "";
+      return;
+    }
+    $("#cap-overall").textContent = Number(cap.overall).toFixed(1);
+    $("#cap-grade").textContent = cap.grade;
+    $("#cap-summary").textContent =
+      "静态 " + Number(cap.static.overall).toFixed(1) +
+      (cap.dynamic.available
+        ? " · 动态 " + Number(cap.dynamic.overall).toFixed(1)
+        : " · 等待履约样本");
+    renderDimensionList($("#cap-static"), cap.static.dimensions);
+    renderDimensionList($("#cap-dynamic"), cap.dynamic.dimensions, cap.dynamic.note);
+    const insights = $("#cap-insights");
+    insights.textContent = "";
+    (cap.strengths || []).forEach(function (item) {
+      const row = el("div", "cap-insight good");
+      row.appendChild(el("span", null, "优势 · " + item.label));
+      row.appendChild(el("b", null, Number(item.score).toFixed(1)));
+      insights.appendChild(row);
+    });
+    (cap.gaps || []).forEach(function (item) {
+      const row = el("div", "cap-insight bad");
+      row.appendChild(el("span", null, "短板 · " + item.label));
+      row.appendChild(el("b", null, Number(item.score).toFixed(1)));
+      insights.appendChild(row);
+    });
+    $("#cap-note").textContent = cap.note + " " + (cap.dynamic.note || "");
+  }
+
+  function debugKv(label, value) {
+    const row = el("div", "debug-kv");
+    row.appendChild(el("span", null, label));
+    row.appendChild(el("b", null, value === null || value === undefined ? "—" : value));
+    return row;
+  }
+
+  function debugBlock(title) {
+    const block = el("div", "debug-block");
+    block.appendChild(el("h5", null, title));
+    return block;
+  }
+
+  function renderDebug() {
+    const body = $("#debug-body");
+    if (!body) return;
+    body.textContent = "";
+    const item = currentItem();
+
+    const session = debugBlock("会话 / 请求");
+    const grid = el("div", "debug-grid");
+    [
+      ["refresh", state.refresh],
+      ["queue", (state.queue.length ? state.queueIndex + 1 : 0) + " / " + state.queue.length],
+      ["seen", state.seen.length],
+      ["pending", "+" + state.accepted.length + " / -" + state.skipped.length],
+      ["pool", state.poolSize],
+      ["retrieval", state.retrievalPool],
+      ["request", state.lastRequestId ? state.lastRequestId.slice(0, 10) : "—"],
+      ["samples", state.personalSamples]
+    ].forEach(function (entry) {
+      grid.appendChild(debugKv(entry[0], entry[1]));
+    });
+    session.appendChild(grid);
+    body.appendChild(session);
+
+    const task = debugBlock("当前任务");
+    if (!item) {
+      task.appendChild(el("div", "muted", "暂无当前任务。"));
+    } else {
+      const grid = el("div", "debug-grid");
+      [
+        ["id", item.id],
+        ["rank", "#" + item.rank],
+        ["score", fmt(item.score)],
+        ["propensity", item.propensity !== undefined ? Number(item.propensity).toFixed(3) : "—"],
+        ["budget", "¥" + Math.round(item.budget)],
+        ["category", item.category],
+        ["difficulty", item.difficulty],
+        ["hours", item.estimated_hours]
+      ].forEach(function (entry) {
+        grid.appendChild(debugKv(entry[0], entry[1]));
+      });
+      task.appendChild(grid);
+      if (item.features) {
+        const featureBox = el("div");
+        featureBox.style.marginTop = "6px";
+        Object.keys(FEATURE_LABELS).forEach(function (key) {
+          const row = el("div", "debug-feature");
+          row.appendChild(el("div", null, FEATURE_LABELS[key]));
+          const track = el("div", "track");
+          const fill = el("i");
+          fill.style.width = Math.max(2, Number(item.features[key] || 0) * 100) + "%";
+          track.appendChild(fill);
+          row.appendChild(track);
+          row.appendChild(el("div", null, Number(item.features[key] || 0).toFixed(2)));
+          featureBox.appendChild(row);
+        });
+        task.appendChild(featureBox);
+      }
+      if (item.reasons && item.reasons.length) {
+        const reasons = el("div", "debug-reasons");
+        item.reasons.forEach(function (reason) {
+          reasons.appendChild(el("span", null, reason));
+        });
+        task.appendChild(reasons);
+      }
+      if (item.completion) {
+        task.appendChild(el("div", "muted", "自动完成度 " + Number(item.completion.total).toFixed(1)));
+      }
+      const raw = el("pre", "debug-json", JSON.stringify(item, null, 2));
+      task.appendChild(raw);
+    }
+    body.appendChild(task);
+
+    const weights = debugBlock("七维权重");
+    if (!state.weights) {
+      weights.appendChild(el("div", "muted", "暂无。"));
+    } else {
+      Object.keys(FEATURE_LABELS).forEach(function (key) {
+        const delta = (state.delta && state.delta[key]) || 0;
+        weights.appendChild(debugKv(
+          FEATURE_LABELS[key],
+          Number(state.weights[key]).toFixed(4) +
+            " (" + (delta > 0 ? "+" : "") + Number(delta).toFixed(4) + ")"
+        ));
+      });
+    }
+    body.appendChild(weights);
+
+    const personal = debugBlock("个人权重 / 探索");
+    if (state.personalization) {
+      personal.appendChild(debugKv("source", state.personalization.source));
+      personal.appendChild(debugKv("segment", state.personalization.segment_id));
+      personal.appendChild(debugKv("confidence", Number(state.personalization.confidence || 0).toFixed(3)));
+      personal.appendChild(debugKv("version", state.personalization.version));
+    } else {
+      personal.appendChild(el("div", "muted", "暂无。"));
+    }
+    body.appendChild(personal);
+
+    const funnel = debugBlock("事件漏斗");
+    Object.keys(state.funnel || {}).forEach(function (key) {
+      funnel.appendChild(debugKv(key, state.funnel[key]));
+    });
+    body.appendChild(funnel);
+  }
+
+  function renderAll() {
+    renderProfile();
+    renderWeights();
+    renderMyTasks();
+    renderCapability();
+    renderCompletionList();
+    renderFunnel();
+    renderDebug();
+  }
+
+  /* ------------------------- completion modal ------------------------- */
+  function completionTotal(dimensions) {
+    let total = 0;
+    Object.keys(COMPLETION_WEIGHTS).forEach(function (key) {
+      total += Number(dimensions[key] || 0) * COMPLETION_WEIGHTS[key];
+    });
+    return Math.round(total * 10) / 10;
+  }
+
+  function openTaskModal(taskId) {
+    const record = state.myTasks[taskId];
+    if (!record) return;
+    state.modalTaskId = taskId;
+    state.modalAdjusted = Boolean(record.adjusted);
+    const source = (record.final && record.final.dimensions)
+      || (record.auto && record.auto.dimensions)
+      || { requirement_coverage: 60, quality: 60, timeliness: 60, completeness: 60, communication: 60 };
+    state.modalDimensions = Object.assign({}, source);
+    $("#modal-task-title").textContent = record.title;
+    $("#modal-task-sub").textContent = record.subtitle || "";
+    $("#modal-task-desc").textContent = record.description || "";
+    $("#modal-deliverable").value = record.deliverable || "";
+    $("#modal-error").textContent = "";
+    $("#modal-badge").textContent = record.status === "evaluated"
+      ? "已评价"
+      : (record.adjusted ? "手动调整" : "自动初评");
+    $("#modal-badge").classList.toggle("adjusted", record.adjusted);
+    renderModalSliders();
+    $("#task-modal").hidden = false;
+  }
+
+  function renderModalSliders() {
+    const box = $("#modal-sliders");
+    box.textContent = "";
+    const totalLabel = $("#modal-total");
+    totalLabel.textContent = completionTotal(state.modalDimensions).toFixed(1);
+    Object.keys(COMPLETION_LABELS).forEach(function (key) {
+      const row = el("div", "completion-row");
+      row.appendChild(el("div", null, COMPLETION_LABELS[key]));
+      const input = document.createElement("input");
+      input.type = "range"; input.min = "0"; input.max = "100"; input.step = "1";
+      input.value = String(Math.round(state.modalDimensions[key] || 0));
+      const value = el("div", "cr-value", input.value);
+      const weight = el("div", "cr-weight", Math.round(COMPLETION_WEIGHTS[key] * 100) + "%");
+      input.addEventListener("input", function () {
+        state.modalDimensions[key] = Number(input.value);
+        state.modalAdjusted = true;
+        value.textContent = input.value;
+        totalLabel.textContent = completionTotal(state.modalDimensions).toFixed(1);
+        $("#modal-badge").textContent = "手动调整";
+        $("#modal-badge").classList.add("adjusted");
+      });
+      row.appendChild(input);
+      row.appendChild(value);
+      row.appendChild(weight);
+      box.appendChild(row);
+    });
+  }
+
+  function closeTaskModal() {
+    $("#task-modal").hidden = true;
+    state.modalTaskId = null;
+  }
+
+  function submitEvaluation() {
+    const taskId = state.modalTaskId;
+    const record = taskId ? state.myTasks[taskId] : null;
+    if (!record) return;
+    const deliverable = $("#modal-deliverable").value.trim();
+    if (!deliverable) {
+      $("#modal-error").textContent = "请填写交付说明或交付链接。";
+      return;
+    }
+    const dimensions = Object.assign({}, state.modalDimensions);
+    const total = completionTotal(dimensions);
+    record.final = { task_id: taskId, dimensions: dimensions, total: total };
+    record.deliverable = deliverable;
+    record.status = "evaluated";
+    record.adjusted = state.modalAdjusted;
+    record.evaluated_at = new Date().toISOString();
+    state.completionRecords[taskId] = {
+      task_id: taskId, dimensions: Object.assign({}, dimensions), total: total
+    };
+    if (!state.evaluated.includes(taskId)) state.evaluated.push(taskId);
+    saveState();
+    closeTaskModal();
+    renderAll();
+    if (drawerName === "tasks") openDrawer("tasks");
+    refreshFeed();
+  }
+
+  /* ------------------------------ parsing ------------------------------ */
+  async function parseResume() {
+    const text = $("#resume-text").value.trim();
+    if (!text) { $("#error").textContent = "请先写一份简历。"; return; }
+    $("#error").textContent = "";
+    $("#btn-parse").disabled = true;
+    $("#status").textContent = "解析中…";
+    try {
+      const data = await post("/resume/analyze", { text: text, top_n: 5 });
+      const firstLine = text.split(/\n/)[0].trim();
+      const candidateName = firstLine.split(/[，,、\s]/)[0];
+      if (data.draft && candidateName && candidateName.length <= 20) {
+        data.draft.name = candidateName;
+      }
+      state.analysis = data.analysis || null;
+      state.draft = data.draft;
+      state.weights = null;
+      state.personalSamples = 0;
+      state.lastRequestId = null;
+      state.seen = [];
+      state.refresh = 0;
+      state.queue = [];
+      state.queueIndex = 0;
+      state.accepted = [];
+      state.skipped = [];
+      state.myTasks = {};
+      state.evaluated = [];
+      state.completionRecords = {};
+      state.capability = null;
+      state.profile = null;
+      state.exhausted = false;
+      setAuto(false);
+      $("#auto-toggle").checked = false;
+      saveState();
+      closeDrawer();
+      await refreshFeed();
+      $("#status").textContent = "推送中";
+    } catch (error) {
+      $("#error").textContent = error.message;
+      $("#status").textContent = "解析失败";
+    } finally {
+      $("#btn-parse").disabled = false;
+    }
+  }
+
+  function resetFeed() {
+    state.seen = [];
+    state.refresh = 0;
+    state.queue = [];
+    state.queueIndex = 0;
+    state.accepted = [];
+    state.skipped = [];
+    state.weights = null;
+    state.delta = null;
+    state.personalSamples = 0;
+    state.lastRequestId = null;
+    state.exhausted = false;
+    state.capability = null;
+    saveState();
+    renderAll();
+    if (state.draft) refreshFeed();
+  }
+
+  function setAuto(on) {
+    state.auto = on;
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+    if (on) {
+      state.timer = setInterval(function () {
+        if (state.busy) return;
+        if (state.queueIndex < state.queue.length - 1) advance();
+        else if (state.draft) refreshFeed();
+      }, 8000);
+    }
+  }
+
+  /* ------------------------------- init -------------------------------- */
+  function init() {
+    $("#btn-example").addEventListener("click", function () {
+      $("#resume-text").value = EXAMPLE;
+    });
+    $("#btn-parse").addEventListener("click", parseResume);
+    $("#btn-sync").addEventListener("click", function () {
+      if (state.draft) refreshFeed();
+      else openDrawer("resume");
+    });
+    $("#btn-accept").addEventListener("click", acceptCurrent);
+    $("#btn-skip").addEventListener("click", skipCurrent);
+    $("#btn-clear").addEventListener("click", clearSaved);
+    $("#auto-toggle").addEventListener("change", function (event) {
+      setAuto(event.target.checked);
+    });
+    function closeDebug() {
+      $("#debug-panel").classList.remove("open");
+      $(".workspace").classList.add("no-debug");
+    }
+    $("#btn-debug").addEventListener("click", function () {
+      if (window.matchMedia("(max-width: 1100px)").matches) {
+        $("#debug-panel").classList.toggle("open");
+      } else {
+        $(".workspace").classList.toggle("no-debug");
+      }
+    });
+    $("#debug-close").addEventListener("click", closeDebug);
+    $$("[data-drawer]").forEach(function (button) {
+      button.addEventListener("click", function () { openDrawer(button.dataset.drawer); });
+    });
+    $("#drawer-close").addEventListener("click", closeDrawer);
+    $("#drawer-overlay").addEventListener("click", closeDrawer);
+    $("#modal-close").addEventListener("click", closeTaskModal);
+    $("#modal-cancel").addEventListener("click", closeTaskModal);
+    $("#modal-submit").addEventListener("click", submitEvaluation);
+    $("#task-modal").addEventListener("click", function (event) {
+      if (event.target === this) closeTaskModal();
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") {
+        if (!$("#task-modal").hidden) { closeTaskModal(); return; }
+        if (!$("#drawer").hidden) closeDrawer();
+        return;
+      }
+      if ($("#task-modal").hidden === false) return;
+      if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+        event.preventDefault();
+        if (state.queueIndex < state.queue.length - 1) advance();
+        else if (state.draft) refreshFeed();
+      }
+      if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+        event.preventDefault();
+      }
+      if (event.key === " ") {
+        event.preventDefault();
+        if (state.queueIndex < state.queue.length - 1) advance();
+        else if (state.draft) refreshFeed();
+      }
+    });
+    let touchStart = null;
+    const stage = $(".feed-stage");
+    stage.addEventListener("touchstart", function (event) {
+      touchStart = event.touches[0].clientY;
+    }, { passive: true });
+    stage.addEventListener("touchend", function (event) {
+      if (touchStart === null) return;
+      const delta = touchStart - event.changedTouches[0].clientY;
+      touchStart = null;
+      if (delta > 60) {
+        if (state.queueIndex < state.queue.length - 1) advance();
+        else if (state.draft) refreshFeed();
+      }
+    }, { passive: true });
+    let wheelLock = false;
+    stage.addEventListener("wheel", function (event) {
+      if (wheelLock) return;
+      if (Math.abs(event.deltaY) < 18) return;
+      wheelLock = true;
+      setTimeout(function () { wheelLock = false; }, 500);
+      if (event.deltaY > 0) {
+        if (state.queueIndex < state.queue.length - 1) advance();
+        else if (state.draft) refreshFeed();
+      }
+    }, { passive: true });
+
+    if (window.location.protocol === "file:") {
+      $("#error").textContent = "推送需要后端：请通过 http://127.0.0.1:8010/ui/resume-feed.html 打开。";
+    }
+    const restored = restoreState();
+    renderAll();
+    if (restored) {
+      $("#status").textContent = "已恢复上次保存的简历与任务";
+      refreshFeed();
+    } else {
+      renderCard(null);
+      openDrawer("resume");
+    }
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("start") === "1") {
+      parseResume();
+    }
+    if (params.get("drawer")) {
+      setTimeout(function () {
+        openDrawer(params.get("drawer"));
+      }, 50);
+    }
+  }
+
+  init();
+}());
+</script>
+</body>
+</html>

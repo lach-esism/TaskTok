@@ -42,14 +42,16 @@ def is_eligible(
     task: Task,
     store: Store,
     now: datetime | None = None,
+    require_skills: bool = True,
 ) -> tuple[bool, str]:
     if task.status != "open":
         return False, "task is not open"
     if worker.status != "active":
         return False, "worker is not active"
-    for skill, minimum in task.required_skills.items():
-        if worker.skills.get(skill, 0) < minimum:
-            return False, f"missing skill: {skill}"
+    if require_skills:
+        for skill, minimum in task.required_skills.items():
+            if worker.skills.get(skill, 0) < minimum:
+                return False, f"missing skill: {skill}"
     if worker.level < task.required_level:
         return False, "worker level below required"
     if (
@@ -401,7 +403,12 @@ class RecommendationService:
         return candidates[: max(0, top_n)]
 
     def recommend_tasks(
-        self, worker_id: str, top_n: int = 10, user_id: str | None = None
+        self,
+        worker_id: str,
+        top_n: int = 10,
+        user_id: str | None = None,
+        candidate_ids: set[str] | None = None,
+        require_skills: bool = True,
     ) -> list[ScoredCandidate]:
         worker = self.store.workers.get(worker_id)
         if worker is None:
@@ -414,10 +421,16 @@ class RecommendationService:
         }
         eligible: list[Task] = []
         for task in self.store.tasks.values():
+            if candidate_ids is not None and task.task_id not in candidate_ids:
+                continue
             if task.task_id in assigned_task_ids:
                 continue
             ok, _ = is_eligible(
-                worker, task, self.store, now=self.reference_time
+                worker,
+                task,
+                self.store,
+                now=self.reference_time,
+                require_skills=require_skills,
             )
             if ok:
                 eligible.append(task)

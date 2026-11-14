@@ -8,8 +8,16 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from app.chains.dag import critical_path, topological_order, validate_dag
+from app.chains.materialize import build_subtask_task
 from app.chains.split_rules import ModuleRule, batch_rule_for, rules_for
-from app.domain import ChainEdge, DecompositionDraft, SubTask, Task
+from app.data.store import Store
+from app.domain import (
+    ChainEdge,
+    DecompositionDraft,
+    DecompositionQuality,
+    SubTask,
+    Task,
+)
 
 _FLOAT_FIELDS = ("target_hours", "min_hours", "max_hours")
 _INT_FIELDS = ("max_pieces", "min_batch_size", "default_batch_size")
@@ -602,3 +610,150 @@ def apply_split(
     draft.split_policy = asdict(policy)
     draft.split_count = len(nodes)
     return draft
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def split_quality_score(
+    draft: DecompositionDraft,
+    task: Task,
+    store: Store,
+    policy: SplitPolicy,
+) -> DecompositionQuality:
+    """Score a split draft with the v2 split-specific rubric."""
+    nodes = draft.chain.nodes
+    requirements = draft.requirements
+    covered = sum(
+        1
+        for requirement in requirements
+        if draft.coverage.get(requirement)
+        and requirement not in draft.uncovered_requirements
+    )
+    coverage = covered / max(1, len(requirements))
+
+    non_delivery = [
+        node for node in nodes if node.node_type != "delivery"
+    ]
+    granularity = (
+        sum(
+            1
+            for node in non_delivery
+            if policy.min_hours <= node.estimated_hours <= policy.max_hours
+        )
+        / max(1, len(non_delivery))
+    )
+    dependency = 1.0 if validate_dag(nodes).valid else 0.0
+
+    workers = list(store.workers.values())
+    feasible = sum(
+        1
+        for node in nodes
+        if any(
+            worker.status == "active"
+            and all(
+                worker.skills.get(skill, 0) >= minimum
+                for skill, minimum in node.required_skills.items()
+            )
+            and worker.current_load_hours + node.estimated_hours
+            <= worker.capacity_hours
+            for worker in workers
+        )
+    )
+    feasibility = feasible / max(1, len(nodes))
+
+    total_hours = sum(node.estimated_hours for node in nodes)
+    total_budget = sum(node.budget for node in nodes)
+    effective_hours = (
+        task.estimated_hours
+        if task.estimated_hours > 0
+        else total_hours
+    )
+    hours_dev = abs(total_hours - effective_hours) / max(
+        effective_hours, 1
+    )
+    budget_dev = abs(total_budget - task.budget) / max(task.budget, 1)
+    parent_deadline = _as_aware(task.deadline)
+    deadlines = [
+        _as_aware(node.deadline)
+        for node in nodes
+        if node.deadline is not None
+    ]
+    latest = max(deadlines, default=parent_deadline)
+    deadline_dev = max(
+        0.0, (latest - parent_deadline).total_seconds() / 3600
+    ) / max(effective_hours, 1)
+    split_fidelity = 1.0 - _clamp(
+        (hours_dev + budget_dev + deadline_dev) / 3.0
+    )
+
+    now = datetime.now(timezone.utc)
+    materializable = 0
+    for node in nodes:
+        try:
+            built = build_subtask_task(
+                task, node, draft.chain, draft.draft_id
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            built.estimated_hours > 0
+            and built.budget >= 0
+            and built.required_level >= 1
+            and built.required_skills
+            and _as_aware(built.deadline) <= parent_deadline
+            and _as_aware(built.deadline) >= now
+        ):
+            materializable += 1
+    materializability = materializable / max(1, len(nodes))
+
+    template_category = getattr(
+        draft, "template_category", ""
+    )
+    template_fit = 1.0 if template_category == task.category else 0.5
+    historical_success = 0.5
+    risk_penalty = min(
+        0.20, 0.05 * sum(len(node.risk_flags) for node in nodes)
+    )
+    total = _clamp(
+        0.28 * coverage
+        + 0.18 * granularity
+        + 0.12 * split_fidelity
+        + 0.12 * dependency
+        + 0.14 * feasibility
+        + 0.08 * materializability
+        + 0.05 * template_fit
+        + 0.03 * historical_success
+        - risk_penalty
+    )
+
+    issues: list[str] = []
+    if coverage < 1.0:
+        issues.append(
+            "uncovered requirements: "
+            + (", ".join(draft.uncovered_requirements) or "unknown")
+        )
+    if dependency < 1.0:
+        issues.append("invalid DAG")
+    if feasibility < 1.0:
+        issues.append("not every node has a feasible worker")
+    if materializability < 1.0:
+        issues.append("not every node can be materialized")
+    if split_fidelity < 0.95:
+        issues.append("split totals deviate from the parent task")
+
+    return DecompositionQuality(
+        coverage=coverage,
+        granularity=granularity,
+        dependency=dependency,
+        feasibility=feasibility,
+        template_fit=template_fit,
+        historical_success=historical_success,
+        risk_penalty=risk_penalty,
+        total=total,
+        issues=issues,
+        split_fidelity=split_fidelity,
+        materializability=materializability,
+        quality_version="v2-split",
+    )

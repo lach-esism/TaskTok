@@ -1679,7 +1679,20 @@ def create_app(
                     else None
                 ),
             )
-            draft.quality = quality_score(draft, current)
+            if request.split:
+                from app.chains.split import (
+                    parse_split_policy,
+                    split_quality_score,
+                )
+
+                draft.quality = split_quality_score(
+                    draft,
+                    task,
+                    current,
+                    parse_split_policy(draft.split_policy),
+                )
+            else:
+                draft.quality = quality_score(draft, current)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error))
         app.state.chains[draft.chain.chain_id] = draft.chain

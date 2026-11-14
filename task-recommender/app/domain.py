@@ -467,6 +467,9 @@ class DecompositionQuality:
     risk_penalty: float
     total: float
     issues: list[str] = field(default_factory=list)
+    split_fidelity: float = 1.0
+    materializability: float = 1.0
+    quality_version: str = "v1"
 
 
 @dataclass

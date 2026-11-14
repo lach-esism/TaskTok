@@ -1,0 +1,3601 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-23 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+ADDED   app\benchmark\large.py
+ADDED   app\data\large_synthetic.py
+ADDED   scripts\build_large_benchmark.py
+ADDED   tests\test_large_benchmark.py
+ADDED   tests\test_large_synthetic.py
+
+## Diff
+
+--- a/app\benchmark\large.py
++++ b/app\benchmark\large.py
+@@ -0,0 +1,903 @@
++"""Large-benchmark SQLite/JSONL storage and sampled evaluation.
++
++Ground truth (``labels``) is written to its own table and read only by
++:func:`evaluate_large`. :func:`load_large_sqlite` returns a model-safe dataset
++with an empty ``labels`` mapping so feature/training code cannot read gold
++answers.
++
++The evaluator wires a real :class:`app.models.itemcf.ItemCF`:
++- the item-item similarity graph is built from **train-split accepted**
++  assignments only, and
++- the worker history used for scoring is also **train-split only**, so neither
++  a held-out test task nor its outcomes can enter a candidate's score. Held-out
++  tasks are cold-start items for ItemCF under this strict protocol.
++
++Collaborative scores are normalized across each candidate pool (divide by the
++pool maximum) before being combined with the other six features, which closes
++the Task 14 deferral ("pass an ItemCF built from benchmark interactions").
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import random
++import sqlite3
++from pathlib import Path
++
++import numpy as np
++
++from app.benchmark.features import FEATURE_KEYS
++from app.data.large_synthetic import LargeDataset
++from app.learning_simulation import SIM_INITIAL_WEIGHTS
++from app.models.itemcf import ItemCF
++from app.nlp.classifier import extract_fields, rule_scores
++from sklearn.feature_extraction.text import TfidfVectorizer
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS metadata (
++    key TEXT PRIMARY KEY,
++    value TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS customers (
++    customer_id TEXT PRIMARY KEY,
++    name TEXT NOT NULL,
++    region TEXT NOT NULL,
++    preferred_categories TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS workers (
++    worker_id TEXT PRIMARY KEY,
++    name TEXT NOT NULL,
++    resume_text TEXT NOT NULL,
++    skills TEXT NOT NULL,
++    specialties TEXT NOT NULL,
++    level INTEGER NOT NULL,
++    rating REAL NOT NULL,
++    completed INTEGER NOT NULL,
++    on_time_rate REAL NOT NULL,
++    rework_rate REAL NOT NULL,
++    capacity_hours REAL NOT NULL,
++    current_load_hours REAL NOT NULL,
++    region TEXT NOT NULL,
++    remote_ok INTEGER NOT NULL,
++    preferred_categories TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS tasks (
++    task_id TEXT PRIMARY KEY,
++    customer_id TEXT NOT NULL,
++    title TEXT NOT NULL,
++    task_text TEXT NOT NULL,
++    budget REAL NOT NULL,
++    deadline TEXT NOT NULL,
++    region TEXT NOT NULL,
++    remote_ok INTEGER NOT NULL,
++    split TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS splits (
++    task_id TEXT PRIMARY KEY,
++    split TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS assignments (
++    assignment_id TEXT PRIMARY KEY,
++    task_id TEXT NOT NULL,
++    worker_id TEXT NOT NULL,
++    customer_id TEXT NOT NULL,
++    status TEXT NOT NULL,
++    on_time INTEGER,
++    rating REAL,
++    rework INTEGER,
++    created_at TEXT NOT NULL,
++    split TEXT NOT NULL
++);
++CREATE TABLE IF NOT EXISTS labels (
++    task_id TEXT PRIMARY KEY,
++    gold_worker_id TEXT NOT NULL,
++    split TEXT NOT NULL
++);
++CREATE INDEX IF NOT EXISTS idx_assignments_task ON assignments(task_id);
++CREATE INDEX IF NOT EXISTS idx_assignments_worker ON assignments(worker_id);
++CREATE INDEX IF NOT EXISTS idx_assignments_split ON assignments(split);
++"""
++
++
++def _clamp(value: float) -> float:
++    return max(0.0, min(1.0, value))
++
++
++def _redact_test_outcomes(
++    assignments: list[dict], include_test_outcomes: bool = False
++) -> list[dict]:
++    """Return model-facing assignment rows.
++
++    Test-split outcomes are evaluator-only: by default their status/rating/
++    on-time/rework fields are redacted. Train-split rows are returned intact.
++    The assignment identity, task id, worker id, customer id and split stay
++    visible so the row can still act as an exposure/history record.
++    """
++    rows: list[dict] = []
++    for assignment in assignments:
++        row = dict(assignment)
++        if not include_test_outcomes and row.get("split") == "test":
++            row["status"] = "unknown"
++            row["on_time"] = None
++            row["rating"] = None
++            row["rework"] = None
++        rows.append(row)
++    return rows
++
++
++# ---------------------------------------------------------------------------
++# SQLite / JSONL storage.
++# ---------------------------------------------------------------------------
++def build_large_sqlite(dataset: LargeDataset, path: Path | str) -> str:
++    """Write the large benchmark to SQLite; labels live in their own table."""
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists():
++        path.unlink()
++
++    connection = sqlite3.connect(str(path))
++    try:
++        connection.executescript(SCHEMA)
++        for key, value in dataset.metadata.items():
++            connection.execute(
++                "INSERT INTO metadata(key, value) VALUES (?, ?)",
++                (key, json.dumps(value, ensure_ascii=False)),
++            )
++        for key, value in dataset.stats.items():
++            connection.execute(
++                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
++                (f"stat:{key}", json.dumps(value, ensure_ascii=False)),
++            )
++        connection.executemany(
++            "INSERT INTO customers VALUES (?, ?, ?, ?)",
++            [
++                (
++                    customer["customer_id"],
++                    customer["name"],
++                    customer["region"],
++                    json.dumps(customer["preferred_categories"], ensure_ascii=False),
++                )
++                for customer in dataset.customers
++            ],
++        )
++        connection.executemany(
++            "INSERT INTO workers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            [
++                (
++                    worker["worker_id"],
++                    worker["name"],
++                    worker["resume_text"],
++                    json.dumps(worker["skills"], ensure_ascii=False),
++                    json.dumps(worker["specialties"], ensure_ascii=False),
++                    worker["level"],
++                    worker["rating"],
++                    worker["completed"],
++                    worker["on_time_rate"],
++                    worker["rework_rate"],
++                    worker["capacity_hours"],
++                    worker["current_load_hours"],
++                    worker["region"],
++                    worker["remote_ok"],
++                    json.dumps(worker["preferred_categories"], ensure_ascii=False),
++                )
++                for worker in dataset.workers
++            ],
++        )
++        connection.executemany(
++            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            [
++                (
++                    task["task_id"],
++                    task["customer_id"],
++                    task["title"],
++                    task["task_text"],
++                    task["budget"],
++                    task["deadline"],
++                    task["region"],
++                    task["remote_ok"],
++                    task["split"],
++                )
++                for task in dataset.tasks
++            ],
++        )
++        connection.executemany(
++            "INSERT INTO splits VALUES (?, ?)",
++            [(task_id, split) for task_id, split in dataset.splits.items()],
++        )
++        connection.executemany(
++            "INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            [
++                (
++                    assignment["assignment_id"],
++                    assignment["task_id"],
++                    assignment["worker_id"],
++                    assignment["customer_id"],
++                    assignment["status"],
++                    assignment["on_time"],
++                    assignment["rating"],
++                    assignment["rework"],
++                    assignment["created_at"],
++                    assignment["split"],
++                )
++                for assignment in dataset.assignments
++            ],
++        )
++        connection.executemany(
++            "INSERT INTO labels VALUES (?, ?, ?)",
++            [
++                (
++                    task_id,
++                    label["gold_worker_id"],
++                    label["split"],
++                )
++                for task_id, label in dataset.labels.items()
++            ],
++        )
++        connection.commit()
++    finally:
++        connection.close()
++    return str(path)
++
++
++def load_large_sqlite(
++    path: Path | str, include_test_outcomes: bool = False
++) -> LargeDataset:
++    """Load model-safe tables; labels and build-time stats are not returned.
++
++    Test-split assignment outcomes are redacted unless
++    ``include_test_outcomes=True``. The raw SQLite database is the evaluator
++    artifact; this loader is the model-facing view.
++    """
++    path = Path(path)
++    connection = sqlite3.connect(str(path))
++    connection.row_factory = sqlite3.Row
++    try:
++        metadata_rows = connection.execute(
++            "SELECT key, value FROM metadata"
++        ).fetchall()
++        metadata: dict = {}
++        for row in metadata_rows:
++            if row["key"].startswith("stat:"):
++                # Build-time statistics include all-split assignment outcomes.
++                # They are report/evaluator material, not model-facing input.
++                continue
++            try:
++                metadata[row["key"]] = json.loads(row["value"])
++            except (TypeError, ValueError):
++                metadata[row["key"]] = row["value"]
++
++        customers = [
++            {
++                **dict(row),
++                "preferred_categories": json.loads(row["preferred_categories"]),
++            }
++            for row in connection.execute("SELECT * FROM customers").fetchall()
++        ]
++        workers = [
++            {
++                **dict(row),
++                "skills": json.loads(row["skills"]),
++                "specialties": json.loads(row["specialties"]),
++                "preferred_categories": json.loads(row["preferred_categories"]),
++            }
++            for row in connection.execute("SELECT * FROM workers").fetchall()
++        ]
++        tasks = [dict(row) for row in connection.execute("SELECT * FROM tasks").fetchall()]
++        assignments = _redact_test_outcomes(
++            [
++                dict(row)
++                for row in connection.execute("SELECT * FROM assignments").fetchall()
++            ],
++            include_test_outcomes=include_test_outcomes,
++        )
++        splits = {
++            row["task_id"]: row["split"]
++            for row in connection.execute("SELECT * FROM splits").fetchall()
++        }
++    finally:
++        connection.close()
++    return LargeDataset(
++        workers=workers,
++        tasks=tasks,
++        customers=customers,
++        assignments=assignments,
++        splits=splits,
++        metadata=metadata,
++        stats={},
++        labels={},
++    )
++
++
++def export_large_jsonl(
++    dataset: LargeDataset,
++    path: Path | str,
++    include_test_outcomes: bool = False,
++) -> str:
++    """Export model-safe records as newline-delimited JSON.
++
++    No labels are written. Test-split assignment outcomes are redacted unless
++    ``include_test_outcomes=True``; build-time statistics (which aggregate
++    test outcomes) are not written to the model-facing JSONL. The stats report
++    is written separately by the build script.
++    """
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    assignments = _redact_test_outcomes(
++        dataset.assignments, include_test_outcomes=include_test_outcomes
++    )
++    with path.open("w", encoding="utf-8") as handle:
++        handle.write(
++            json.dumps(
++                {
++                    "type": "meta",
++                    "metadata": dataset.metadata,
++                    "outcome_policy": {
++                        "test_split": (
++                            "included" if include_test_outcomes else "redacted"
++                        ),
++                        "train_split": "full",
++                    },
++                },
++                ensure_ascii=False,
++            )
++            + "\n"
++        )
++        for worker in dataset.workers:
++            handle.write(json.dumps({"type": "worker", **worker}, ensure_ascii=False) + "\n")
++        for task in dataset.tasks:
++            handle.write(json.dumps({"type": "task", **task}, ensure_ascii=False) + "\n")
++        for customer in dataset.customers:
++            handle.write(json.dumps({"type": "customer", **customer}, ensure_ascii=False) + "\n")
++        for assignment in assignments:
++            handle.write(json.dumps({"type": "assignment", **assignment}, ensure_ascii=False) + "\n")
++        for task_id, split in dataset.splits.items():
++            handle.write(
++                json.dumps(
++                    {"type": "split", "task_id": task_id, "split": split},
++                    ensure_ascii=False,
++                )
++                + "\n"
++            )
++    return str(path)
++
++
++# ---------------------------------------------------------------------------
++# Evaluator-only label access (never used by feature/training code).
++# ---------------------------------------------------------------------------
++class LargeRepository:
++    """Reads model-safe tables and (evaluator-only) labels separately."""
++
++    def __init__(self, db_path: Path | str) -> None:
++        self.db_path = Path(db_path)
++
++    def _connect(self) -> sqlite3.Connection:
++        connection = sqlite3.connect(str(self.db_path))
++        connection.row_factory = sqlite3.Row
++        return connection
++
++    def load_workers(self) -> list[dict]:
++        with self._connect() as connection:
++            rows = connection.execute("SELECT * FROM workers").fetchall()
++        return [
++            {
++                **dict(row),
++                "skills": json.loads(row["skills"]),
++                "specialties": json.loads(row["specialties"]),
++                "preferred_categories": json.loads(row["preferred_categories"]),
++            }
++            for row in rows
++        ]
++
++    def load_tasks(self) -> list[dict]:
++        with self._connect() as connection:
++            return [
++                dict(row)
++                for row in connection.execute("SELECT * FROM tasks").fetchall()
++            ]
++
++    def load_customers(self) -> list[dict]:
++        with self._connect() as connection:
++            rows = connection.execute("SELECT * FROM customers").fetchall()
++        return [
++            {
++                **dict(row),
++                "preferred_categories": json.loads(row["preferred_categories"]),
++            }
++            for row in rows
++        ]
++
++    def load_assignments(self) -> list[dict]:
++        with self._connect() as connection:
++            return [
++                dict(row)
++                for row in connection.execute("SELECT * FROM assignments").fetchall()
++            ]
++
++    def load_splits(self) -> dict[str, str]:
++        with self._connect() as connection:
++            rows = connection.execute("SELECT task_id, split FROM splits").fetchall()
++        return {row["task_id"]: row["split"] for row in rows}
++
++    def load_labels(self) -> dict[str, str]:
++        with self._connect() as connection:
++            rows = connection.execute(
++                "SELECT task_id, gold_worker_id FROM labels"
++            ).fetchall()
++        return {row["task_id"]: row["gold_worker_id"] for row in rows}
++
++    def load_metadata(self) -> dict:
++        with self._connect() as connection:
++            rows = connection.execute("SELECT key, value FROM metadata").fetchall()
++        metadata: dict = {}
++        for row in rows:
++            try:
++                metadata[row["key"]] = json.loads(row["value"])
++            except (TypeError, ValueError):
++                metadata[row["key"]] = row["value"]
++        return metadata
++
++
++# ---------------------------------------------------------------------------
++# ItemCF wiring (Task 14 deferral closure).
++# ---------------------------------------------------------------------------
++def build_itemcf(assignments: list[dict], split: str | None = None) -> ItemCF:
++    """Build a real ItemCF from accepted assignments (optionally one split)."""
++    interactions: list[tuple[str, str, float]] = []
++    for assignment in assignments:
++        if assignment["status"] != "accepted":
++            continue
++        if split is not None and assignment["split"] != split:
++            continue
++        weight = float(assignment["rating"]) if assignment["rating"] is not None else 1.0
++        interactions.append(
++            (assignment["worker_id"], assignment["task_id"], weight)
++        )
++    return ItemCF(interactions)
++
++
++def item_similarity(itemcf: ItemCF, task_a: str, task_b: str) -> float:
++    """Cosine-with-shrinkage similarity between two tasks (ItemCF math)."""
++    users_a = itemcf.item_users.get(task_a, {})
++    users_b = itemcf.item_users.get(task_b, {})
++    common = set(users_a) & set(users_b)
++    if not common:
++        return 0.0
++    cooc = sum(users_a[user] * users_b[user] for user in common)
++    norm_a = sum(users_a.values())
++    norm_b = sum(users_b.values())
++    if norm_a <= 0 or norm_b <= 0:
++        return 0.0
++    return cooc / (math.sqrt(norm_a * norm_b) + itemcf.shrinkage)
++
++
++def pool_normalize(raw: dict[str, float]) -> dict[str, float]:
++    """Normalize raw scores across a candidate pool by the pool maximum."""
++    if not raw:
++        return {}
++    maximum = max(raw.values())
++    if maximum <= 0:
++        return {key: 0.0 for key in raw}
++    return {key: max(0.0, value) / maximum for key, value in raw.items()}
++
++
++def collaborative_scores(
++    sim_itemcf: ItemCF,
++    history_itemcf: ItemCF,
++    task_id: str,
++    worker_ids: list[str],
++) -> dict[str, float]:
++    """ItemCF score per worker using train-only history, then raw scores.
++
++    ``sim_itemcf`` provides the task-task similarity graph; ``history_itemcf``
++    provides each worker's train-only interaction history.
++    """
++    scores: dict[str, float] = {}
++    for worker_id in worker_ids:
++        history = history_itemcf.user_items.get(worker_id, {})
++        if not history:
++            scores[worker_id] = 0.0
++            continue
++        numerator = 0.0
++        denominator = 0.0
++        for other_task, weight in history.items():
++            similarity = item_similarity(sim_itemcf, task_id, other_task)
++            numerator += similarity * weight
++            denominator += abs(similarity)
++        scores[worker_id] = max(0.0, numerator / max(1.0, denominator))
++    return scores
++
++
++# ---------------------------------------------------------------------------
++# Feature builder (mirrors app.benchmark.features without a growing cache).
++# ---------------------------------------------------------------------------
++class LargeFeatureBuilder:
++    """Seven observable features for one task-worker pair.
++
++    When ``train_task_ids`` is supplied the TF-IDF vectorizer is fit on worker
++    resumes plus **train-split task text only**; test task text is transformed
++    with the frozen vocabulary. This is the strict protocol used by
++    :func:`evaluate_large`. Passing ``train_task_ids=None`` retains the old
++    transductive behaviour (fit on train + test text) and is documented as
++    such for callers that explicitly want it.
++    """
++
++    def __init__(
++        self,
++        workers: list[dict],
++        tasks: list[dict],
++        customers: list[dict],
++        train_task_ids: list[str] | None = None,
++    ) -> None:
++        self.workers = workers
++        self.tasks = tasks
++        self.worker_index = {
++            worker["worker_id"]: index for index, worker in enumerate(workers)
++        }
++        self.task_index = {
++            task["task_id"]: index for index, task in enumerate(tasks)
++        }
++        self.customer_by_id = {
++            customer["customer_id"]: customer for customer in customers
++        }
++        self.train_task_ids = (
++            set(train_task_ids) if train_task_ids is not None else None
++        )
++        self.transductive = train_task_ids is None
++        if self.train_task_ids is None:
++            fit_texts = [worker["resume_text"] for worker in workers] + [
++                task["task_text"] for task in tasks
++            ]
++        else:
++            fit_texts = [worker["resume_text"] for worker in workers] + [
++                task["task_text"]
++                for task in tasks
++                if task["task_id"] in self.train_task_ids
++            ]
++        self.vectorizer = TfidfVectorizer(
++            analyzer="char",
++            ngram_range=(2, 4),
++            min_df=1,
++            sublinear_tf=True,
++        )
++        self.vectorizer.fit(fit_texts)
++        self.worker_matrix = self.vectorizer.transform(
++            [worker["resume_text"] for worker in workers]
++        )
++        self.task_matrix = self.vectorizer.transform(
++            [task["task_text"] for task in tasks]
++        )
++        self.similarity = (
++            self.task_matrix @ self.worker_matrix.T
++        ).toarray().astype(np.float32)
++
++        self.task_categories: dict[str, str] = {}
++        self.task_skills: dict[str, set[str]] = {}
++        for task in tasks:
++            scores = rule_scores(task["task_text"])
++            self.task_categories[task["task_id"]] = max(scores, key=scores.get)
++            self.task_skills[task["task_id"]] = set(
++                extract_fields(task["task_text"])["skills"]
++            )
++
++    def features(self, task_id: str, worker_id: str) -> dict[str, float]:
++        task_index = self.task_index[task_id]
++        worker_index = self.worker_index[worker_id]
++        task = self.tasks[task_index]
++        worker = self.workers[worker_index]
++        category = self.task_categories[task_id]
++
++        task_skills = self.task_skills[task_id]
++        worker_skills = worker["skills"]
++        if task_skills:
++            skill = sum(
++                min(worker_skills.get(name, 0), 4) / 4.0
++                for name in task_skills
++            ) / len(task_skills)
++        else:
++            skill = 0.4
++
++        capacity = max(float(worker["capacity_hours"]), 1.0)
++        load = 1.0 - float(worker["current_load_hours"]) / capacity
++        preference = float(
++            worker.get("preferred_categories", {}).get(category, 0.2)
++        )
++        customer = self.customer_by_id.get(task["customer_id"], {})
++        customer_preference = float(
++            customer.get("preferred_categories", {}).get(category, 0.2)
++        )
++
++        return {
++            "reputation": _clamp(
++                0.7 * float(worker["rating"]) / 5.0
++                + 0.3 * float(worker["on_time_rate"])
++            ),
++            "skill": _clamp(skill),
++            "expertise": _clamp(float(self.similarity[task_index, worker_index])),
++            "collaborative": 0.0,
++            "preference": _clamp(preference),
++            "load": _clamp(load),
++            "customer_preference": _clamp(customer_preference),
++        }
++
++
++# ---------------------------------------------------------------------------
++# Sampled evaluation.
++# ---------------------------------------------------------------------------
++def _metric_for_rank(rank: int) -> tuple[float, float, float, float]:
++    top1 = 1.0 if rank == 0 else 0.0
++    top5 = 1.0 if rank < 5 else 0.0
++    mrr = 1.0 / (rank + 1)
++    ndcg = 1.0 / math.log2(rank + 2) if rank < 5 else 0.0
++    return top1, top5, mrr, ndcg
++
++
++def _collaborative_matrix(
++    sim_itemcf: ItemCF,
++    history_itemcf: ItemCF,
++    test_task_ids: list[str],
++    train_task_ids: list[str],
++    worker_index: dict[str, int],
++) -> np.ndarray:
++    """Raw ItemCF scores for test tasks x workers, computed with numpy.
++
++    Worker history is train-only; the similarity graph is ``sim_itemcf``.
++    """
++    n_workers = len(worker_index)
++    n_train = len(train_task_ids)
++    train_task_index = {
++        task_id: index for index, task_id in enumerate(train_task_ids)
++    }
++
++    user_items = history_itemcf.user_items
++    history_matrix = np.zeros((n_workers, n_train), dtype=np.float32)
++    for worker_id, history in user_items.items():
++        row = worker_index.get(worker_id)
++        if row is None:
++            continue
++        for other_task, weight in history.items():
++            column = train_task_index.get(other_task)
++            if column is not None:
++                history_matrix[row, column] = weight
++
++    similarity_matrix = np.zeros((len(test_task_ids), n_train), dtype=np.float32)
++    cache: dict[tuple[str, str], float] = {}
++    for test_row, test_task in enumerate(test_task_ids):
++        for user in sim_itemcf.item_users.get(test_task, {}):
++            for other_task in user_items.get(user, {}):
++                if other_task not in train_task_index:
++                    continue
++                key = (test_task, other_task)
++                if key not in cache:
++                    cache[key] = item_similarity(sim_itemcf, test_task, other_task)
++                column = train_task_index[other_task]
++                similarity_matrix[test_row, column] = cache[key]
++
++    numerator = similarity_matrix @ history_matrix.T
++    denominator = np.abs(similarity_matrix) @ (history_matrix > 0).astype(
++        np.float32
++    ).T
++    denominator = np.maximum(denominator, 1.0)
++    return np.maximum(numerator, 0.0) / denominator
++
++
++def _interaction_splits(assignments: list[dict], itemcf: ItemCF) -> list[str]:
++    """Derive the split set actually represented in an ItemCF graph.
++
++    The ItemCF object stores only weights, so map each (worker, task) edge back
++    to its assignment row. This keeps ``history_is_train_only`` an observed
++    property of the data rather than a hard-coded claim.
++    """
++    accepted_splits = {
++        (row["worker_id"], row["task_id"]): row["split"]
++        for row in assignments
++        if row["status"] == "accepted"
++    }
++    splits: set[str] = set()
++    for worker_id, history in itemcf.user_items.items():
++        for task_id in history:
++            split = accepted_splits.get((worker_id, task_id))
++            if split is not None:
++                splits.add(split)
++    return sorted(splits)
++
++
++def _mean_std(values: list[float]) -> dict:
++    return {
++        "mean": round(float(np.mean(values)), 4),
++        "std": round(float(np.std(values)), 4),
++    }
++
++
++def evaluate_large(
++    path: Path | str,
++    test_tasks: int = 500,
++    candidates: int = 200,
++    seeds: tuple[int, ...] = (42, 43, 44, 45, 46),
++) -> dict:
++    """Sampled evaluation of the large benchmark under a strict protocol.
++
++    ``test_tasks`` test tasks are sampled; each is ranked against a candidate
++    pool of ``candidates`` workers (always including the gold worker). The
++    ItemCF similarity graph and worker history are **train-split only**, so a
++    held-out task is a cold-start item and its outcomes cannot enter any score.
++    Collaborative scores are normalized across the candidate pool.
++
++    A feature-only baseline (the same scoring without the collaborative term)
++    and an analytical uniform-random baseline are reported alongside the main
++    metrics.
++    """
++    repository = LargeRepository(path)
++    workers = repository.load_workers()
++    tasks = repository.load_tasks()
++    customers = repository.load_customers()
++    assignments = repository.load_assignments()
++    splits = repository.load_splits()
++    labels = repository.load_labels()
++    metadata = repository.load_metadata()
++
++    test_task_ids = [
++        task["task_id"] for task in tasks if splits.get(task["task_id"]) == "test"
++    ]
++    task_rng = random.Random(42)
++    sampled_tasks = sorted(
++        task_rng.sample(test_task_ids, k=min(test_tasks, len(test_task_ids)))
++    )
++    train_task_ids = [
++        task["task_id"] for task in tasks if splits.get(task["task_id"]) == "train"
++    ]
++
++    sim_itemcf = build_itemcf(assignments, split="train")
++    history_itemcf = build_itemcf(assignments, split="train")
++    worker_index = {worker["worker_id"]: i for i, worker in enumerate(workers)}
++
++    similarity_splits = _interaction_splits(assignments, sim_itemcf)
++    history_splits = _interaction_splits(assignments, history_itemcf)
++    accepted_total = sum(1 for row in assignments if row["status"] == "accepted")
++    test_accepted = sum(
++        1
++        for row in assignments
++        if row["status"] == "accepted" and row["split"] == "test"
++    )
++
++    collaborative = _collaborative_matrix(
++        sim_itemcf,
++        history_itemcf,
++        sampled_tasks,
++        train_task_ids,
++        worker_index,
++    )
++    sampled_index = {task_id: i for i, task_id in enumerate(sampled_tasks)}
++
++    builder = LargeFeatureBuilder(
++        workers, tasks, customers, train_task_ids=train_task_ids
++    )
++    weights = dict(SIM_INITIAL_WEIGHTS)
++    metric_names = ("top1", "top5", "mrr", "ndcg")
++
++    per_seed: list[dict] = []
++    aggregate = {name: [] for name in metric_names}
++    baseline_aggregate = {name: [] for name in metric_names}
++    nonzero_collaborative = 0
++    total_candidates = 0
++
++    for seed in seeds:
++        rng = random.Random(seed)
++        full_sums = {name: 0.0 for name in metric_names}
++        baseline_sums = {name: 0.0 for name in metric_names}
++        for task_id in sampled_tasks:
++            gold = labels[task_id]
++            distractors = [w for w in worker_index if w != gold]
++            pool = [gold] + rng.sample(
++                distractors, k=min(candidates - 1, len(distractors))
++            )
++            collab_row = collaborative[sampled_index[task_id]]
++            raw_collab = {
++                worker_id: float(collab_row[worker_index[worker_id]])
++                for worker_id in pool
++            }
++            collab_norm = pool_normalize(raw_collab)
++            for worker_id in raw_collab:
++                if raw_collab[worker_id] > 0:
++                    nonzero_collaborative += 1
++            total_candidates += len(pool)
++
++            full_scored: list[tuple[str, float]] = []
++            baseline_scored: list[tuple[str, float]] = []
++            for worker_id in pool:
++                features = builder.features(task_id, worker_id)
++                features["collaborative"] = collab_norm.get(worker_id, 0.0)
++                full_score = sum(
++                    weights[key] * features.get(key, 0.0)
++                    for key in FEATURE_KEYS
++                )
++                baseline_score = sum(
++                    weights[key] * features.get(key, 0.0)
++                    for key in FEATURE_KEYS
++                    if key != "collaborative"
++                )
++                full_scored.append((worker_id, full_score))
++                baseline_scored.append((worker_id, baseline_score))
++
++            full_scored.sort(key=lambda item: (-item[1], item[0]))
++            baseline_scored.sort(key=lambda item: (-item[1], item[0]))
++            full_rank = [worker_id for worker_id, _ in full_scored].index(gold)
++            baseline_rank = [
++                worker_id for worker_id, _ in baseline_scored
++            ].index(gold)
++            for name, value in zip(metric_names, _metric_for_rank(full_rank)):
++                full_sums[name] += value
++            for name, value in zip(
++                metric_names, _metric_for_rank(baseline_rank)
++            ):
++                baseline_sums[name] += value
++
++        total = len(sampled_tasks)
++        seed_metrics = {
++            name: round(full_sums[name] / total, 4) for name in metric_names
++        }
++        seed_baseline = {
++            name: round(baseline_sums[name] / total, 4)
++            for name in metric_names
++        }
++        per_seed.append({"seed": seed, **seed_metrics})
++        for name in metric_names:
++            aggregate[name].append(seed_metrics[name])
++            baseline_aggregate[name].append(seed_baseline[name])
++
++    metrics = {name: _mean_std(values) for name, values in aggregate.items()}
++    feature_only = {
++        name: _mean_std(values) for name, values in baseline_aggregate.items()
++    }
++    exposure_pool_size = (
++        len(assignments) // len(tasks) if tasks else 0
++    )
++    if "stat:exposure_pool_size" in metadata:
++        exposure_pool_size = int(metadata["stat:exposure_pool_size"])
++
++    return {
++        "db_path": str(path),
++        "n_workers": len(workers),
++        "n_tasks": len(tasks),
++        "n_test_tasks_available": len(test_task_ids),
++        "sampled_test_tasks": len(sampled_tasks),
++        "candidates": candidates,
++        "seeds": list(seeds),
++        "metrics": metrics,
++        "per_seed": per_seed,
++        "baselines": {
++            "feature_only": feature_only,
++            "random": {
++                "top1": round(1.0 / candidates, 6),
++                "top5": round(min(5, candidates) / candidates, 6),
++                "note": "analytical uniform ranking over the candidate pool",
++            },
++        },
++        "protocol": {
++            "eval_split": "test",
++            "similarity_graph": "train-split accepted assignments only",
++            "worker_history": "train-split accepted assignments only",
++            "candidate_pool": f"gold + {candidates - 1} random workers",
++            "gold_definition": "latent-best worker in the exposure pool",
++            "exposure_pool_size": exposure_pool_size,
++            "feature_weights": "SIM_INITIAL_WEIGHTS",
++        },
++        "itemcf": {
++            "similarity_interactions": sum(
++                len(history) for history in sim_itemcf.user_items.values()
++            ),
++            "history_interactions": sum(
++                len(history) for history in history_itemcf.user_items.values()
++            ),
++            "similarity_splits": similarity_splits,
++            "history_splits": history_splits,
++            "similarity_is_train_only": similarity_splits == ["train"],
++            "history_is_train_only": history_splits == ["train"],
++            "accepted_interactions_total": accepted_total,
++            "excluded_test_accepted_interactions": test_accepted,
++            "pool_normalized": True,
++        },
++        "collaborative_nonzero_rate": round(
++            nonzero_collaborative / max(1, total_candidates), 4
++        ),
++    }
+
+--- a/app\data\large_synthetic.py
++++ b/app\data\large_synthetic.py
+@@ -0,0 +1,1693 @@
++"""Large natural-language benchmark generator (scheme E).
++
++Scheme E composition:
++- **A** (template slots + sentence variants): 80-90% of task/resume records are
++  rendered from deterministic templates with slot variation, sentence patterns
++  and synonym-style connector choices. Every ``task_text`` and ``resume_text``
++  is natural language, never a bare field concatenation.
++- **B** (latent DGP): workers carry latent reliability/skill/preferences, tasks
++  carry latent difficulty/urgency, customers carry latent strictness. Those
++  latents drive accept/reject, on-time and rating outcomes, and the hidden gold
++  label per task.
++- **C** (LLM seeds): an optional ``llm_seeds`` dict hook, off by default, that
++  injects caller-supplied natural-language seeds into a small deterministic
++  subset of records (subject to the same dedup guarantees). No LLM is required.
++
++The module deliberately stores no ground truth on model-visible records: task
++rows carry no gold/category columns, and ``load_large_sqlite`` (in
++``app.benchmark.large``) never returns labels.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import random
++import re
++import unicodedata
++from collections import defaultdict
++from dataclasses import dataclass, field
++from datetime import datetime, timedelta, timezone
++
++import numpy as np
++
++from app.data.synthetic import CATEGORIES, SKILLS, TASK_PROFILES
++from app.resume import (
++    CATEGORY_LABELS,
++    CATEGORY_PROFILES,
++    CATEGORY_SKILLS,
++    CITIES,
++    GIVEN_FIRST,
++    GIVEN_SECOND,
++    REGION_LABELS,
++    SKILL_LABELS,
++    SURNAMES,
++    UNIVERSITIES,
++)
++
++BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
++REGIONS = ["CN", "US", "EU"]
++
++CATEGORY_INDEX = {category: index for index, category in enumerate(CATEGORIES)}
++SKILL_INDEX = {skill: index for index, skill in enumerate(SKILLS)}
++
++TITLE_QUALIFIERS = [
++    "",
++    "（一期）",
++    "（二期）",
++    "（加急）",
++    "（年度框架）",
++    "（重构）",
++    "（升级）",
++    "（试点）",
++    "（Q3 交付）",
++    "（二期迭代）",
++    "（续约）",
++    "（多语言版）",
++]
++
++# ---------------------------------------------------------------------------
++# Industries (quota dimension) with natural subjects and context sentences.
++# ---------------------------------------------------------------------------
++INDUSTRIES: dict[str, dict] = {
++    "连锁餐饮": {
++        "subjects": ["连锁咖啡品牌", "中式快餐连锁", "火锅连锁品牌", "新茶饮品牌", "烘焙连锁品牌"],
++        "contexts": ["门店数量增长较快，总部希望统一各门店的运营与服务体验。"],
++    },
++    "新能源汽车": {
++        "subjects": ["新能源汽车品牌", "充电桩运营商", "动力电池企业", "汽车后市场平台"],
++        "contexts": ["产品更新节奏快，需要持续提升线上获客与售后服务效率。"],
++    },
++    "医疗健康": {
++        "subjects": ["三甲医院", "连锁药房", "互联网医疗平台", "医疗器械企业"],
++        "contexts": ["行业对合规与数据安全要求较高，客户希望流程规范可控。"],
++    },
++    "跨境电商": {
++        "subjects": ["跨境电商独立站", "出海消费品牌", "跨境物流服务商", "跨境支付机构"],
++        "contexts": ["面向海外市场的业务增长迅速，需要兼顾本地化与投放效率。"],
++    },
++    "制造业": {
++        "subjects": ["装备制造企业", "电子制造工厂", "精密机械公司", "化工企业"],
++        "contexts": ["工厂数字化改造持续推进，客户希望在预算内分阶段落地。"],
++    },
++    "金融科技": {
++        "subjects": ["区域银行", "消费金融公司", "支付服务商", "保险经纪平台"],
++        "contexts": ["业务受监管约束较多，客户重视合规与上线稳定性。"],
++    },
++    "教育": {
++        "subjects": ["K12 教育机构", "职业培训机构", "在线教育平台", "留学服务机构"],
++        "contexts": ["招生节奏集中在特定节点，客户希望快速产出可复用内容。"],
++    },
++    "文旅": {
++        "subjects": ["文旅景区", "主题乐园", "酒店集团", "旅行社"],
++        "contexts": ["旺季客流量大，客户希望提升线上预订与现场体验。"],
++    },
++    "宠物": {
++        "subjects": ["宠物食品品牌", "宠物医院连锁", "宠物用品电商"],
++        "contexts": ["品类消费频次高，客户希望通过内容与运营提升复购。"],
++    },
++    "美妆": {
++        "subjects": ["美妆品牌", "护肤品品牌", "彩妆集合店"],
++        "contexts": ["用户决策依赖种草内容与视觉呈现，客户重视投放节奏。"],
++    },
++    "家居": {
++        "subjects": ["家居品牌", "家装平台", "智能家居品牌"],
++        "contexts": ["客单价高、决策链路长，客户希望沉淀专业内容资产。"],
++    },
++    "物流": {
++        "subjects": ["物流企业", "同城配送平台", "冷链物流公司"],
++        "contexts": ["时效与成本压力并存，客户希望用系统化工具提升履约效率。"],
++    },
++    "农业": {
++        "subjects": ["农产品品牌", "生鲜电商", "农业科技公司"],
++        "contexts": ["产地与销售端距离远，客户希望打通品牌与销售链路。"],
++    },
++    "零售": {
++        "subjects": ["连锁便利店", "商超集团", "折扣零售品牌"],
++        "contexts": ["门店网络密集，客户需要统一的会员与促销体系。"],
++    },
++    "酒旅": {
++        "subjects": ["精品酒店", "民宿平台", "酒水品牌"],
++        "contexts": ["节假日与周末是主要消费场景，客户希望抓住节点流量。"],
++    },
++    "游戏": {
++        "subjects": ["游戏公司", "电竞平台", "手游发行商"],
++        "contexts": ["用户增长竞争激烈，客户需要持续的内容与活动供给。"],
++    },
++    "企业服务": {
++        "subjects": ["SaaS 公司", "企业培训平台", "财税服务平台"],
++        "contexts": ["面向企业客户的决策链较长，客户重视专业内容与案例。"],
++    },
++    "人力资源": {
++        "subjects": ["人力资源服务商", "灵活用工平台", "猎头公司"],
++        "contexts": ["用工需求波动大，客户希望缩短招聘周期并保证到岗质量。"],
++    },
++    "新能源": {
++        "subjects": ["光伏企业", "储能公司", "风电运营商"],
++        "contexts": ["项目制交付为主，客户需要可复用的方案与文档体系。"],
++    },
++    "半导体": {
++        "subjects": ["芯片设计公司", "半导体设备企业", "封测厂"],
++        "contexts": ["技术门槛高，客户重视供应商的专业背景与交付记录。"],
++    },
++}
++INDUSTRY_NAMES = list(INDUSTRIES)
++
++# ---------------------------------------------------------------------------
++# Category slots for titles and requirements (A). Budget/days are reused from
++# the Phase-1 task profiles so distributions stay consistent with the app.
++# ---------------------------------------------------------------------------
++CATEGORY_OBJECTS: dict[str, list[str]] = {
++    "software_dev": [
++        "会员小程序开发", "ERP 库存模块升级", "独立站支付接入", "订单履约系统开发",
++        "预约挂号小程序", "司机端 App 改版", "门店数据看板开发", "CRM 客户管理系统",
++        "WMS 仓储系统建设", "供应商协同平台", "营销活动 H5 开发", "数据分析中台搭建",
++        "物联网设备管理平台", "客服工单系统重构", "官网与商城开发", "OpenAPI 接口平台",
++        "小程序商城改版", "BI 报表系统建设",
++    ],
++    "ui_ux_design": [
++        "SaaS 数据看板体验改版", "移动端投保流程重设计", "智能家居 App 交互优化",
++        "B2B 采购平台信息架构梳理", "医疗预约小程序体验优化", "电商详情页转化率设计",
++        "会员中心体验升级", "后台管理系统交互规范", "官网视觉与动效改版",
++        "门店自助终端界面设计", "教育产品学习路径设计", "金融 App 首页改版",
++        "多端响应式界面规范", "运营活动落地页设计", "车载中控界面设计", "小程序信息架构梳理",
++        "数据产品可视化设计", "账号体系流程重设计",
++    ],
++    "brand_design": [
++        "VI 与包装设计", "品牌视觉升级", "品牌焕新", "Logo 与品牌手册",
++        "礼盒包装设计", "门店物料设计", "品牌主视觉设计", "产品包装系列设计",
++        "品牌色彩与字体规范", "电商主视觉设计", "品牌 IP 形象设计", "会员卡与物料延展",
++        "新品上市视觉设计", "品牌活动视觉设计", "渠道陈列视觉设计", "品牌宣传册设计",
++        "公众号视觉规范", "品牌升级落地执行",
++    ],
++    "content_writing": [
++        "行业白皮书", "小红书种草文案", "官网内容重构", "行业研究报告",
++        "品牌故事与官网文案", "科普系列文章", "公众号内容规划", "产品卖点文案",
++        "深度访谈与案例文章", "视频脚本撰写", "邮件与销售物料文案", "专题策划与撰稿",
++        "社媒内容日历", "发布会演讲稿", "招商手册文案", "课程内容脚本",
++        "PR 通稿与媒体素材", "用户手册与帮助文档",
++    ],
++    "video_production": [
++        "信息流短视频", "产品功能介绍视频", "门店宣传片", "产品演示视频",
++        "达人种草视频", "招商宣传片", "品牌故事短片", "活动预热短视频",
++        "招聘宣传视频", "课程讲解视频", "发布会开场视频", "客户案例视频",
++        "竖屏剧情短片", "产品开箱视频", "直播切片包装", "周年庆主题视频",
++        "公益宣传短片", "年会回顾视频",
++    ],
++    "marketing_campaign": [
++        "周年庆整合营销", "新品上市 campaign", "信用卡拉新活动", "黑五促销策划",
++        "秋季招生推广", "线上获客活动", "私域复购活动", "会员日活动策划",
++        "渠道招商活动", "联名营销 campaign", "区域地推活动", "节日营销 campaign",
++        "直播带货活动", "用户召回活动", "品牌联名活动", "季末清仓促销",
++        "社区团购推广", "门店开业活动",
++    ],
++    "data_annotation": [
++        "路侧图像标注", "商品图文分类标注", "病灶区域标注", "语音转写与意图标注",
++        "票据字段抽取标注", "内容安全审核标注", "点云数据标注", "文本情感标注",
++        "OCR 文本标注", "视频帧目标标注", "知识图谱三元组标注", "客服对话质检标注",
++        "图像分割标注", "多语言语料标注", "资质文件信息抽取", "街景要素标注",
++        "评论观点抽取标注", "文档版面分析标注",
++    ],
++    "translation_localization": [
++        "说明书中英日本地化", "商品详情多语言翻译", "产品界面本地化", "合同英译中审校",
++        "游戏剧情本地化", "技术手册翻译", "官网多语言搭建", "营销物料翻译",
++        "视频字幕本地化", "法规文件翻译", "APP 文案本地化", "培训资料翻译",
++        "专利文献翻译", "会议资料同传转译", "邮件模板本地化", "说明书合规审校",
++        "多语言术语管理", "发布会内容翻译",
++    ],
++    "ecommerce_ops": [
++        "独立站黑五运营", "天猫旗舰店运营托管", "抖音小店起盘与投流", "私域复购运营",
++        "京东店铺优化", "Amazon Listing 优化", "会员体系搭建", "直播带货运营",
++        "拼多多店铺运营", "社群团购运营", "新品首发运营", "会员日活动运营",
++        "门店到家业务运营", "跨境电商全渠道运营", "小红书店铺运营", "B 站带货运营",
++        "私域用户分层运营", "复购率提升运营",
++    ],
++    "recruitment": [
++        "工艺工程师招聘", "区域经理猎聘", "算法工程师招聘", "注册专员招聘",
++        "运营团队搭建", "班组长批量招聘", "销售团队组建", "门店店长招聘",
++        "技术总监猎聘", "客服团队批量招聘", "海外团队招聘", "校招项目",
++        "研发团队搭建", "供应链岗位招聘", "财务负责人猎聘", "产线工人批量招聘",
++        "运营负责人招聘", "管培生项目招聘",
++    ],
++    "consulting_research": [
++        "文旅产业升级调研", "产业链投资研究", "选址与单店模型咨询", "行业竞品分析",
++        "数字化转型诊断", "用户画像研究", "市场进入可行性研究", "组织效能诊断",
++        "渠道策略咨询", "定价策略研究", "供应链优化咨询", "品牌健康度调研",
++        "客户满意度研究", "区域市场扫描", "政策与合规研究", "增长策略咨询",
++        "品类机会研究", "门店运营诊断",
++    ],
++    "training_course": [
++        "信息安全意识培训", "店长管理能力训练营", "精益生产培训", "客户成功团队培训",
++        "运营实战课程", "合规培训", "新员工入职培训", "销售技巧训练营",
++        "中层管理能力提升", "产品知识培训", "客服话术培训", "领导力工作坊",
++        "数字化工具培训", "安全操作培训", "面试官认证培训", "门店带教体系搭建",
++        "讲师认证培训", "跨部门协作工作坊",
++    ],
++}
++
++CATEGORY_REQUIREMENTS: dict[str, list[str]] = {
++    "software_dev": [
++        "有 3 年以上相关开发经验，能独立完成模块设计与实现",
++        "熟悉小程序或 Web 前后端开发并能完成联调",
++        "有同类业务系统交付案例，可提供说明",
++        "代码规范，能提供部署文档与上线支持",
++        "可配合里程碑验收，沟通响应及时",
++        "熟悉常用云服务与上线流程",
++        "有性能优化与线上问题排查经验",
++        "能梳理接口文档并保证联调质量",
++    ],
++    "ui_ux_design": [
++        "有 3 年以上 UI/UX 设计经验与完整项目案例",
++        "能独立完成用户研究、信息架构与原型设计",
++        "熟练使用 Figma 并能交付可点击原型",
++        "有 B 端或移动端产品设计经验优先",
++        "能配合开发走查并输出设计规范",
++        "有可用性测试与迭代经验",
++        "能梳理关键流程并给出体验优化建议",
++        "对视觉细节有把控并能输出高保真稿",
++    ],
++    "brand_design": [
++        "有 3 年以上品牌或平面设计经验与完整 VI 案例",
++        "能完成品牌定位、视觉概念与延展设计",
++        "熟悉印刷工艺与包装落地要求",
++        "能交付源文件与多尺寸资产",
++        "可配合客户评审完成多轮修改",
++        "有门店物料或电商主视觉落地经验",
++        "能输出色彩与字体使用规范",
++        "有礼盒或包装打样跟进经验",
++    ],
++    "content_writing": [
++        "有 B2B 或行业内容写作经验并能提供作品",
++        "能独立完成资料研究、提纲与成稿",
++        "文字逻辑清晰，事实与引用可核查",
++        "能配合编辑修改并按时交稿",
++        "有相关行业背景优先",
++        "能把专业内容转成通俗可读的素材",
++        "有公众号或小红书内容经验优先",
++        "能按选题日历稳定产出",
++    ],
++    "video_production": [
++        "有商业短视频或宣传片制作经验",
++        "能完成脚本、分镜、拍摄与剪辑全流程",
++        "熟悉抖音或视频号等平台内容节奏",
++        "能提供配音、字幕与封面版本",
++        "可配合客户多轮修改",
++        "有竖屏信息流素材制作经验",
++        "能保证画面质感与交付规格",
++        "有产品演示或种草视频案例优先",
++    ],
++    "marketing_campaign": [
++        "有整合营销或活动策划经验并能提供案例",
++        "能完成策略、创意、渠道与预算规划",
++        "熟悉线上投放与线下活动执行",
++        "能跟踪核心指标并输出复盘",
++        "有相关行业资源优先",
++        "有私域或会员活动策划经验优先",
++        "能协调多方资源按节奏推进",
++        "对转化与声量目标负责",
++    ],
++    "data_annotation": [
++        "有对应类型数据标注经验并理解标注规范",
++        "能按规范完成批量标注并保证一致率",
++        "可配合质检与返修并接受抽检",
++        "有隐私与数据安全意识",
++        "能按周交付进度",
++        "能快速理解新标注规范并组织人员",
++        "有质检流程搭建经验优先",
++        "能输出标注问题反馈与规范建议",
++    ],
++    "translation_localization": [
++        "目标语言母语级或同等水平并有翻译案例",
++        "熟悉行业术语与本地表达习惯",
++        "能完成翻译、审校与术语统一",
++        "可配合格式与交付规范",
++        "有相关行业背景优先",
++        "能处理界面文案与文档两种文体",
++        "有术语库或翻译记忆工具使用经验",
++        "能按里程碑分批交付",
++    ],
++    "ecommerce_ops": [
++        "有对应平台店铺运营经验并能提供数据案例",
++        "熟悉商品页、活动与投放的基本打法",
++        "能独立完成数据跟踪与复盘",
++        "对转化率与 ROI 等指标负责",
++        "可配合品牌方节奏执行",
++        "有私域或会员运营经验优先",
++        "能制定店铺诊断与优化计划",
++        "有直播或内容电商运营经验优先",
++    ],
++    "recruitment": [
++        "有对应行业招聘经验并熟悉人才画像",
++        "能独立完成寻访、筛选与面试安排",
++        "有稳定的候选人渠道与寻访能力",
++        "能按周期反馈招聘进展",
++        "了解相关岗位薪酬水平",
++        "能输出岗位画像与寻访计划",
++        "有批量招聘或团队搭建经验优先",
++        "重视到岗率与候选人质量",
++    ],
++    "consulting_research": [
++        "有相关行业研究或咨询经验并能提供报告案例",
++        "能独立完成访谈、数据收集与分析",
++        "逻辑严谨，结论有证据支撑",
++        "能输出可汇报的报告与建议",
++        "有相关行业资源优先",
++        "能搭建研究框架并管理调研进度",
++        "有量化测算或建模能力优先",
++        "能把复杂问题拆解成可执行步骤",
++    ],
++    "training_course": [
++        "有企业培训或课程开发经验并能提供课程案例",
++        "能完成需求分析、课程设计与课件开发",
++        "具备现场或线上授课能力",
++        "能设计练习、考试与效果评估",
++        "有相关行业经验优先",
++        "能把业务场景转化为训练任务",
++        "有训练营或工作坊设计经验优先",
++        "能根据反馈迭代课程内容",
++    ],
++}
++
++BACKGROUND_PATTERNS = [
++    "{subject}目前主要依靠线下流程推进，希望把核心业务搬到线上并提升整体效率。",
++    "客户计划在近期完成{object}，现阶段最关心的是交付质量与周期可控。",
++    "{subject}正处于业务扩张期，需要在短时间内补齐{object}相关能力。",
++    "客户现有方案在效率与体验上都不理想，决定重新规划并落地{object}。",
++    "{industry_context}，因此客户希望借助外部团队完成{object}。",
++    "项目背景：{subject}希望通过{object}解决长期存在的效率与体验问题。",
++    "客户已完成初步需求梳理，正在寻找能独立交付{object}的团队。",
++    "随着业务规模增长，{subject}把{object}作为下一阶段的重点投入。",
++    "客户希望在预算可控的前提下高质量完成{object}并支持后续迭代。",
++    "{industry_context}，客户决定启动{object}项目并期待尽快见效。",
++]
++
++DELIVERABLE_PATTERNS = [
++    "主要交付物包括{items}",
++    "交付范围涵盖{items}",
++    "需要交付{items}",
++    "验收时需提供{items}",
++]
++
++CONSTRAINT_PATTERNS = [
++    "预算 {budget_min}–{budget_max} 元，期望 {days} 天内完成",
++    "本项目报酬 {budget_min}–{budget_max} 元，交付周期 {days} 天",
++    "服务费用 {budget_min}–{budget_max} 元，希望在 {days} 天内交付",
++    "总预算约 {budget_min}–{budget_max} 元，工期 {days} 天",
++]
++
++MODE_REMOTE = "支持远程协作，按里程碑同步进度"
++MODE_ONSITE = "需要与{region}团队线下协作，按里程碑验收"
++
++REQUIREMENT_LEADS = ["要求如下：", "我们希望找到符合以下条件的合作方：", "主要要求包括：", "你需要具备："]
++SKILL_LEADS = ["需要熟悉{skills}", "需具备{skills}相关能力", "要求掌握{skills}", "在{skills}方面要有实操经验"]
++
++
++def _clamp(value: float, low: float, high: float) -> float:
++    return max(low, min(high, value))
++
++
++def _gumbel(rng: random.Random) -> float:
++    value = max(rng.random(), 1e-12)
++    return -np.log(-np.log(value))
++
++
++# ---------------------------------------------------------------------------
++# Text hashing / near-duplicate detection (21c).
++# ---------------------------------------------------------------------------
++def _normalize_for_hash(text: str) -> str:
++    text = unicodedata.normalize("NFKC", text or "")
++    text = text.lower()
++    text = re.sub(r"\s+", " ", text)
++    return text.strip()
++
++
++def normalized_text_hash(text: str) -> str:
++    """Exact normalized SHA-256 hex digest of ``text``."""
++    return hashlib.sha256(_normalize_for_hash(text).encode("utf-8")).hexdigest()
++
++
++def _mix64(value: int) -> int:
++    """MurmurHash3 fmix64 finalizer for full 64-bit avalanche."""
++    mask = 0xFFFFFFFFFFFFFFFF
++    value ^= value >> 33
++    value = (value * 0xFF51AFD7ED558CCD) & mask
++    value ^= value >> 33
++    value = (value * 0xC4CEB9FE1A85EC53) & mask
++    value ^= value >> 33
++    return value
++
++
++def _token_hash64(token: str) -> int:
++    """Deterministic FNV-1a 64-bit hash with an fmix64 finalizer.
++
++    The finalizer is required because raw FNV-1a over very short byte strings
++    (single CJK characters, bigrams) leaves many output bits correlated, which
++    collapses the simhash Hamming distance. The finalizer restores full bit
++    avalanche while keeping the hash stable across runs and processes.
++    """
++    value = 14695981039346656037
++    for byte in token.encode("utf-8"):
++        value ^= byte
++        value = (value * 1099511628211) & 0xFFFFFFFFFFFFFFFF
++    return _mix64(value)
++
++
++def _simhash_tokens(text: str) -> list[str]:
++    chars = list(text or "")
++    if not chars:
++        return []
++    tokens = list(chars)
++    tokens.extend(chars[i] + chars[i + 1] for i in range(len(chars) - 1))
++    return tokens
++
++
++def simhash64(text: str) -> int:
++    """64-bit simhash over character unigrams + bigrams.
++
++    Shared tokens vote identically, so near-duplicate texts (a handful of
++    differing characters) land within a small Hamming distance while genuinely
++    distinct texts separate toward ~32 bits.
++    """
++    tokens = _simhash_tokens(text)
++    if not tokens:
++        return 0
++    hashes = np.asarray([_token_hash64(token) for token in tokens], dtype=np.uint64)
++    count = hashes.size
++    result = 0
++    for bit in range(64):
++        ones = int(((hashes >> np.uint64(bit)) & np.uint64(1)).sum())
++        if ones > count - ones:
++            result |= 1 << bit
++    return result
++
++
++def is_near_duplicate(a: str, b: str, max_hamming: int = 3) -> bool:
++    """True when the simhash Hamming distance is within ``max_hamming``."""
++    return (simhash64(a) ^ simhash64(b)).bit_count() <= max_hamming
++
++
++class _DedupIndex:
++    """Exact-hash + unique-title + 4-block simhash near-duplicate index.
++
++    Two 64-bit simhashes with Hamming distance <= 3 must share at least one of
++    four 16-bit blocks (pigeonhole), so candidate lookup is O(1) per block.
++    """
++
++    def __init__(self) -> None:
++        self._hashes: set[str] = set()
++        self._titles: set[str] = set()
++        self._blocks: list[dict[int, list[tuple[str, int]]]] = [
++            defaultdict(list) for _ in range(4)
++        ]
++        self._simhashes: dict[str, int] = {}
++        self.near_dup_rejections = 0
++
++    def contains(
++        self, text: str, title: str | None = None, fingerprint: int | None = None
++    ) -> bool:
++        text_hash = normalized_text_hash(text)
++        if text_hash in self._hashes:
++            return True
++        if title is not None:
++            normalized_title = _normalize_for_hash(title)
++            if normalized_title in self._titles:
++                return True
++        if fingerprint is None:
++            fingerprint = simhash64(text)
++        for block in range(4):
++            block_value = (fingerprint >> (block * 16)) & 0xFFFF
++            for _, candidate_fingerprint in self._blocks[block][block_value]:
++                if (fingerprint ^ candidate_fingerprint).bit_count() <= 3:
++                    return True
++        return False
++
++    def add(self, text: str, title: str | None = None) -> bool:
++        fingerprint = simhash64(text)
++        if self.contains(text, title, fingerprint=fingerprint):
++            self.near_dup_rejections += 1
++            return False
++        text_hash = normalized_text_hash(text)
++        self._hashes.add(text_hash)
++        if title is not None:
++            self._titles.add(_normalize_for_hash(title))
++        for block in range(4):
++            block_value = (fingerprint >> (block * 16)) & 0xFFFF
++            self._blocks[block][block_value].append((text_hash, fingerprint))
++        self._simhashes[text_hash] = fingerprint
++        return True
++
++
++# ---------------------------------------------------------------------------
++# Resume rendering (A): natural language with sentence variants + synonyms.
++# ---------------------------------------------------------------------------
++RESUME_SUMMARY_PATTERNS = [
++    "{years} 年{category}相关经验，完成 {completed} 个项目，客户评分 {rating}/5，按时交付率 {on_time}。",
++    "拥有 {years} 年{category}从业经历，累计交付 {completed} 个项目，客户评分 {rating}/5。",
++    "从事{category}工作 {years} 年，交付 {completed} 个项目，平均评分 {rating}/5，按时交付率 {on_time}。",
++    "{years} 年经验，聚焦{category}方向，完成 {completed} 个项目，客户评分 {rating}/5。",
++]
++
++RESUME_SKILL_PATTERNS = [
++    "技能：{skills}",
++    "擅长：{skills}",
++    "核心能力包括{skills}",
++    "熟练领域：{skills}",
++]
++
++RESUME_CERT_PATTERNS = [
++    "证书：{certs}",
++    "持有证书：{certs}",
++    "专业认证：{certs}",
++]
++
++COMPANY_POOL = [
++    "云启科技", "数联软件", "星链网络", "像素设计", "体验实验室", "木棉设计",
++    "造物品牌", "白昼设计", "有光创意", "知行内容", "青禾文化", "远见研究所",
++    "光年影像", "逐帧工作室", "野火视频", "原野营销", "橙子创意", "增长工场",
++    "数标科技", "清源数据", "标点智能", "译言本地化", "桥接语言服务", "东岸翻译",
++    "海川电商", "橙链科技", "远航品牌", "伯乐猎聘", "远航人才", "锐仕咨询",
++    "行远咨询", "灼识咨询", "知行学堂", "启程培训", "砾石学习", "晨光科技",
++    "星河网络", "云帆软件", "初见设计", "澄明咨询", "领跑营销", "拓界数据",
++]
++
++CERT_POOL = [
++    "PMP", "AWS Certified Developer", "Google Analytics 认证", "Figma 专业认证",
++    "NN/g UX 认证", "Adobe 认证设计师", "CATTI 二级笔译", "CATTI 三级笔译",
++    "SDL Trados 认证", "DaVinci Resolve 认证", "Google Ads 认证",
++    "巨量千川投放认证", "数据标注项目管理认证", "保密与数据安全培训",
++    "人力资源管理师", "领英人才解决方案认证", "CFA Level II", "企业培训师认证",
++    "ATD 课程设计认证", "无人机航拍证", "包装印刷工艺认证", "天猫运营认证",
++]
++
++RESULT_POOL = [
++    "上线后转化率提升 18%", "交付周期缩短 30%", "用户投诉率下降 40%",
++    "关键指标提升 25%", "支持 30 家门店统一换新", "首月售罄率超过 80%",
++    "抽检一致率保持在 98% 以上", "通过客户合规评审", "报告被用于年度规划",
++    "覆盖 1,200 名员工", "返修率从 12% 降到 4%", "投放 CTR 高于行业均值 35%",
++    "黑五 GMV 同比增长 65%", "月转化率从 1.8% 提升到 2.6%",
++    "到岗率 83%，试用期留存 90%", "平均到岗周期 38 天",
++    "接口平均响应从 800ms 降到 220ms",
++]
++
++# Category-specific project outcomes and certificates (21a coherence). Each
++# list starts with the category's own profile project results so the visible
++# resume bullets always match the worker's stated direction.
++CATEGORY_RESULTS: dict[str, list[str]] = {
++    "software_dev": [
++        "接口平均响应从 800ms 降到 220ms",
++        "上线后库存差异率下降 35%",
++        "核心接口 P95 延迟下降 45%",
++        "系统可用性提升到 99.95%",
++        "上线后订单处理效率提升 30%",
++        "发布周期从 2 周缩短到 3 天",
++        "支持日均 10 万次请求",
++    ],
++    "ui_ux_design": [
++        "上线后关键任务完成率提升 28%",
++        "用户投诉率下降 40%",
++        "原型可用性测试通过率 90%",
++        "设计交付周期缩短 35%",
++        "核心流程步骤减少 30%",
++        "设计规范覆盖 20 个页面",
++        "用户满意度提升 18%",
++    ],
++    "brand_design": [
++        "支持 30 家门店统一换新",
++        "首月店铺转化率提升 18%",
++        "包装打样一次通过",
++        "品牌识别度调研提升 22%",
++        "电商主视觉点击率提升 25%",
++        "VI 规范覆盖 12 个渠道",
++        "礼盒首月售罄率达到 85%",
++    ],
++    "content_writing": [
++        "被 20 家企业用于销售材料",
++        "官网留资率提升 22%",
++        "文章平均阅读完成率 65%",
++        "白皮书下载量超过 5,000",
++        "内容月更稳定在 12 篇",
++        "搜索排名进入前三",
++        "案例被 8 家媒体转载",
++    ],
++    "video_production": [
++        "投放 CTR 高于行业均值 35%",
++        "用于发布会与门店循环播放",
++        "单条视频播放量突破 100 万",
++        "完播率提升 28%",
++        "素材交付周期缩短 30%",
++        "视频号涨粉 1.2 万",
++        "广告转化率提升 22%",
++    ],
++    "marketing_campaign": [
++        "活动期客流同比增长 26%",
++        "首月售罄率超过 80%",
++        "投放 ROI 提升 35%",
++        "活动报名人数超目标 40%",
++        "私域新增用户 8,000",
++        "复购率提升 12%",
++        "品牌声量增长 50%",
++    ],
++    "data_annotation": [
++        "抽检一致率保持在 98% 以上",
++        "返修率从 12% 降到 4%",
++        "标注吞吐提升 30%",
++        "质检通过率达到 97%",
++        "标注交付周期缩短 25%",
++        "标注规范覆盖 5 类数据",
++        "客户验收一次通过",
++    ],
++    "translation_localization": [
++        "通过客户合规评审",
++        "上线后海外工单下降 30%",
++        "术语一致率达到 99%",
++        "翻译交付准时率 98%",
++        "审校返修率低于 3%",
++        "支持 3 种语言同步上线",
++        "本地化文案零重大投诉",
++    ],
++    "ecommerce_ops": [
++        "黑五 GMV 同比增长 65%",
++        "月转化率从 1.8% 提升到 2.6%",
++        "店铺 ROI 提升 40%",
++        "复购率提升 15%",
++        "活动期客单价提升 12%",
++        "私域新增会员 6,000",
++        "库存周转提升 20%",
++    ],
++    "recruitment": [
++        "到岗率 83%，试用期留存 90%",
++        "平均到岗周期 38 天",
++        "关键岗位完成率 95%",
++        "候选人推荐准确率 85%",
++        "招聘周期缩短 30%",
++        "Offer 接受率 88%",
++        "团队搭建按期完成",
++    ],
++    "consulting_research": [
++        "报告被用于年度规划",
++        "支持 2 个标的的投决",
++        "访谈覆盖 30 位专家",
++        "市场规模模型误差低于 10%",
++        "客户决策周期缩短 25%",
++        "研究结论被 3 个部门采纳",
++        "竞品数据库覆盖 50 家",
++    ],
++    "training_course": [
++        "覆盖 1,200 名员工",
++        "结营考核通过率 92%",
++        "课程满意度 4.8/5",
++        "培训后测试平均分提升 25%",
++        "课程复购 3 期",
++        "讲师认证通过率 95%",
++        "学习完成率提升 30%",
++    ],
++}
++
++CATEGORY_CERTS: dict[str, list[str]] = {
++    "software_dev": ["AWS Certified Developer", "PMP", "阿里云 ACP 认证", "Kubernetes CKA 认证"],
++    "ui_ux_design": ["Figma 专业认证", "NN/g UX 认证", "Adobe 认证设计师"],
++    "brand_design": ["Adobe 认证设计师", "包装印刷工艺认证", "色彩管理认证"],
++    "content_writing": ["CATTI 三级笔译", "Google Analytics 认证", "内容营销认证"],
++    "video_production": ["DaVinci Resolve 认证", "无人机航拍证", "Adobe 认证剪辑师"],
++    "marketing_campaign": ["Google Ads 认证", "巨量千川投放认证", "Google Analytics 认证"],
++    "data_annotation": ["数据标注项目管理认证", "保密与数据安全培训", "ISO 27001 内审员"],
++    "translation_localization": ["CATTI 二级笔译", "SDL Trados 认证", "CATTI 三级笔译"],
++    "ecommerce_ops": ["天猫运营认证", "Google Analytics 认证", "京东运营认证"],
++    "recruitment": ["人力资源管理师", "领英人才解决方案认证", "SHL 测评认证"],
++    "consulting_research": ["PMP", "CFA Level II", "注册管理咨询师"],
++    "training_course": ["企业培训师认证", "ATD 课程设计认证", "人力资源管理师"],
++}
++
++GENERIC_RESPONSIBILITIES = [
++    "负责跨部门协作与项目进度管理",
++    "沉淀团队方法论与交付模板",
++    "负责关键指标跟踪与周期性复盘",
++    "参与方案评审并推动落地",
++]
++
++
++def _unique_name(rng: random.Random, used: set[str]) -> str:
++    for _ in range(400):
++        name = (
++            rng.choice(SURNAMES)
++            + rng.choice(GIVEN_FIRST)
++            + rng.choice(GIVEN_SECOND)
++        )
++        if name not in used:
++            used.add(name)
++            return name
++    index = 0
++    while True:
++        name = (
++            rng.choice(SURNAMES)
++            + rng.choice(GIVEN_FIRST)
++            + rng.choice(GIVEN_SECOND)
++            + f"{index % 10}"
++        )
++        index += 1
++        if name not in used:
++            used.add(name)
++            return name
++
++
++def _resume_skill_labels(skills: dict[str, int], category: str, profile: dict) -> list[str]:
++    # Use the worker's full skill set (not just category-relevant skills) so two
++    # workers in the same category still diverge substantially in text.
++    ranked = sorted(skills.items(), key=lambda item: (-item[1], item[0]))
++    labels: list[str] = []
++    for skill, _ in ranked:
++        label = SKILL_LABELS.get(skill)
++        if label and label not in labels:
++            labels.append(label)
++        if len(labels) >= 8:
++            break
++    for tag in profile["tags"]:
++        if tag not in labels:
++            labels.append(tag)
++        if len(labels) >= 8:
++            break
++    return labels[:8]
++
++
++def _render_resume(
++    meta: dict,
++    aggregates: dict,
++    rng: random.Random,
++) -> tuple[dict, str]:
++    """Render one worker's resume; ``meta`` is latent, ``aggregates`` train-only."""
++    category = meta["top_category"]
++    profile = CATEGORY_PROFILES.get(category, CATEGORY_PROFILES["consulting_research"])
++    region = meta["region"]
++    name = meta["name"]
++    city = rng.choice(CITIES.get(region, CITIES["CN"]))
++    years = max(3, 2 + meta["level"] * 2 + rng.randint(0, 3))
++    rating = (
++        round(sum(aggregates["ratings"]) / len(aggregates["ratings"]), 1)
++        if aggregates["ratings"]
++        else 4.5
++    )
++    on_time_rate = (
++        round(aggregates["on_time"] / aggregates["completed"], 3)
++        if aggregates["completed"]
++        else 0.9
++    )
++    completed = aggregates["completed"]
++    category_label = CATEGORY_LABELS.get(category, category)
++    university = rng.choice(UNIVERSITIES.get(region, UNIVERSITIES["CN"]))
++    degree = "硕士" if meta["level"] >= 4 else "学士"
++    major = rng.choice(profile["majors"])
++
++    summary = rng.choice(RESUME_SUMMARY_PATTERNS).format(
++        years=years,
++        category=category_label,
++        completed=completed,
++        rating=rating,
++        on_time=f"{on_time_rate:.0%}",
++    )
++
++    skills = _resume_skill_labels(meta["skills"], category, profile)
++    skills_line = rng.choice(RESUME_SKILL_PATTERNS).format(
++        skills="、".join(skills)
++    )
++
++    companies = rng.sample(profile["companies"], k=2)
++    titles = rng.sample(profile["titles"], k=2)
++    responsibilities = rng.sample(
++        profile["responsibilities"] + GENERIC_RESPONSIBILITIES, k=2
++    )
++    current_year = 2026
++    experience_lines = [
++        f"曾在{companies[0]}担任{titles[0]}（{current_year - 3} 至今），{responsibilities[0]}",
++        f"此前在{companies[1]}担任{titles[1]}（{current_year - years} 至 {current_year - 3}），{responsibilities[1]}",
++    ]
++
++    # Pair each role/bullet/result as a single category project template so the
++    # visible outcome matches the work described in the bullet. The generated
++    # project name varies while the category semantics stay coherent.
++    project_templates = list(profile["projects"])
++    if not project_templates:
++        project_templates = [
++            (f"{CATEGORY_LABELS.get(category, category)}项目", "项目负责人", "负责项目交付与验收", result)
++            for result in CATEGORY_RESULTS.get(category, RESULT_POOL)
++        ]
++    rng.shuffle(project_templates)
++    chosen_projects = list(project_templates[:2])
++    project_lines = [
++        f"代表项目《{name_}》，担任{role}，{bullet}，{result}"
++        for name_, role, bullet, result in chosen_projects
++    ]
++
++    certifications = rng.sample(CATEGORY_CERTS.get(category, CERT_POOL), k=2)
++    cert_line = rng.choice(RESUME_CERT_PATTERNS).format(
++        certs="、".join(certifications)
++    )
++
++    remaining_hours = max(0.0, meta["capacity_hours"] - meta["current_load_hours"])
++    availability = (
++        f"本周可投入 {remaining_hours:.0f} 小时"
++        + ("，支持远程协作" if meta["remote_ok"] else "，需线下协作")
++    )
++    expected_rate = (
++        f"¥{600 + meta['level'] * 320 + rng.randint(0, 200):,}"
++        f"–{600 + meta['level'] * 320 + rng.randint(600, 1100):,}/天"
++    )
++
++    parts = [
++        f"{name}，现居{city}，{category_label}方向",
++        f"{university} · {major}{degree}",
++        summary,
++        skills_line,
++        "工作经历：" + "；".join(experience_lines),
++        "项目经历：" + "；".join(project_lines),
++        cert_line,
++        f"{availability}，期望报酬 {expected_rate}",
++    ]
++    resume_text = "。".join(part.rstrip("。") for part in parts) + "。"
++
++    resume = {
++        "worker_id": meta["worker_id"],
++        "name": name,
++        "city": city,
++        "title": profile["headline"],
++        "skills": skills,
++        "projects": [project[0] for project in chosen_projects],
++        "certifications": certifications,
++        "experience_years": years,
++        "resume_text": resume_text,
++    }
++    return resume, resume_text
++
++
++# ---------------------------------------------------------------------------
++# Dataset container.
++# ---------------------------------------------------------------------------
++@dataclass
++class LargeDataset:
++    workers: list[dict]
++    tasks: list[dict]
++    customers: list[dict]
++    assignments: list[dict]
++    splits: dict[str, str]
++    metadata: dict
++    stats: dict = field(default_factory=dict)
++    labels: dict[str, dict] = field(default_factory=dict, repr=False)
++
++
++# ---------------------------------------------------------------------------
++# Main generator.
++# ---------------------------------------------------------------------------
++def _apply_llm_seed_texts(
++    llm_seeds: dict | None,
++    n_tasks: int,
++    n_workers: int,
++) -> tuple[dict[int, dict], dict[int, dict]]:
++    """Normalize the optional scheme-C hook into per-index overrides.
++
++    Returns ``(task_overrides, resume_overrides)`` keyed by record index. Only a
++    small deterministic subset of records is affected and every seed still has
++    to pass the dedup index at insert time.
++    """
++    if not llm_seeds:
++        return {}, {}
++    task_overrides: dict[int, dict] = {}
++    resume_overrides: dict[int, dict] = {}
++    for position, entry in enumerate(llm_seeds.get("tasks", [])[: max(1, n_tasks // 20)]):
++        index = (position * 20) % n_tasks
++        task_overrides[index] = {
++            "title": str(entry.get("title") or entry.get("task_text", "")[:30]),
++            "task_text": str(entry.get("task_text") or ""),
++        }
++    for position, entry in enumerate(llm_seeds.get("resumes", [])[: max(1, n_workers // 20)]):
++        index = (position * 20) % n_workers
++        resume_overrides[index] = {
++            "resume_text": str(entry.get("resume_text") or ""),
++        }
++    return task_overrides, resume_overrides
++
++
++def _quota_plan(rng: random.Random, items: list[str], total: int) -> list[str]:
++    """Deterministic quota assignment summing to ``total``."""
++    base, remainder = divmod(total, len(items))
++    plan = []
++    for item in items:
++        plan.extend([item] * base)
++    plan.extend(items[:remainder])
++    rng.shuffle(plan)
++    return plan
++
++
++def _sample_skills(rng: random.Random, categories: list[str]) -> dict[str, int]:
++    pool = set()
++    for category in categories:
++        pool.update(CATEGORY_SKILLS.get(category, set()))
++    if not pool:
++        pool = set(SKILLS)
++    chosen = rng.sample(sorted(pool), k=min(len(pool), rng.randint(10, 16)))
++    return {skill: rng.randint(1, 5) for skill in chosen}
++
++
++def generate_large_dataset(
++    n_workers: int = 1000,
++    n_tasks: int = 10000,
++    n_assignments: int = 100000,
++    seed: int = 42,
++    llm_seeds: dict | None = None,
++) -> LargeDataset:
++    """Generate the reproducible large natural-language benchmark."""
++    rng = random.Random(seed)
++    np_rng = np.random.default_rng(seed)
++
++    task_overrides, resume_overrides = _apply_llm_seed_texts(
++        llm_seeds, n_tasks, n_workers
++    )
++
++    # ---- Workers (latent traits) -------------------------------------------
++    worker_metas: list[dict] = []
++    used_names: set[str] = set()
++    for i in range(n_workers):
++        worker_id = f"w{i + 1:04d}"
++        specialties = rng.sample(CATEGORIES, k=rng.randint(1, 3))
++        specialty_levels = {
++            category: rng.randint(1, 5) for category in specialties
++        }
++        skills = _sample_skills(rng, specialties)
++        low_difficulty = rng.randint(1, 4)
++        high_difficulty = rng.randint(low_difficulty + 1, 5)
++        meta = {
++            "worker_id": worker_id,
++            "name": _unique_name(rng, used_names),
++            "skills": skills,
++            "specialties": specialty_levels,
++            "level": rng.randint(1, 5),
++            "capacity_hours": float(rng.randint(30, 50)),
++            "current_load_hours": float(rng.randint(0, 15)),
++            "preferred_categories": {
++                category: round(rng.uniform(0.3, 0.9), 2)
++                for category in specialties
++            },
++            "preferred_difficulty": (low_difficulty, high_difficulty),
++            "region": rng.choice(REGIONS),
++            "remote_ok": rng.random() < 0.6,
++            "reliability": rng.uniform(0.4, 1.0),
++            "expected_pay": 0.0,
++        }
++        top_category = max(
++            specialty_levels, key=lambda key: (specialty_levels[key], key)
++        ) if specialty_levels else "consulting_research"
++        meta["top_category"] = top_category
++        budget_min, budget_max = TASK_PROFILES.get(
++            top_category, TASK_PROFILES["consulting_research"]
++        )["budget"]
++        meta["expected_pay"] = round(
++            (budget_min + budget_max) / 2 * rng.uniform(0.7, 1.3), 2
++        )
++        worker_metas.append(meta)
++
++    # ---- Customers ----------------------------------------------------------
++    n_customers = max(10, n_workers // 2)
++    customers: list[dict] = []
++    customer_leniency: dict[str, float] = {}
++    customer_region: dict[str, str] = {}
++    for i in range(n_customers):
++        customer_id = f"c{i + 1:04d}"
++        preferred = rng.sample(CATEGORIES, k=2)
++        customers.append(
++            {
++                "customer_id": customer_id,
++                "name": f"客户{i + 1:04d}",
++                "region": rng.choice(REGIONS),
++                "preferred_categories": {
++                    category: round(rng.uniform(0.6, 0.95), 3)
++                    for category in preferred
++                },
++            }
++        )
++        customer_leniency[customer_id] = rng.uniform(-0.25, 0.25)
++        customer_region[customer_id] = customers[-1]["region"]
++
++    # ---- Quotas and task latent ---------------------------------------------
++    category_plan = _quota_plan(rng, CATEGORIES, n_tasks)
++    industry_plan = _quota_plan(rng, INDUSTRY_NAMES, n_tasks)
++
++    task_metas: list[dict] = []
++    task_texts: list[str] = []
++    task_titles: list[str] = []
++    task_index = _DedupIndex()
++
++    for j in range(n_tasks):
++        category = category_plan[j]
++        industry = industry_plan[j]
++        profile = TASK_PROFILES[category]
++        task_rng = random.Random(f"{seed}|task|{j}|latent")
++
++        subject = task_rng.choice(INDUSTRIES[industry]["subjects"])
++        required_skills = task_rng.sample(
++            sorted(CATEGORY_SKILLS.get(category, set())),
++            k=min(2, len(CATEGORY_SKILLS.get(category, set()))),
++        )
++        required_skill_levels = {
++            skill: task_rng.randint(1, 3) for skill in required_skills
++        }
++        required_level = task_rng.randint(1, 2)
++        difficulty = task_rng.randint(1, 5)
++        urgency = task_rng.randint(1, 5)
++        estimated_hours = round(task_rng.uniform(2, 24), 1)
++        customer_id = rng.choice(customers)["customer_id"]
++        region = customer_region[customer_id]
++        remote_ok = rng.random() < 0.5
++        base_min, base_max = profile["budget"]
++        scale = task_rng.uniform(0.85, 1.2)
++        budget_min = float(round(base_min * scale / 100) * 100)
++        budget_max = float(round(base_max * scale / 100) * 100)
++        days = task_rng.randint(*profile["days"])
++        created_at = BASE_TIME + timedelta(
++            days=(j * 37) % 360, hours=(j * 13) % 24
++        )
++        deadline = created_at + timedelta(days=days)
++
++        # ---- Render natural-language text with retry-on-duplicate ------------
++        title = ""
++        task_text = ""
++        override = task_overrides.get(j)
++        if override and override.get("task_text"):
++            title = override["title"]
++            task_text = override["task_text"]
++            if not task_index.add(task_text, title):
++                title, task_text = "", ""
++        if not task_text:
++            for attempt in range(200):
++                text_rng = random.Random(f"{seed}|task|{j}|text|{attempt}")
++                object_phrase = text_rng.choice(CATEGORY_OBJECTS[category])
++                qualifier = text_rng.choice(TITLE_QUALIFIERS)
++                subject = text_rng.choice(INDUSTRIES[industry]["subjects"])
++                title = subject + object_phrase + qualifier
++                industry_context = text_rng.choice(
++                    INDUSTRIES[industry]["contexts"]
++                )
++                background = text_rng.choice(BACKGROUND_PATTERNS).format(
++                    subject=subject,
++                    object=object_phrase,
++                    industry_context=industry_context.rstrip("。"),
++                )
++
++                requirements = text_rng.sample(
++                    CATEGORY_REQUIREMENTS[category],
++                    k=text_rng.randint(3, min(4, len(CATEGORY_REQUIREMENTS[category]))),
++                )
++                skill_phrase = "、".join(
++                    SKILL_LABELS.get(skill, skill)
++                    for skill in sorted(required_skill_levels)
++                )
++                if skill_phrase:
++                    requirements.append(
++                        text_rng.choice(SKILL_LEADS).format(skills=skill_phrase)
++                    )
++
++                deliverables = list(profile["deliverables"])
++                text_rng.shuffle(deliverables)
++                deliverables_sentence = text_rng.choice(
++                    DELIVERABLE_PATTERNS
++                ).format(items="、".join(deliverables))
++
++                mode = (
++                    MODE_REMOTE
++                    if remote_ok
++                    else MODE_ONSITE.format(
++                        region=REGION_LABELS.get(region, region)
++                    )
++                )
++                constraint = text_rng.choice(CONSTRAINT_PATTERNS).format(
++                    budget_min=f"{budget_min:,.0f}",
++                    budget_max=f"{budget_max:,.0f}",
++                    days=days,
++                )
++
++                lead = text_rng.choice(REQUIREMENT_LEADS)
++                requirement_text = "；".join(requirements)
++
++                def _clean_end(part: str) -> str:
++                    return part.rstrip("。")
++
++                task_text = "。".join(
++                    _clean_end(part)
++                    for part in [
++                        title,
++                        background,
++                        f"{lead}{requirement_text}",
++                        deliverables_sentence,
++                        f"{constraint}，{mode}",
++                    ]
++                ) + "。"
++                if task_index.add(task_text, title):
++                    break
++            else:
++                raise RuntimeError(f"could not generate unique task text for {j}")
++
++        task_metas.append(
++            {
++                "task_id": f"t{j + 1:05d}",
++                "customer_id": customer_id,
++                "category": category,
++                "industry": industry,
++                "required_skills": required_skill_levels,
++                "required_level": required_level,
++                "difficulty": difficulty,
++                "urgency": urgency,
++                "estimated_hours": estimated_hours,
++                "budget_min": budget_min,
++                "budget_max": budget_max,
++                "days": days,
++                "region": region,
++                "remote_ok": remote_ok,
++                "created_at": created_at,
++                "deadline": deadline,
++            }
++        )
++        task_texts.append(task_text)
++        task_titles.append(title)
++
++    # ---- Numpy latent arrays for the DGP ------------------------------------
++    n_skill = len(SKILLS)
++    w_skill = np.zeros((n_workers, n_skill), dtype=np.float32)
++    w_spec = np.zeros((n_workers, len(CATEGORIES)), dtype=np.float32)
++    w_pref = np.zeros((n_workers, len(CATEGORIES)), dtype=np.float32)
++    w_rel = np.zeros(n_workers, dtype=np.float32)
++    w_level = np.zeros(n_workers, dtype=np.int32)
++    w_capacity = np.zeros(n_workers, dtype=np.float32)
++    w_load = np.zeros(n_workers, dtype=np.float32)
++    w_region = [""] * n_workers
++    w_remote = [False] * n_workers
++    w_pay = np.zeros(n_workers, dtype=np.float32)
++    for i, meta in enumerate(worker_metas):
++        for skill, level in meta["skills"].items():
++            w_skill[i, SKILL_INDEX[skill]] = float(level)
++        for category, level in meta["specialties"].items():
++            w_spec[i, CATEGORY_INDEX[category]] = float(level)
++        for category, value in meta["preferred_categories"].items():
++            w_pref[i, CATEGORY_INDEX[category]] = value
++        w_rel[i] = meta["reliability"]
++        w_level[i] = meta["level"]
++        w_capacity[i] = meta["capacity_hours"]
++        w_load[i] = meta["current_load_hours"]
++        w_region[i] = meta["region"]
++        w_remote[i] = meta["remote_ok"]
++        w_pay[i] = meta["expected_pay"]
++
++    # ---- Split (task-level, deterministic 80/20) -----------------------------
++    split_rng = random.Random(seed + 11)
++    order = list(range(n_tasks))
++    split_rng.shuffle(order)
++    test_count = n_tasks // 5
++    test_indices = set(order[:test_count])
++    splits: dict[str, str] = {}
++    for j in range(n_tasks):
++        splits[f"t{j + 1:05d}"] = "test" if j in test_indices else "train"
++
++    # ---- Assignments DGP (B) -------------------------------------------------
++    base_pool = n_assignments // n_tasks
++    remainder = n_assignments % n_tasks
++    assignments: list[dict] = []
++    gold_labels: dict[str, dict] = {}
++    assignment_counter = 0
++
++    for j in range(n_tasks):
++        meta = task_metas[j]
++        task_id = meta["task_id"]
++        category_idx = CATEGORY_INDEX[meta["category"]]
++        required_skills = meta["required_skills"]
++        if required_skills:
++            skill_match = np.zeros(n_workers, dtype=np.float32)
++            for skill, minimum in required_skills.items():
++                column = w_skill[:, SKILL_INDEX[skill]]
++                skill_match += np.minimum(column / float(minimum), 1.0)
++            skill_match /= len(required_skills)
++        else:
++            skill_match = np.full(n_workers, 0.4, dtype=np.float32)
++
++        specialty = w_spec[:, category_idx] / 5.0
++        load_ratio = np.clip(
++            (w_load + meta["estimated_hours"]) / np.maximum(w_capacity, 1.0),
++            0.0,
++            1.0,
++        )
++        logging_weight = (
++            0.4 * skill_match
++            + 0.3 * specialty
++            + 0.2 * (1.0 - load_ratio)
++            + 0.1 * w_rel
++            + 0.001
++        )
++        probabilities = logging_weight / logging_weight.sum()
++        pool_size = base_pool + (1 if j < remainder else 0)
++        pool = np_rng.choice(
++            n_workers, size=pool_size, replace=False, p=probabilities
++        )
++
++        region_match = np.zeros(n_workers, dtype=np.float32)
++        for i in range(n_workers):
++            if w_region[i] == meta["region"] or meta["remote_ok"] or w_remote[i]:
++                region_match[i] = 1.0
++            else:
++                region_match[i] = 0.5
++
++        accept_flags: list[bool] = []
++        true_match = np.zeros(pool_size, dtype=np.float32)
++        for k, worker_index in enumerate(pool):
++            preference = float(w_pref[worker_index, category_idx])
++            pay_fit = 1.0 if float(w_pay[worker_index]) <= meta["budget_max"] * 1.2 else 0.4
++            accept_prob = _clamp(
++                0.35
++                + 0.4 * preference
++                + 0.15 * (1.0 - float(load_ratio[worker_index]))
++                + 0.05 * pay_fit
++                + 0.05 * float(region_match[worker_index]),
++                0.05,
++                0.95,
++            )
++            accept_flags.append(rng.random() < accept_prob)
++            true_match[k] = (
++                0.4 * float(skill_match[worker_index])
++                + 0.3 * float(w_rel[worker_index])
++                + 0.2 * preference
++                + 0.1 * (1.0 - float(load_ratio[worker_index]))
++                + 0.05 * _gumbel(rng)
++            )
++
++        if not any(accept_flags):
++            forced = int(np.argmax(true_match))
++            accept_flags[forced] = True
++
++        gold_position = int(np.argmax(true_match))
++        gold_worker_id = worker_metas[int(pool[gold_position])]["worker_id"]
++        gold_labels[task_id] = {
++            "gold_worker_id": gold_worker_id,
++            "split": splits[task_id],
++        }
++
++        for k, worker_index in enumerate(pool):
++            accepted = accept_flags[k]
++            on_time: int | None = None
++            rating: float | None = None
++            rework: int | None = None
++            if accepted:
++                on_time_prob = _clamp(
++                    0.55
++                    + 0.35 * float(skill_match[worker_index])
++                    + 0.15 * float(w_rel[worker_index])
++                    - 0.25 * float(load_ratio[worker_index])
++                    - 0.04 * meta["urgency"],
++                    0.05,
++                    0.98,
++                )
++                on_time = 1 if rng.random() < on_time_prob else 0
++                quality = _clamp(
++                    0.5 * float(skill_match[worker_index])
++                    + 0.3 * float(w_rel[worker_index])
++                    + 0.2 * float(on_time)
++                    + rng.uniform(-0.1, 0.1),
++                    0.0,
++                    1.0,
++                )
++                rework = 1 if quality < 0.45 and rng.random() < 0.5 else 0
++                rating = float(
++                    int(
++                        round(
++                            _clamp(
++                                1.0
++                                + 4.0 * quality
++                                + customer_leniency[meta["customer_id"]]
++                                + rng.uniform(-0.3, 0.3),
++                                1.0,
++                                5.0,
++                            )
++                        )
++                    )
++                )
++
++            assignment_counter += 1
++            assignments.append(
++                {
++                    "assignment_id": f"a{assignment_counter:07d}",
++                    "task_id": task_id,
++                    "worker_id": worker_metas[int(worker_index)]["worker_id"],
++                    "customer_id": meta["customer_id"],
++                    "status": "accepted" if accepted else "rejected",
++                    "on_time": on_time,
++                    "rating": rating,
++                    "rework": rework,
++                    "created_at": (
++                        meta["created_at"] + timedelta(hours=k + 1)
++                    ).isoformat(),
++                    "split": splits[task_id],
++                }
++            )
++
++    assignments.sort(key=lambda row: (row["created_at"], row["assignment_id"]))
++
++    # ---- Train-only worker aggregates ----------------------------------------
++    task_category_by_id = {meta["task_id"]: meta["category"] for meta in task_metas}
++    aggregates = {
++        meta["worker_id"]: {
++            "ratings": [],
++            "completed": 0,
++            "on_time": 0,
++            "rework": 0,
++            "category_ratings": defaultdict(list),
++        }
++        for meta in worker_metas
++    }
++    for assignment in assignments:
++        if assignment["split"] != "train" or assignment["status"] != "accepted":
++            continue
++        aggregate = aggregates[assignment["worker_id"]]
++        aggregate["completed"] += 1
++        aggregate["on_time"] += assignment["on_time"] or 0
++        aggregate["rework"] += assignment["rework"] or 0
++        aggregate["ratings"].append(assignment["rating"])
++        category = task_category_by_id[assignment["task_id"]]
++        aggregate["category_ratings"][category].append(assignment["rating"])
++
++    # ---- Resumes (A) with retry-on-duplicate ---------------------------------
++    workers: list[dict] = []
++    resume_index = _DedupIndex()
++    for i, meta in enumerate(worker_metas):
++        resume_text = ""
++        resume: dict = {}
++        override = resume_overrides.get(i)
++        if override and override.get("resume_text"):
++            resume_text = override["resume_text"]
++            if resume_index.add(resume_text):
++                resume = {
++                    "worker_id": meta["worker_id"],
++                    "name": meta["name"],
++                    "resume_text": resume_text,
++                }
++            else:
++                resume_text = ""
++        if not resume_text:
++            for attempt in range(200):
++                resume_rng = random.Random(f"{seed}|resume|{i}|{attempt}")
++                resume, resume_text = _render_resume(
++                    meta, aggregates[meta["worker_id"]], resume_rng
++                )
++                if resume_index.add(resume_text):
++                    break
++            else:
++                raise RuntimeError(f"could not generate unique resume for {i}")
++
++        aggregate = aggregates[meta["worker_id"]]
++        workers.append(
++            {
++                "worker_id": meta["worker_id"],
++                "name": meta["name"],
++                "resume_text": resume_text,
++                "skills": dict(meta["skills"]),
++                "specialties": dict(meta["specialties"]),
++                "level": meta["level"],
++                "rating": (
++                    round(sum(aggregate["ratings"]) / len(aggregate["ratings"]), 3)
++                    if aggregate["ratings"]
++                    else 4.5
++                ),
++                "completed": aggregate["completed"],
++                "on_time_rate": (
++                    round(aggregate["on_time"] / aggregate["completed"], 4)
++                    if aggregate["completed"]
++                    else 0.9
++                ),
++                "rework_rate": (
++                    round(aggregate["rework"] / aggregate["completed"], 4)
++                    if aggregate["completed"]
++                    else 0.0
++                ),
++                "capacity_hours": float(meta["capacity_hours"]),
++                "current_load_hours": float(meta["current_load_hours"]),
++                "region": meta["region"],
++                "remote_ok": int(meta["remote_ok"]),
++                "preferred_categories": dict(meta["preferred_categories"]),
++            }
++        )
++
++    # ---- Model-safe task rows (no category/gold) ------------------------------
++    tasks: list[dict] = []
++    for j, meta in enumerate(task_metas):
++        tasks.append(
++            {
++                "task_id": meta["task_id"],
++                "customer_id": meta["customer_id"],
++                "title": task_titles[j],
++                "task_text": task_texts[j],
++                "budget": round((meta["budget_min"] + meta["budget_max"]) / 2, 2),
++                "deadline": meta["deadline"].isoformat(),
++                "region": meta["region"],
++                "remote_ok": int(meta["remote_ok"]),
++                "split": splits[meta["task_id"]],
++            }
++        )
++
++    # ---- Stats ----------------------------------------------------------------
++    stats = _compute_stats(
++        n_workers,
++        n_tasks,
++        n_customers,
++        workers,
++        tasks,
++        task_metas,
++        assignments,
++        splits,
++        gold_labels,
++        task_index,
++        resume_index,
++    )
++
++    metadata = {
++        "seed": seed,
++        "n_workers": n_workers,
++        "n_tasks": n_tasks,
++        "n_assignments": n_assignments,
++        "scheme": "E",
++        "split": "80/20 task split",
++        "generated_at": datetime.now(timezone.utc).isoformat(),
++        "llm_seeds": bool(llm_seeds),
++    }
++
++    return LargeDataset(
++        workers=workers,
++        tasks=tasks,
++        customers=customers,
++        assignments=assignments,
++        splits=splits,
++        metadata=metadata,
++        stats=stats,
++        labels=gold_labels,
++    )
++
++
++def _near_duplicate_collisions(texts: list[str]) -> int:
++    """Count emitted texts that collide with an earlier text at Hamming <= 3.
++
++    Exact duplicates are skipped first so exact and near counters stay
++    independent. A fresh index is used so generator resample counters are not
++    mixed into post-hoc statistics.
++    """
++    index = _DedupIndex()
++    seen: set[str] = set()
++    collisions = 0
++    for text in texts:
++        text_hash = normalized_text_hash(text)
++        if text_hash in seen:
++            continue
++        seen.add(text_hash)
++        if not index.add(text):
++            collisions += 1
++    return collisions
++
++
++def _compute_stats(
++    n_workers: int,
++    n_tasks: int,
++    n_customers: int,
++    workers: list[dict],
++    tasks: list[dict],
++    task_metas: list[dict],
++    assignments: list[dict],
++    splits: dict[str, str],
++    gold_labels: dict[str, dict],
++    task_index: _DedupIndex,
++    resume_index: _DedupIndex,
++) -> dict:
++    train_tasks = sum(1 for split in splits.values() if split == "train")
++    test_tasks = sum(1 for split in splits.values() if split == "test")
++    accepted = sum(1 for row in assignments if row["status"] == "accepted")
++    rejected = len(assignments) - accepted
++
++    task_texts = [task["task_text"] for task in tasks]
++    resume_texts = [worker["resume_text"] for worker in workers]
++    task_titles = [task["title"] for task in tasks]
++    task_exact_duplicates = len(task_texts) - len(
++        {normalized_text_hash(text) for text in task_texts}
++    )
++    resume_exact_duplicates = len(resume_texts) - len(
++        {normalized_text_hash(text) for text in resume_texts}
++    )
++    task_title_duplicates = len(task_titles) - len(
++        {_normalize_for_hash(title) for title in task_titles}
++    )
++    task_near_dup_collisions = _near_duplicate_collisions(task_texts)
++    resume_near_dup_collisions = _near_duplicate_collisions(resume_texts)
++    task_near_dup_rate = (
++        round(task_near_dup_collisions / len(task_texts), 6) if task_texts else 0.0
++    )
++    resume_near_dup_rate = (
++        round(resume_near_dup_collisions / len(resume_texts), 6)
++        if resume_texts
++        else 0.0
++    )
++
++    status_by_pair = {
++        (row["task_id"], row["worker_id"]): row["status"] for row in assignments
++    }
++    gold_accepted = sum(
++        1
++        for task_id, label in gold_labels.items()
++        if status_by_pair.get((task_id, label["gold_worker_id"])) == "accepted"
++    )
++    gold_acceptance_rate = (
++        round(gold_accepted / len(gold_labels), 4) if gold_labels else 0.0
++    )
++    exposure_pool_size = len(assignments) // n_tasks if n_tasks else 0
++
++    split_outcomes: dict[str, dict] = {}
++    for split_name in ("train", "test"):
++        rows = [row for row in assignments if row["split"] == split_name]
++        split_accepted = sum(1 for row in rows if row["status"] == "accepted")
++        split_ratings = [row["rating"] for row in rows if row["rating"] is not None]
++        split_on_time = [row["on_time"] for row in rows if row["on_time"] is not None]
++        split_outcomes[split_name] = {
++            "assignments": len(rows),
++            "accepted": split_accepted,
++            "rejected": len(rows) - split_accepted,
++            "rated": len(split_ratings),
++            "mean_rating": (
++                round(sum(split_ratings) / len(split_ratings), 3)
++                if split_ratings
++                else 0.0
++            ),
++            "on_time_rate": (
++                round(sum(split_on_time) / len(split_on_time), 4)
++                if split_on_time
++                else 0.0
++            ),
++        }
++
++    category_dist: dict[str, int] = defaultdict(int)
++    industry_dist: dict[str, int] = defaultdict(int)
++    budgets: list[float] = []
++    days: list[int] = []
++    for meta in task_metas:
++        category_dist[meta["category"]] += 1
++        industry_dist[meta["industry"]] += 1
++        budgets.append(round((meta["budget_min"] + meta["budget_max"]) / 2, 2))
++        days.append(meta["days"])
++
++    task_lengths = [len(task["task_text"]) for task in tasks]
++    resume_lengths = [len(worker["resume_text"]) for worker in workers]
++
++    rating_values = [
++        row["rating"] for row in assignments if row["rating"] is not None
++    ]
++    on_time_values = [
++        row["on_time"] for row in assignments if row["on_time"] is not None
++    ]
++
++    gold_workers = {label["gold_worker_id"] for label in gold_labels.values()}
++    gold_counts: dict[str, int] = defaultdict(int)
++    for label in gold_labels.values():
++        gold_counts[label["gold_worker_id"]] += 1
++
++    completeness_markers = {
++        "name": sum(1 for worker in workers if worker["name"]),
++        "city": sum(
++            1
++            for worker in workers
++            if any(city in worker["resume_text"] for city in _all_cities())
++        ),
++        "skills": sum(1 for worker in workers if "技能" in worker["resume_text"] or "擅长" in worker["resume_text"] or "熟练" in worker["resume_text"] or "核心能力" in worker["resume_text"]),
++        "projects": sum(1 for worker in workers if "项目" in worker["resume_text"]),
++        "certifications": sum(1 for worker in workers if "证书" in worker["resume_text"] or "认证" in worker["resume_text"]),
++        "experience": sum(1 for worker in workers if "担任" in worker["resume_text"] or "工作经历" in worker["resume_text"]),
++    }
++
++    return {
++        "n_workers": n_workers,
++        "n_tasks": n_tasks,
++        "n_customers": n_customers,
++        "n_assignments": len(assignments),
++        "train_tasks": train_tasks,
++        "test_tasks": test_tasks,
++        "accepted": accepted,
++        "rejected": rejected,
++        "task_exact_duplicates": task_exact_duplicates,
++        "task_title_duplicates": task_title_duplicates,
++        "task_unique_titles": len({task["title"] for task in tasks}),
++        "task_near_dup_collisions": task_near_dup_collisions,
++        "task_near_dup_rate": task_near_dup_rate,
++        "task_near_dup_rejections": task_index.near_dup_rejections,
++        "resume_exact_duplicates": resume_exact_duplicates,
++        "resume_near_dup_collisions": resume_near_dup_collisions,
++        "resume_near_dup_rate": resume_near_dup_rate,
++        "resume_near_dup_rejections": resume_index.near_dup_rejections,
++        "category_distribution": dict(sorted(category_dist.items())),
++        "industry_distribution": dict(sorted(industry_dist.items())),
++        "budget": {
++            "min": min(budgets),
++            "mean": round(sum(budgets) / len(budgets), 2),
++            "max": max(budgets),
++        },
++        "duration_days": {
++            "min": min(days),
++            "mean": round(sum(days) / len(days), 2),
++            "max": max(days),
++        },
++        "task_text_length": {
++            "min": min(task_lengths),
++            "mean": round(sum(task_lengths) / len(task_lengths), 1),
++            "max": max(task_lengths),
++        },
++        "resume_text_length": {
++            "min": min(resume_lengths),
++            "mean": round(sum(resume_lengths) / len(resume_lengths), 1),
++            "max": max(resume_lengths),
++        },
++        "resume_completeness": {
++            marker: round(count / n_workers, 4)
++            for marker, count in completeness_markers.items()
++        },
++        "rating_distribution": _histogram(rating_values, 1, 5),
++        "on_time_rate": (
++            round(sum(on_time_values) / len(on_time_values), 4)
++            if on_time_values
++            else 0.0
++        ),
++        "gold_workers": len(gold_workers),
++        "gold_accepted": gold_accepted,
++        "gold_acceptance_rate": gold_acceptance_rate,
++        "exposure_pool_size": exposure_pool_size,
++        "max_gold_share": (
++            round(max(gold_counts.values()) / len(gold_labels), 4)
++            if gold_labels
++            else 0.0
++        ),
++        "split_outcomes": split_outcomes,
++    }
++
++
++def _all_cities() -> list[str]:
++    return [city for cities in CITIES.values() for city in cities]
++
++
++def _histogram(values: list[float], low: int, high: int) -> dict[str, int]:
++    result = {str(value): 0 for value in range(low, high + 1)}
++    for value in values:
++        bucket = int(round(value))
++        result[str(min(high, max(low, bucket)))] += 1
++    return result
+
+--- a/scripts\build_large_benchmark.py
++++ b/scripts\build_large_benchmark.py
+@@ -0,0 +1,418 @@
++"""Build the large natural-language benchmark and run the sampled evaluation."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++
++from app.benchmark.large import (  # noqa: E402
++    build_large_sqlite,
++    evaluate_large,
++    export_large_jsonl,
++)
++from app.data.large_synthetic import generate_large_dataset  # noqa: E402
++
++DEFAULT_DB = ROOT / "data" / "benchmark" / "task_benchmark_large.sqlite"
++DEFAULT_JSONL = ROOT / "data" / "benchmark" / "task_benchmark_large.jsonl"
++DEFAULT_STATS = ROOT / "reports" / "large_benchmark_stats.md"
++DEFAULT_EVAL = ROOT / "reports" / "large_benchmark_eval.md"
++
++
++def _table(rows: list[tuple[str, str]]) -> str:
++    lines = ["| item | value |", "| --- | --- |"]
++    lines.extend(f"| {key} | {value} |" for key, value in rows)
++    return "\n".join(lines)
++
++
++def write_stats_report(dataset, path: Path) -> Path:
++    stats = dataset.stats
++    lines: list[str] = []
++    lines.append("# Large Benchmark — Data Quality & Statistics\n")
++    lines.append(
++        _table(
++            [
++                ("workers", str(stats["n_workers"])),
++                ("tasks", str(stats["n_tasks"])),
++                ("customers", str(stats["n_customers"])),
++                ("assignments", str(stats["n_assignments"])),
++                ("train tasks", str(stats["train_tasks"])),
++                ("test tasks", str(stats["test_tasks"])),
++                ("accepted", str(stats["accepted"])),
++                ("rejected", str(stats["rejected"])),
++                ("scheme", dataset.metadata.get("scheme", "E")),
++                ("seed", str(dataset.metadata.get("seed"))),
++            ]
++        )
++    )
++
++    lines.append("\n## Duplicate checks (computed from the emitted corpus)\n")
++    lines.append(
++        _table(
++            [
++                ("task exact duplicates", str(stats["task_exact_duplicates"])),
++                ("task title duplicates", str(stats.get("task_title_duplicates", 0))),
++                ("task unique titles", f"{stats['task_unique_titles']} / {stats['n_tasks']}"),
++                ("task near-dup collisions", str(stats.get("task_near_dup_collisions", 0))),
++                ("task near-dup rate", f"{stats['task_near_dup_rate']:.4%}"),
++                ("task near-dup resamples", str(stats["task_near_dup_rejections"])),
++                ("resume exact duplicates", str(stats["resume_exact_duplicates"])),
++                ("resume near-dup collisions", str(stats.get("resume_near_dup_collisions", 0))),
++                ("resume near-dup rate", f"{stats['resume_near_dup_rate']:.4%}"),
++                ("resume near-dup resamples", str(stats["resume_near_dup_rejections"])),
++            ]
++        )
++    )
++    lines.append(
++        "\nExact duplicates use normalized SHA-256; title duplicates use the "
++        "normalized title set; near-duplicates use 64-bit simhash with Hamming "
++        "distance <= 3. Exact/title/near counters are recomputed from the "
++        "emitted texts, while the resample counters record generator retries."
++    )
++
++    lines.append("\n## Category distribution\n")
++    lines.append(_table([(key, str(value)) for key, value in stats["category_distribution"].items()]))
++
++    lines.append("\n## Industry distribution\n")
++    lines.append(_table([(key, str(value)) for key, value in stats["industry_distribution"].items()]))
++
++    lines.append("\n## Budget (midpoint, CNY)\n")
++    budget = stats["budget"]
++    lines.append(
++        _table(
++            [
++                ("min", f"{budget['min']:,.0f}"),
++                ("mean", f"{budget['mean']:,.0f}"),
++                ("max", f"{budget['max']:,.0f}"),
++            ]
++        )
++    )
++
++    lines.append("\n## Duration (days)\n")
++    duration = stats["duration_days"]
++    lines.append(
++        _table(
++            [
++                ("min", str(duration["min"])),
++                ("mean", f"{duration['mean']:.1f}"),
++                ("max", str(duration["max"])),
++            ]
++        )
++    )
++
++    lines.append("\n## Text lengths (characters)\n")
++    task_len = stats["task_text_length"]
++    resume_len = stats["resume_text_length"]
++    lines.append(
++        _table(
++            [
++                ("task_text min/mean/max", f"{task_len['min']} / {task_len['mean']} / {task_len['max']}"),
++                ("resume_text min/mean/max", f"{resume_len['min']} / {resume_len['mean']} / {resume_len['max']}"),
++            ]
++        )
++    )
++
++    lines.append("\n## Resume completeness (fraction of resumes containing each section)\n")
++    lines.append(
++        _table(
++            [
++                (marker, f"{value:.1%}")
++                for marker, value in stats["resume_completeness"].items()
++            ]
++        )
++    )
++
++    lines.append("\n## Assignment outcomes\n")
++    lines.append(
++        _table(
++            [
++                ("rating distribution", json.dumps(stats["rating_distribution"], ensure_ascii=False)),
++                ("on-time rate", f"{stats['on_time_rate']:.2%}"),
++            ]
++        )
++    )
++
++    split_outcomes = stats.get("split_outcomes", {})
++    if split_outcomes:
++        lines.append("\n## Split outcomes\n")
++        lines.append(
++            "| split | assignments | accepted | rejected | mean rating | on-time |"
++        )
++        lines.append("| --- | --- | --- | --- | --- | --- |")
++        for split in ("train", "test"):
++            outcome = split_outcomes.get(split, {})
++            lines.append(
++                f"| {split} | {outcome.get('assignments', 0)} | "
++                f"{outcome.get('accepted', 0)} | {outcome.get('rejected', 0)} | "
++                f"{outcome.get('mean_rating', 0)} | "
++                f"{outcome.get('on_time_rate', 0):.2%} |"
++            )
++
++    lines.append("\n## Gold definition\n")
++    lines.append(
++        _table(
++            [
++                (
++                    "definition",
++                    "latent-best worker (argmax DGP true-match) in the task's exposure pool",
++                ),
++                ("exposure pool size", str(stats.get("exposure_pool_size", "n/a"))),
++                ("distinct gold workers", str(stats["gold_workers"])),
++                (
++                    "gold accepted the task",
++                    f"{stats.get('gold_accepted', 0)} / {stats['n_tasks']} "
++                    f"({stats.get('gold_acceptance_rate', 0):.2%})",
++                ),
++                ("max gold share", f"{stats['max_gold_share']:.2%}"),
++            ]
++        )
++    )
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    return path
++
++
++def write_eval_report(result: dict, stats: dict, path: Path) -> Path:
++    metrics = result["metrics"]
++    lines: list[str] = []
++    lines.append("# Large Benchmark — Sampled Evaluation\n")
++    lines.append(
++        _table(
++            [
++                ("sampled test tasks", str(result["sampled_test_tasks"])),
++                ("candidates per task", str(result["candidates"])),
++                ("seeds", ", ".join(str(seed) for seed in result["seeds"])),
++                ("workers", str(result["n_workers"])),
++                ("tasks", str(result["n_tasks"])),
++            ]
++        )
++    )
++
++    lines.append("\n## Protocol\n")
++    protocol = result.get("protocol", {})
++    lines.append(
++        _table(
++            [
++                ("eval split", protocol.get("eval_split", "test")),
++                (
++                    "similarity graph",
++                    protocol.get(
++                        "similarity_graph", "train-split accepted assignments only"
++                    ),
++                ),
++                (
++                    "worker history",
++                    protocol.get(
++                        "worker_history", "train-split accepted assignments only"
++                    ),
++                ),
++                (
++                    "candidate pool",
++                    protocol.get(
++                        "candidate_pool",
++                        f"gold + {result['candidates'] - 1} random workers",
++                    ),
++                ),
++                (
++                    "gold definition",
++                    protocol.get(
++                        "gold_definition", "latent-best worker in the exposure pool"
++                    ),
++                ),
++                (
++                    "exposure pool size",
++                    str(
++                        protocol.get(
++                            "exposure_pool_size",
++                            stats.get("exposure_pool_size", "n/a"),
++                        )
++                    ),
++                ),
++                (
++                    "feature weights",
++                    protocol.get("feature_weights", "SIM_INITIAL_WEIGHTS"),
++                ),
++            ]
++        )
++    )
++    lines.append(
++        "\nGold is the latent-best worker (argmax of the DGP true-match score) "
++        "inside the task's exposure pool, not an accepted-only label. "
++        f"{stats.get('gold_accepted', 0)} / {stats.get('n_tasks', 0)} gold workers "
++        f"({stats.get('gold_acceptance_rate', 0):.2%}) accepted their task. Each "
++        f"{result['candidates']}-candidate pool is the gold worker plus "
++        f"{result['candidates'] - 1} uniformly sampled workers."
++    )
++
++    lines.append("\n## Metrics (mean ± std across seeds)\n")
++    lines.append(
++        _table(
++            [
++                (
++                    key.upper(),
++                    f"{metrics[key]['mean']:.4f} ± {metrics[key]['std']:.4f}",
++                )
++                for key in ("top1", "top5", "mrr", "ndcg")
++            ]
++        )
++    )
++
++    lines.append("\n## Baselines\n")
++    feature_only = result.get("baselines", {}).get("feature_only", {})
++    random_baseline = result.get("baselines", {}).get("random", {})
++    lines.append("| baseline | Top-1 | Top-5 | MRR | NDCG |")
++    lines.append("| --- | --- | --- | --- | --- |")
++    lines.append(
++        "| feature-only (no collaborative) | "
++        f"{feature_only.get('top1', {}).get('mean', 0):.4f} ± "
++        f"{feature_only.get('top1', {}).get('std', 0):.4f} | "
++        f"{feature_only.get('top5', {}).get('mean', 0):.4f} ± "
++        f"{feature_only.get('top5', {}).get('std', 0):.4f} | "
++        f"{feature_only.get('mrr', {}).get('mean', 0):.4f} ± "
++        f"{feature_only.get('mrr', {}).get('std', 0):.4f} | "
++        f"{feature_only.get('ndcg', {}).get('mean', 0):.4f} ± "
++        f"{feature_only.get('ndcg', {}).get('std', 0):.4f} |"
++    )
++    lines.append(
++        "| uniform random (analytical) | "
++        f"{random_baseline.get('top1', 0):.4f} | "
++        f"{random_baseline.get('top5', 0):.4f} | n/a | n/a |"
++    )
++    lines.append(
++        "\nThe feature-only baseline uses the same six observable features and "
++        "weights with the collaborative term removed. The analytical random "
++        "baseline is 1/200 Top-1 and 5/200 Top-5. Random is only a scale "
++        "reference, not a fair model comparison: gold is latent-best inside a "
++        "10-worker exposure pool and the 199 distractors are uniformly random, "
++        "so most distractors are not plausible candidates. The feature-only "
++        "baseline is the meaningful reference for the ItemCF contribution."
++    )
++
++    lines.append("\n## Per-seed metrics\n")
++    lines.append("| seed | top1 | top5 | mrr | ndcg |")
++    lines.append("| --- | --- | --- | --- | --- |")
++    for row in result["per_seed"]:
++        lines.append(
++            f"| {row['seed']} | {row['top1']} | {row['top5']} | {row['mrr']} | {row['ndcg']} |"
++        )
++
++    lines.append("\n## ItemCF wiring (strict train-only graph)\n")
++    itemcf = result["itemcf"]
++    lines.append(
++        _table(
++            [
++                ("similarity interactions (train accepted)", str(itemcf["similarity_interactions"])),
++                ("history interactions (train accepted)", str(itemcf["history_interactions"])),
++                ("similarity splits", json.dumps(itemcf.get("similarity_splits"))),
++                ("history splits", json.dumps(itemcf.get("history_splits"))),
++                ("similarity is train-only", str(itemcf.get("similarity_is_train_only"))),
++                ("history is train-only", str(itemcf.get("history_is_train_only"))),
++                ("accepted interactions total", str(itemcf.get("accepted_interactions_total"))),
++                (
++                    "excluded test accepted interactions",
++                    str(itemcf.get("excluded_test_accepted_interactions")),
++                ),
++                ("collaborative pool-normalized", str(itemcf["pool_normalized"])),
++                ("collaborative nonzero rate", f"{result['collaborative_nonzero_rate']:.2%}"),
++            ]
++        )
++    )
++    lines.append(
++        "\nThe similarity graph and the worker history are both built from "
++        "train-split accepted assignments only. A held-out test task therefore "
++        "has no ItemCF co-occurrence edges and is a cold-start item, so the "
++        "collaborative term is zero for every test-task candidate under this "
++        "protocol. This is the strict, leak-free result; the pre-fix graph used "
++        "test-task co-occurrences and was optimistic."
++    )
++
++    lines.append("\n## Data quality\n")
++    lines.append(
++        _table(
++            [
++                (
++                    "task exact / title / near duplicates",
++                    f"{stats['task_exact_duplicates']} / "
++                    f"{stats.get('task_title_duplicates', 0)} / "
++                    f"{stats.get('task_near_dup_collisions', 0)}",
++                ),
++                (
++                    "resume exact / near duplicates",
++                    f"{stats['resume_exact_duplicates']} / "
++                    f"{stats.get('resume_near_dup_collisions', 0)}",
++                ),
++                ("task near-dup rate", f"{stats['task_near_dup_rate']:.4%}"),
++                ("resume near-dup rate", f"{stats['resume_near_dup_rate']:.4%}"),
++                ("task unique titles", f"{stats['task_unique_titles']} / {stats['n_tasks']}"),
++                ("task_text mean length", str(stats["task_text_length"]["mean"])),
++                ("resume_text mean length", str(stats["resume_text_length"]["mean"])),
++            ]
++        )
++    )
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    return path
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workers", type=int, default=1000)
++    parser.add_argument("--tasks", type=int, default=10000)
++    parser.add_argument("--assignments", type=int, default=100000)
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--llm-seeds", default=None, help="optional JSON seed file (scheme C)")
++    parser.add_argument("--db", default=str(DEFAULT_DB))
++    parser.add_argument("--jsonl", default=str(DEFAULT_JSONL))
++    parser.add_argument("--stats", default=str(DEFAULT_STATS))
++    parser.add_argument("--eval-report", default=str(DEFAULT_EVAL))
++    parser.add_argument("--skip-eval", action="store_true")
++    args = parser.parse_args()
++
++    llm_seeds = None
++    if args.llm_seeds:
++        llm_seeds = json.loads(Path(args.llm_seeds).read_text(encoding="utf-8"))
++
++    dataset = generate_large_dataset(
++        n_workers=args.workers,
++        n_tasks=args.tasks,
++        n_assignments=args.assignments,
++        seed=args.seed,
++        llm_seeds=llm_seeds,
++    )
++
++    db_path = build_large_sqlite(dataset, Path(args.db))
++    jsonl_path = export_large_jsonl(dataset, Path(args.jsonl))
++    stats_path = write_stats_report(dataset, Path(args.stats))
++
++    summary = {
++        "db": str(db_path),
++        "jsonl": str(jsonl_path),
++        "stats_report": str(stats_path),
++        "seed": args.seed,
++        "workers": len(dataset.workers),
++        "tasks": len(dataset.tasks),
++        "customers": len(dataset.customers),
++        "assignments": len(dataset.assignments),
++        "train_tasks": dataset.stats["train_tasks"],
++        "test_tasks": dataset.stats["test_tasks"],
++        "task_near_dup_rate": dataset.stats["task_near_dup_rate"],
++        "resume_near_dup_rate": dataset.stats["resume_near_dup_rate"],
++    }
++
++    if not args.skip_eval:
++        result = evaluate_large(Path(args.db))
++        eval_path = write_eval_report(result, dataset.stats, Path(args.eval_report))
++        summary["eval_report"] = str(eval_path)
++        summary["metrics"] = result["metrics"]
++
++    print(json.dumps(summary, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+
+--- a/tests\test_large_benchmark.py
++++ b/tests\test_large_benchmark.py
+@@ -0,0 +1,307 @@
++"""Focused tests for large-benchmark storage and sampled evaluation."""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import numpy as np
++
++from app.benchmark.large import (
++    LargeFeatureBuilder,
++    build_itemcf,
++    build_large_sqlite,
++    collaborative_scores,
++    evaluate_large,
++    export_large_jsonl,
++    item_similarity,
++    load_large_sqlite,
++    pool_normalize,
++)
++from app.data.large_synthetic import generate_large_dataset
++from app.models.itemcf import ItemCF
++
++
++def build_small(tmp_path, **overrides):
++    kwargs = dict(n_workers=60, n_tasks=200, n_assignments=2000, seed=7)
++    kwargs.update(overrides)
++    dataset = generate_large_dataset(**kwargs)
++    db_path = tmp_path / "bench.sqlite"
++    build_large_sqlite(dataset, db_path)
++    return db_path, dataset
++
++
++def test_build_and_load_large_sqlite_roundtrip(tmp_path):
++    db_path, dataset = build_small(tmp_path)
++    loaded = load_large_sqlite(db_path)
++    assert len(loaded.workers) == len(dataset.workers)
++    assert len(loaded.tasks) == len(dataset.tasks)
++    assert len(loaded.customers) == len(dataset.customers)
++    assert len(loaded.assignments) == len(dataset.assignments)
++    assert loaded.splits == dataset.splits
++    assert loaded.labels == {}
++    assert not any(key.startswith("stat:") for key in loaded.metadata)
++    assert loaded.workers[0]["resume_text"]
++    assert loaded.tasks[0]["task_text"]
++    assert "skills" in loaded.workers[0]
++
++    for assignment in loaded.assignments:
++        if assignment["split"] == "test":
++            assert assignment["status"] == "unknown"
++            assert assignment["on_time"] is None
++            assert assignment["rating"] is None
++            assert assignment["rework"] is None
++        else:
++            assert assignment["status"] in {"accepted", "rejected"}
++
++
++def test_evaluate_large_metrics_bounded(tmp_path):
++    db_path, _ = build_small(tmp_path)
++    result = evaluate_large(db_path, test_tasks=20, candidates=50, seeds=(42, 43))
++    assert set(result["metrics"]) == {"top1", "top5", "mrr", "ndcg"}
++    for name, value in result["metrics"].items():
++        assert 0.0 <= value["mean"] <= 1.0
++        assert 0.0 <= value["std"] <= 1.0
++    assert len(result["per_seed"]) == 2
++    for row in result["per_seed"]:
++        assert 0.0 <= row["top1"] <= 1.0
++        assert 0.0 <= row["top5"] <= 1.0
++        assert 0.0 <= row["mrr"] <= 1.0
++        assert 0.0 <= row["ndcg"] <= 1.0
++    assert 0.0 <= result["collaborative_nonzero_rate"] <= 1.0
++
++
++def test_itemcf_wiring_and_pool_normalization():
++    sim = ItemCF([("w1", "t1", 5.0), ("w2", "t1", 4.0), ("w2", "t2", 3.0)])
++    history = ItemCF([("w1", "t1", 5.0), ("w2", "t2", 3.0)])
++
++    assert item_similarity(sim, "t1", "t2") > 0.0
++
++    scores = collaborative_scores(sim, history, "t2", ["w1", "w2"])
++    assert scores["w1"] > 0.0
++    assert scores["w2"] >= 0.0
++
++    assert pool_normalize({"a": 0.2, "b": 0.4}) == {"a": 0.5, "b": 1.0}
++    assert pool_normalize({"a": 0.0, "b": 0.0}) == {"a": 0.0, "b": 0.0}
++    assert pool_normalize({}) == {}
++
++
++def test_build_itemcf_filters_by_split():
++    assignments = [
++        {"worker_id": "w1", "task_id": "t1", "status": "accepted", "rating": 5.0, "split": "train"},
++        {"worker_id": "w2", "task_id": "t2", "status": "accepted", "rating": 4.0, "split": "test"},
++        {"worker_id": "w3", "task_id": "t3", "status": "rejected", "rating": None, "split": "train"},
++    ]
++    train_cf = build_itemcf(assignments, split="train")
++    assert set(train_cf.user_items) == {"w1"}
++    all_cf = build_itemcf(assignments)
++    assert set(all_cf.user_items) == {"w1", "w2"}
++
++
++def test_evaluate_large_wires_real_itemcf(tmp_path):
++    db_path, _ = build_small(tmp_path)
++    result = evaluate_large(db_path, test_tasks=10, candidates=30, seeds=(42,))
++    assert result["itemcf"]["pool_normalized"] is True
++    assert result["itemcf"]["history_is_train_only"] is True
++    assert result["itemcf"]["history_interactions"] > 0
++    assert result["itemcf"]["similarity_interactions"] >= result["itemcf"]["history_interactions"]
++
++
++def test_test_split_assignments_cannot_affect_itemcf_or_scores():
++    train_assignments = [
++        {"worker_id": "w1", "task_id": "t1", "status": "accepted", "rating": 5.0, "split": "train"},
++        {"worker_id": "w2", "task_id": "t1", "status": "accepted", "rating": 4.0, "split": "train"},
++        {"worker_id": "w2", "task_id": "t2", "status": "accepted", "rating": 3.0, "split": "train"},
++    ]
++    itemcf = build_itemcf(train_assignments, split="train")
++    baseline_item_users = {
++        task_id: dict(users) for task_id, users in itemcf.item_users.items()
++    }
++    baseline_similarity = item_similarity(itemcf, "t1", "t2")
++    baseline_scores = collaborative_scores(
++        itemcf, itemcf, "t_held_out", ["w1", "w2"]
++    )
++
++    with_test_rows = train_assignments + [
++        {
++            "worker_id": "w1",
++            "task_id": "t_held_out",
++            "status": "accepted",
++            "rating": 5.0,
++            "split": "test",
++        },
++        {
++            "worker_id": "w3",
++            "task_id": "t_held_out",
++            "status": "accepted",
++            "rating": 5.0,
++            "split": "test",
++        },
++    ]
++    itemcf_with_test = build_itemcf(with_test_rows, split="train")
++    assert {
++        task_id: dict(users)
++        for task_id, users in itemcf_with_test.item_users.items()
++    } == baseline_item_users
++    assert item_similarity(itemcf_with_test, "t1", "t2") == baseline_similarity
++    assert collaborative_scores(
++        itemcf_with_test, itemcf_with_test, "t_held_out", ["w1", "w2"]
++    ) == baseline_scores
++
++
++def test_evaluate_large_is_train_only_and_reports_baselines(tmp_path):
++    db_path, _ = build_small(tmp_path)
++    result = evaluate_large(db_path, test_tasks=10, candidates=30, seeds=(42,))
++    itemcf = result["itemcf"]
++    assert itemcf["similarity_splits"] == ["train"]
++    assert itemcf["history_splits"] == ["train"]
++    assert itemcf["similarity_is_train_only"] is True
++    assert itemcf["history_is_train_only"] is True
++    assert itemcf["excluded_test_accepted_interactions"] > 0
++    assert (
++        itemcf["accepted_interactions_total"]
++        == itemcf["similarity_interactions"]
++        + itemcf["excluded_test_accepted_interactions"]
++    )
++    assert result["collaborative_nonzero_rate"] == 0.0
++    assert result["protocol"]["similarity_graph"] == (
++        "train-split accepted assignments only"
++    )
++    assert result["protocol"]["exposure_pool_size"] == 10
++    assert result["protocol"]["candidate_pool"] == "gold + 29 random workers"
++    assert set(result["baselines"]["feature_only"]) == {
++        "top1",
++        "top5",
++        "mrr",
++        "ndcg",
++    }
++    assert result["baselines"]["random"]["top1"] == round(1 / 30, 6)
++    assert result["baselines"]["random"]["top5"] == round(5 / 30, 6)
++    for name in ("top1", "top5", "mrr", "ndcg"):
++        assert result["metrics"][name] == result["baselines"]["feature_only"][name]
++
++
++def test_mutating_test_assignments_does_not_change_evaluation(tmp_path):
++    db_path, _ = build_small(tmp_path)
++    before = evaluate_large(db_path, test_tasks=10, candidates=30, seeds=(42,))
++
++    connection = sqlite3.connect(db_path)
++    try:
++        row = connection.execute(
++            "SELECT assignment_id FROM assignments "
++            "WHERE split='test' AND status='accepted' LIMIT 1"
++        ).fetchone()
++        assert row is not None
++        connection.execute(
++            "UPDATE assignments SET status='rejected', rating=NULL, "
++            "on_time=NULL, rework=NULL WHERE assignment_id=?",
++            (row[0],),
++        )
++        connection.commit()
++    finally:
++        connection.close()
++
++    after = evaluate_large(db_path, test_tasks=10, candidates=30, seeds=(42,))
++    assert after["metrics"] == before["metrics"]
++    assert after["collaborative_nonzero_rate"] == before["collaborative_nonzero_rate"]
++    for key in (
++        "similarity_interactions",
++        "history_interactions",
++        "similarity_splits",
++        "history_splits",
++        "similarity_is_train_only",
++        "history_is_train_only",
++    ):
++        assert after["itemcf"][key] == before["itemcf"][key]
++    assert (
++        after["itemcf"]["excluded_test_accepted_interactions"]
++        == before["itemcf"]["excluded_test_accepted_interactions"] - 1
++    )
++
++
++def test_jsonl_is_model_safe_and_hides_test_outcomes(tmp_path):
++    _, dataset = build_small(tmp_path)
++    jsonl_path = tmp_path / "bench.jsonl"
++    export_large_jsonl(dataset, jsonl_path)
++    records = [
++        json.loads(line)
++        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
++    ]
++    meta = records[0]
++    assert meta["type"] == "meta"
++    assert "stats" not in meta
++    assert not any(key.startswith("stat:") for key in meta["metadata"])
++    assert meta["outcome_policy"] == {
++        "test_split": "redacted",
++        "train_split": "full",
++    }
++
++    test_rows = [
++        row
++        for row in records
++        if row["type"] == "assignment" and row["split"] == "test"
++    ]
++    train_rows = [
++        row
++        for row in records
++        if row["type"] == "assignment" and row["split"] == "train"
++    ]
++    assert test_rows and train_rows
++    for row in test_rows:
++        assert row["status"] == "unknown"
++        assert row["on_time"] is None
++        assert row["rating"] is None
++        assert row["rework"] is None
++    for row in train_rows:
++        assert row["status"] in {"accepted", "rejected"}
++    assert not any("gold_worker_id" in row or "labels" in row for row in records)
++
++    raw_path = tmp_path / "raw.jsonl"
++    export_large_jsonl(dataset, raw_path, include_test_outcomes=True)
++    raw_records = [
++        json.loads(line)
++        for line in raw_path.read_text(encoding="utf-8").splitlines()
++    ]
++    raw_test_rows = [
++        row
++        for row in raw_records
++        if row["type"] == "assignment" and row["split"] == "test"
++    ]
++    assert {row["status"] for row in raw_test_rows} <= {"accepted", "rejected"}
++
++
++def test_feature_builder_fits_on_train_text_only():
++    dataset = generate_large_dataset(
++        n_workers=10, n_tasks=30, n_assignments=300, seed=3
++    )
++    train_ids = [
++        task["task_id"]
++        for task in dataset.tasks
++        if dataset.splits[task["task_id"]] == "train"
++    ]
++    test_task = next(
++        task
++        for task in dataset.tasks
++        if dataset.splits[task["task_id"]] == "test"
++    )
++    builder = LargeFeatureBuilder(
++        dataset.workers,
++        dataset.tasks,
++        dataset.customers,
++        train_task_ids=train_ids,
++    )
++    mutated_tasks = [dict(task) for task in dataset.tasks]
++    for task in mutated_tasks:
++        if task["task_id"] == test_task["task_id"]:
++            task["task_text"] = (
++                "这是一段包含独特词元 QWXZ 的测试任务文本。" + task["task_text"]
++            )
++    mutated_builder = LargeFeatureBuilder(
++        dataset.workers,
++        mutated_tasks,
++        dataset.customers,
++        train_task_ids=train_ids,
++    )
++    assert builder.transductive is False
++    assert builder.vectorizer.vocabulary_ == mutated_builder.vectorizer.vocabulary_
++    assert np.allclose(builder.vectorizer.idf_, mutated_builder.vectorizer.idf_)
+
+--- a/tests\test_large_synthetic.py
++++ b/tests\test_large_synthetic.py
+@@ -0,0 +1,249 @@
++"""Focused tests for the large natural-language synthetic generator."""
++
++from __future__ import annotations
++
++import sqlite3
++from collections import defaultdict
++
++from app.benchmark.large import build_large_sqlite, load_large_sqlite
++from app.data.large_synthetic import (
++    CATEGORY_CERTS,
++    CATEGORY_RESULTS,
++    generate_large_dataset,
++    is_near_duplicate,
++    normalized_text_hash,
++    simhash64,
++)
++from app.resume import CATEGORY_PROFILES
++
++
++def small_dataset(**overrides):
++    kwargs = dict(n_workers=40, n_tasks=120, n_assignments=1200, seed=7)
++    kwargs.update(overrides)
++    return generate_large_dataset(**kwargs)
++
++
++def test_generate_large_dataset_is_deterministic():
++    a = small_dataset()
++    b = small_dataset()
++    assert [w["worker_id"] for w in a.workers] == [w["worker_id"] for w in b.workers]
++    assert [t["task_id"] for t in a.tasks] == [t["task_id"] for t in b.tasks]
++    assert [t["title"] for t in a.tasks] == [t["title"] for t in b.tasks]
++    assert [t["task_text"] for t in a.tasks] == [t["task_text"] for t in b.tasks]
++    assert a.splits == b.splits
++    assert a.labels == b.labels
++
++    c = small_dataset(seed=8)
++    assert [t["task_text"] for t in a.tasks] != [t["task_text"] for t in c.tasks]
++
++
++def test_tasks_and_resumes_unique_and_no_near_duplicates():
++    dataset = small_dataset()
++    task_texts = [t["task_text"] for t in dataset.tasks]
++    resume_texts = [w["resume_text"] for w in dataset.workers]
++
++    assert len({normalized_text_hash(text) for text in task_texts}) == len(task_texts)
++    assert len({normalized_text_hash(text) for text in resume_texts}) == len(resume_texts)
++    assert len({t["title"] for t in dataset.tasks}) == len(dataset.tasks)
++
++    task_hashes = [simhash64(text) for text in task_texts]
++    for i in range(len(task_hashes)):
++        for j in range(i + 1, len(task_hashes)):
++            assert (task_hashes[i] ^ task_hashes[j]).bit_count() > 3
++
++    resume_hashes = [simhash64(text) for text in resume_texts]
++    for i in range(len(resume_hashes)):
++        for j in range(i + 1, len(resume_hashes)):
++            assert (resume_hashes[i] ^ resume_hashes[j]).bit_count() > 3
++
++
++def test_simhash_and_normalized_hash_semantics():
++    long_a = (
++        "连锁咖啡品牌会员小程序开发。客户计划在近期完成会员小程序开发，"
++        "现阶段最关心的是交付质量与周期可控。要求如下：有 3 年以上相关开发经验，"
++        "能独立完成模块设计与实现；需要熟悉后端开发、前端开发。"
++        "主要交付物包括需求确认清单、可运行系统。预算 8,000–30,000 元，期望 30 天内完成。"
++    )
++    long_b = long_a[:-1] + "X"
++    distinct = (
++        "新茶饮品牌 VI 与包装设计。客户准备进入新市场，希望建立统一的品牌视觉体系。"
++        "要求如下：有品牌设计经验；需要熟悉品牌策略、视觉设计。"
++        "主要交付物包括 Logo 与基础规范、包装设计稿。预算 5,000–20,000 元，期望 20 天内完成。"
++    )
++    assert normalized_text_hash(long_a) == normalized_text_hash(long_a)
++    assert normalized_text_hash("A b  c") == normalized_text_hash("a b c")
++    assert normalized_text_hash(long_a) != normalized_text_hash(long_b)
++
++    assert is_near_duplicate(long_a, long_a)
++    assert is_near_duplicate(long_a, long_b)  # one-character edit is near-duplicate
++    assert not is_near_duplicate(long_a, distinct)
++    assert (simhash64(long_a) ^ simhash64(distinct)).bit_count() > 3
++
++
++def test_split_is_disjoint_and_8020():
++    dataset = small_dataset()
++    splits = dataset.splits
++    assert set(splits.values()) <= {"train", "test"}
++    assert len(splits) == len(dataset.tasks)
++    train = sum(1 for value in splits.values() if value == "train")
++    test = sum(1 for value in splits.values() if value == "test")
++    assert train == 96
++    assert test == 24
++    assert train + test == len(dataset.tasks)
++
++    for assignment in dataset.assignments:
++        assert assignment["split"] == splits[assignment["task_id"]]
++    for task_id, label in dataset.labels.items():
++        assert label["split"] == splits[task_id]
++
++
++def test_no_label_leakage(tmp_path):
++    dataset = small_dataset()
++    db_path = tmp_path / "bench.sqlite"
++    build_large_sqlite(dataset, db_path)
++
++    loaded = load_large_sqlite(db_path)
++    assert loaded.labels == {}
++    assert not any(key.startswith("stat:") for key in loaded.metadata)
++    for task in loaded.tasks:
++        assert "gold_worker_id" not in task
++        assert "category" not in task
++    for worker in loaded.workers:
++        assert "reliability" not in worker
++    for assignment in loaded.assignments:
++        if assignment["split"] == "test":
++            assert assignment["status"] == "unknown"
++            assert assignment["on_time"] is None
++            assert assignment["rating"] is None
++            assert assignment["rework"] is None
++        else:
++            assert assignment["status"] in {"accepted", "rejected"}
++
++    raw = load_large_sqlite(db_path, include_test_outcomes=True)
++    test_statuses = {
++        row["status"] for row in raw.assignments if row["split"] == "test"
++    }
++    assert test_statuses <= {"accepted", "rejected"}
++    assert test_statuses
++
++    connection = sqlite3.connect(db_path)
++    try:
++        columns = {
++            row[1]
++            for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
++        }
++        assert "gold_worker_id" not in columns
++        assert "category" not in columns
++        label_columns = {
++            row[1]
++            for row in connection.execute("PRAGMA table_info(labels)").fetchall()
++        }
++        assert "gold_worker_id" in label_columns
++        test_outcomes = connection.execute(
++            "SELECT status, rating FROM assignments WHERE split='test' "
++            "AND status='accepted' AND rating IS NOT NULL LIMIT 1"
++        ).fetchone()
++        assert test_outcomes is not None
++    finally:
++        connection.close()
++
++
++def test_natural_language_fields_are_complete():
++    dataset = small_dataset()
++    for task in dataset.tasks:
++        assert task["task_text"].strip()
++        assert task["title"].strip()
++        assert "交付" in task["task_text"] or "预算" in task["task_text"]
++        assert "天" in task["task_text"]
++    for worker in dataset.workers:
++        text = worker["resume_text"]
++        assert text.strip()
++        assert worker["name"] in text
++        assert "技能" in text or "擅长" in text or "熟练" in text or "核心能力" in text
++        assert "项目" in text
++        assert "证书" in text or "认证" in text
++        assert "担任" in text or "工作经历" in text
++
++
++def _category_owners():
++    result_owners = defaultdict(set)
++    for category, items in CATEGORY_RESULTS.items():
++        for item in items:
++            result_owners[item].add(category)
++    for category, profile in CATEGORY_PROFILES.items():
++        for project in profile["projects"]:
++            result_owners[project[3]].add(category)
++
++    cert_owners = defaultdict(set)
++    for category, items in CATEGORY_CERTS.items():
++        for item in items:
++            cert_owners[item].add(category)
++    for category, profile in CATEGORY_PROFILES.items():
++        for cert in profile["certifications"]:
++            cert_owners[cert].add(category)
++    return result_owners, cert_owners
++
++
++def test_resume_results_and_certs_are_category_consistent():
++    dataset = small_dataset()
++    result_owners, cert_owners = _category_owners()
++    for worker in dataset.workers:
++        specialties = worker["specialties"]
++        top_category = (
++            max(specialties, key=lambda key: (specialties[key], key))
++            if specialties
++            else "consulting_research"
++        )
++        text = worker["resume_text"]
++        for phrase, owners in result_owners.items():
++            if phrase in text:
++                assert top_category in owners, (
++                    worker["worker_id"],
++                    top_category,
++                    phrase,
++                )
++        for phrase, owners in cert_owners.items():
++            if phrase in text:
++                assert top_category in owners, (
++                    worker["worker_id"],
++                    top_category,
++                    phrase,
++                )
++
++
++def test_duplicate_stats_are_computed_from_emitted_texts():
++    dataset = small_dataset()
++    stats = dataset.stats
++    assert stats["task_exact_duplicates"] == 0
++    assert stats["task_title_duplicates"] == 0
++    assert stats["task_near_dup_collisions"] == 0
++    assert stats["task_near_dup_rate"] == 0.0
++    assert stats["resume_exact_duplicates"] == 0
++    assert stats["resume_near_dup_collisions"] == 0
++    assert stats["resume_near_dup_rate"] == 0.0
++    assert stats["task_unique_titles"] == len(dataset.tasks)
++    assert stats["exposure_pool_size"] == 10
++    assert 0.0 <= stats["gold_acceptance_rate"] <= 1.0
++    assert stats["split_outcomes"]["train"]["assignments"] == 960
++    assert stats["split_outcomes"]["test"]["assignments"] == 240
++
++
++def test_llm_seeds_hook_is_optional_and_deterministic():
++    base = small_dataset()
++    seeded = small_dataset(
++        llm_seeds={
++            "tasks": [
++                {"title": "种子任务标题", "task_text": "这是一段由 LLM 提供的种子任务文本，描述一个完全不同的需求。"},
++            ]
++        }
++    )
++    assert seeded.tasks[0]["task_text"] == "这是一段由 LLM 提供的种子任务文本，描述一个完全不同的需求。"
++    assert base.tasks[0]["task_text"] != seeded.tasks[0]["task_text"]
++    again = small_dataset(
++        llm_seeds={
++            "tasks": [
++                {"title": "种子任务标题", "task_text": "这是一段由 LLM 提供的种子任务文本，描述一个完全不同的需求。"},
++            ]
++        }
++    )
++    assert seeded.tasks[0]["task_text"] == again.tasks[0]["task_text"]
+

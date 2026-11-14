@@ -1,0 +1,351 @@
+{
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "k": 10,
+  "baselines": {
+    "task_to_workers": {
+      "hr": 0.6736666666666666,
+      "ndcg": 0.35694149621368465,
+      "mrr": 0.2605318783068783,
+      "queries": 3000
+    },
+    "task_to_workers_exposed": {
+      "hr": 0.6923333333333334,
+      "ndcg": 0.36374658048699876,
+      "mrr": 0.2638869047619048,
+      "queries": 3000
+    },
+    "worker_to_tasks": {
+      "hr": 0.06366666666666666,
+      "ndcg": 0.025843996288271547,
+      "mrr": 0.014784656084656084,
+      "queries": 3000
+    },
+    "worker_to_tasks_exposed": {
+      "hr": 0.495,
+      "ndcg": 0.22725668257091855,
+      "mrr": 0.14757367724867726,
+      "queries": 3000
+    }
+  },
+  "candidate": {
+    "task_to_workers": {
+      "hr": 0.6796666666666666,
+      "ndcg": 0.3577026532102764,
+      "mrr": 0.25981997354497355,
+      "queries": 3000
+    },
+    "task_to_workers_exposed": {
+      "hr": 0.6983333333333334,
+      "ndcg": 0.3645077374835905,
+      "mrr": 0.263175,
+      "queries": 3000
+    },
+    "worker_to_tasks": {
+      "hr": 0.207,
+      "ndcg": 0.09912345341318411,
+      "mrr": 0.06685449735449735,
+      "queries": 3000
+    },
+    "worker_to_tasks_exposed": {
+      "hr": 0.5076666666666667,
+      "ndcg": 0.24171566884674892,
+      "mrr": 0.1623277777777778,
+      "queries": 3000
+    }
+  },
+  "deltas": {
+    "task_to_workers": {
+      "hr": {
+        "mean": 0.006,
+        "low": 0.0006666666666666666,
+        "high": 0.012333333333333333,
+        "p_value": 0.038
+      },
+      "ndcg": {
+        "mean": 0.0007611569965917301,
+        "low": -0.0021005379956567376,
+        "high": 0.0038307048852627727,
+        "p_value": 0.612
+      },
+      "mrr": {
+        "mean": -0.0007119047619047618,
+        "low": -0.003965119047619047,
+        "high": 0.0024999007936507937,
+        "p_value": 0.676
+      }
+    },
+    "task_to_workers_exposed": {
+      "hr": {
+        "mean": 0.006,
+        "low": 0.0006666666666666666,
+        "high": 0.012333333333333333,
+        "p_value": 0.038
+      },
+      "ndcg": {
+        "mean": 0.0007611569965917301,
+        "low": -0.0021005379956567376,
+        "high": 0.0038307048852627727,
+        "p_value": 0.612
+      },
+      "mrr": {
+        "mean": -0.0007119047619047618,
+        "low": -0.003965119047619047,
+        "high": 0.0024999007936507937,
+        "p_value": 0.676
+      }
+    },
+    "worker_to_tasks": {
+      "hr": {
+        "mean": 0.14333333333333334,
+        "low": 0.13065833333333332,
+        "high": 0.15634166666666666,
+        "p_value": 0.0
+      },
+      "ndcg": {
+        "mean": 0.07327945712491256,
+        "low": 0.06706947202849554,
+        "high": 0.0795811574098201,
+        "p_value": 0.0
+      },
+      "mrr": {
+        "mean": 0.052069841269841266,
+        "low": 0.04684536375661376,
+        "high": 0.057686818783068784,
+        "p_value": 0.0
+      }
+    },
+    "worker_to_tasks_exposed": {
+      "hr": {
+        "mean": 0.012666666666666666,
+        "low": 0.004,
+        "high": 0.020358333333333308,
+        "p_value": 0.008
+      },
+      "ndcg": {
+        "mean": 0.014458986275830366,
+        "low": 0.01055214324083665,
+        "high": 0.018229937770585753,
+        "p_value": 0.0
+      },
+      "mrr": {
+        "mean": 0.014754100529100528,
+        "low": 0.01069913029100529,
+        "high": 0.018708736772486773,
+        "p_value": 0.0
+      }
+    }
+  },
+  "cold_start": {
+    "available": false,
+    "reason": "no workers without train assignments in the evaluated seeds",
+    "queries": 0,
+    "measured": false,
+    "baseline": {
+      "task_to_workers": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      },
+      "task_to_workers_exposed": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      },
+      "worker_to_tasks": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      },
+      "worker_to_tasks_exposed": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      }
+    },
+    "candidate": {
+      "task_to_workers": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      },
+      "task_to_workers_exposed": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      },
+      "worker_to_tasks": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      },
+      "worker_to_tasks_exposed": {
+        "hr": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "queries": 0
+      }
+    },
+    "deltas": {
+      "task_to_workers": {
+        "hr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "ndcg": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "mrr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        }
+      },
+      "task_to_workers_exposed": {
+        "hr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "ndcg": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "mrr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        }
+      },
+      "worker_to_tasks": {
+        "hr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "ndcg": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "mrr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        }
+      },
+      "worker_to_tasks_exposed": {
+        "hr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "ndcg": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        },
+        "mrr": {
+          "mean": 0.0,
+          "low": 0.0,
+          "high": 0.0,
+          "p_value": 1.0
+        }
+      }
+    }
+  },
+  "calibration": {
+    "available": true,
+    "reason": null,
+    "label": "rating>=4",
+    "train_samples": 8235,
+    "test_samples": 2064,
+    "train_positive_rate": 0.9719489981785063,
+    "test_positive_rate": 0.9665697674418605,
+    "brier": 0.03230913435602816,
+    "raw_brier": 0.11858160496368526,
+    "a": 10.965197717541875,
+    "b": -3.5030661882022662,
+    "reliability_bins": [
+      {
+        "bin_low": 0.0,
+        "bin_high": 0.2,
+        "count": 0,
+        "mean_predicted": null,
+        "observed_rate": null
+      },
+      {
+        "bin_low": 0.2,
+        "bin_high": 0.4,
+        "count": 0,
+        "mean_predicted": null,
+        "observed_rate": null
+      },
+      {
+        "bin_low": 0.4,
+        "bin_high": 0.6,
+        "count": 0,
+        "mean_predicted": null,
+        "observed_rate": null
+      },
+      {
+        "bin_low": 0.6,
+        "bin_high": 0.8,
+        "count": 0,
+        "mean_predicted": null,
+        "observed_rate": null
+      },
+      {
+        "bin_low": 0.8,
+        "bin_high": 1.0,
+        "count": 2064,
+        "mean_predicted": 0.9777888815708626,
+        "observed_rate": 0.9665697674418605
+      }
+    ]
+  },
+  "baseline_equals_candidate": false,
+  "constraint_violations": 0,
+  "serving_features": {
+    "semantic_matcher": true,
+    "acceptance_model": true,
+    "parity": "serving"
+  },
+  "scoring_latency_p50_ms": 9.5975,
+  "scoring_latency_p95_ms": 20.3737,
+  "latency_p50_ms": 9.5975,
+  "latency_p95_ms": 20.3737,
+  "endpoint_latency": {
+    "available": false,
+    "reason": "the strict evaluator calls the in-process ranking service; HTTP endpoint latency is not measured",
+    "guardrail": "N/A"
+  },
+  "candidate_source": "choice-tuned"
+}

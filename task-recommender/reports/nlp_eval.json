@@ -1,0 +1,159 @@
+{
+  "metrics": {
+    "dataset": {
+      "records": 71,
+      "labeled": 69,
+      "slices": {
+        "ambiguous": {
+          "total": 2,
+          "labeled": 0,
+          "top1_accuracy": 0.0,
+          "clarification_rate": 1.0
+        },
+        "hard": {
+          "total": 24,
+          "labeled": 24,
+          "top1_accuracy": 0.75,
+          "clarification_rate": 0.4167
+        },
+        "paraphrase": {
+          "total": 36,
+          "labeled": 36,
+          "top1_accuracy": 1.0,
+          "clarification_rate": 0.0
+        },
+        "typo": {
+          "total": 9,
+          "labeled": 9,
+          "top1_accuracy": 1.0,
+          "clarification_rate": 0.0
+        }
+      }
+    },
+    "category": {
+      "top1": 0.913,
+      "top3": 0.9855,
+      "macro_f1": 0.9086,
+      "easy": {
+        "top1": 1.0,
+        "top3": 1.0,
+        "macro_f1": 1.0,
+        "n": 45
+      },
+      "hard": {
+        "top1": 0.75,
+        "top3": 0.9583,
+        "macro_f1": 0.7167,
+        "n": 24
+      },
+      "by_slice": {
+        "ambiguous": {
+          "top1": 0.0,
+          "top3": 0.0,
+          "macro_f1": 0.0,
+          "n": 0
+        },
+        "hard": {
+          "top1": 0.75,
+          "top3": 0.9583,
+          "macro_f1": 0.7167,
+          "n": 24
+        },
+        "paraphrase": {
+          "top1": 1.0,
+          "top3": 1.0,
+          "macro_f1": 1.0,
+          "n": 36
+        },
+        "typo": {
+          "top1": 1.0,
+          "top3": 1.0,
+          "macro_f1": 1.0,
+          "n": 9
+        }
+      }
+    },
+    "fields": {
+      "budget": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 35,
+        "fp": 0,
+        "fn": 0
+      },
+      "duration": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 35,
+        "fp": 0,
+        "fn": 0
+      },
+      "date": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 16,
+        "fp": 0,
+        "fn": 0
+      },
+      "remote": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 28,
+        "fp": 0,
+        "fn": 0
+      },
+      "count": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 5,
+        "fp": 0,
+        "fn": 0
+      },
+      "experience": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      "language": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "tp": 6,
+        "fp": 0,
+        "fn": 0
+      },
+      "skills": {
+        "precision": 0.6931,
+        "recall": 0.8434,
+        "f1": 0.7609,
+        "tp": 70,
+        "fp": 31,
+        "fn": 13
+      }
+    },
+    "calibration": {
+      "method": "prior",
+      "ece": 0.1334,
+      "brier": 0.1322,
+      "mean_confidence": 0.8794
+    },
+    "gating": {
+      "clarification_rate": 0.169,
+      "wrong_confident_rate": 0.058,
+      "wrong_confident": 4
+    }
+  },
+  "baseline": {
+    "top1": 0.913,
+    "hard_top1": 0.75,
+    "n": 69
+  }
+}

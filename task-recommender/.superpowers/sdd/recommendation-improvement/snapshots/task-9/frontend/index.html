@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TASKWEAVE · 任务链推荐引擎</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+          <rect x="2" y="2" width="60" height="60" rx="18" fill="url(#lg)" />
+          <path d="M16 33 L32 17 L48 33" stroke="#fff" stroke-width="3.4" fill="none" stroke-linecap="round" stroke-linejoin="round" opacity=".95"/>
+          <path d="M16 33 L32 49 L48 33" stroke="#fff" stroke-width="3.4" fill="none" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/>
+          <circle cx="16" cy="33" r="4.2" fill="#fff"/>
+          <circle cx="32" cy="17" r="4.2" fill="#fff"/>
+          <circle cx="48" cy="33" r="4.2" fill="#fff"/>
+          <circle cx="32" cy="49" r="4.2" fill="#fff"/>
+          <path d="M27 33 l3.6 3.6 7-7" stroke="#0b1020" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          <defs>
+            <linearGradient id="lg" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#5b8cff"/><stop offset="1" stop-color="#39d2c0"/>
+            </linearGradient>
+          </defs>
+        </svg>
+        <div>
+          <h1>TASKWEAVE</h1>
+          <p>任务链 · 可信推荐引擎</p>
+        </div>
+      </div>
+      <div class="top-meta">
+        <span id="health-dot" class="dot" title="服务状态"></span>
+        <span id="version-pill" class="pill">v0.3.0</span>
+        <button id="theme-toggle" class="icon-btn" title="切换主题">◐</button>
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="演示导航">
+      <button class="tab active" data-tab="overview">概览</button>
+      <button class="tab" data-tab="classify">需求分类</button>
+      <button class="tab" data-tab="task-to-worker">任务 → 人</button>
+      <button class="tab" data-tab="worker-to-task">人 → 任务</button>
+      <button class="tab" data-tab="talent">人才库</button>
+      <button class="tab" data-tab="feedback">反馈与权重</button>
+      <button class="tab" data-tab="chain">任务链</button>
+      <button class="tab" data-tab="acceptance">验收闭环</button>
+      <button class="tab" data-tab="benchmark">对答案学习</button>
+      <button class="tab" data-tab="demo">评委演示</button>
+    </nav>
+
+    <main>
+      <!-- 概览 -->
+      <section id="tab-overview" class="tab-panel active">
+        <div class="hero panel">
+          <div>
+            <span class="eyebrow">PHASE 3 · NO LLM</span>
+            <h2>人会变，权重也会。</h2>
+            <p class="muted">用画像冷启动、客户评分与反馈学习，把任务链分配给更合适的人；每一次推荐都可解释、可回滚。</p>
+            <div class="hero-actions">
+              <button class="btn primary" data-goto="task-to-worker">开始推荐</button>
+              <button class="btn ghost" data-goto="demo">打开评委演示</button>
+            </div>
+          </div>
+          <div class="hero-mark" aria-hidden="true">
+            <div class="orb orb-a"></div>
+            <div class="orb orb-b"></div>
+            <div class="orb orb-c"></div>
+            <div class="hero-ring"></div>
+          </div>
+        </div>
+
+        <div class="stat-grid">
+          <article class="stat panel"><span>Worker</span><strong id="stat-workers">—</strong><small>可推荐执行者</small></article>
+          <article class="stat panel"><span>Open Tasks</span><strong id="stat-tasks">—</strong><small>当前开放任务</small></article>
+          <article class="stat panel"><span>Weight Version</span><strong id="stat-weights">—</strong><small>当前全局权重</small></article>
+          <article class="stat panel"><span>API</span><strong id="stat-version">—</strong><small>服务版本</small></article>
+        </div>
+
+        <article class="panel chart-panel">
+          <div class="panel-head">
+            <h3>进步曲线</h3>
+            <span class="muted small">200 用户 cohort · 反馈越多，个人权重越接近真实偏好</span>
+          </div>
+          <div id="progress-chart" class="chart"></div>
+          <p class="muted small chart-note">权重恢复 cosine 上升代表「从不精准到精确」；NDCG 保持稳定代表推荐质量没有以牺牲准确率为代价。</p>
+        </article>
+
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><h3>当前七维权重</h3><span class="muted" id="overview-weight-meta">—</span></div>
+            <div id="overview-weights" class="bars"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>演示路线</h3></div>
+            <ol class="steps compact">
+              <li><b>任务 → 人</b><span>看七维分数与推荐理由</span></li>
+              <li><b>采纳并评分</b><span>客户评分写回信誉与个人权重</span></li>
+              <li><b>反馈与权重</b><span>看 diff、changelog、回滚</span></li>
+              <li><b>任务链</b><span>组合模板、计划、重规划、计划回滚</span></li>
+            </ol>
+          </article>
+        </div>
+      </section>
+
+      <!-- 需求分类 -->
+      <section id="tab-classify" class="tab-panel">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>粘贴一段任务需求</h3>
+            <span class="muted small">规则词典 + 字符 TF-IDF + 逻辑回归，无 LLM</span>
+          </div>
+          <textarea id="classify-text" rows="5" placeholder="例如：我们需要做一个会员小程序，包含积分、下单和后台管理，预算 8000–30000 元，30 天内交付，要求熟悉微信小程序和支付接口。"></textarea>
+          <div class="controls" style="margin:12px 0 0">
+            <button id="classify-run" class="btn primary">识别类别并抽取字段</button>
+            <button id="classify-sample" class="btn">填入示例</button>
+          </div>
+        </div>
+        <div id="classify-result" class="classify-result"></div>
+      </section>
+
+      <!-- 任务 → 人 -->
+      <section id="tab-task-to-worker" class="tab-panel">
+        <div class="panel controls">
+          <div class="field grow">
+            <label for="t2w-task">选择任务</label>
+            <select id="t2w-task"></select>
+          </div>
+          <div class="field narrow">
+            <label for="t2w-topn">Top N</label>
+            <input id="t2w-topn" type="number" min="1" max="20" value="5" />
+          </div>
+          <button id="t2w-run" class="btn primary">生成推荐</button>
+        </div>
+        <div id="t2w-task-preview" class="panel task-preview"></div>
+        <div class="two-col stretch">
+          <div id="t2w-results" class="results"></div>
+          <aside class="panel side">
+            <h3>推荐说明</h3>
+            <p class="muted small">分数由七维加权得到；硬约束不参与加权，违规候选会被直接过滤。</p>
+            <div class="legend">
+              <span><i class="swatch blue"></i>信誉</span><span><i class="swatch teal"></i>技能/专长</span>
+              <span><i class="swatch amber"></i>偏好</span><span><i class="swatch violet"></i>协同</span>
+            </div>
+            <div id="t2w-adopt" class="adopt-slot"></div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- 人 → 任务 -->
+      <section id="tab-worker-to-task" class="tab-panel">
+        <div class="panel controls">
+          <div class="field grow">
+            <label for="w2t-worker">选择 Worker</label>
+            <select id="w2t-worker"></select>
+          </div>
+          <div class="field narrow">
+            <label for="w2t-topn">Top N</label>
+            <input id="w2t-topn" type="number" min="1" max="20" value="5" />
+          </div>
+          <button id="w2t-run" class="btn primary">生成推荐</button>
+        </div>
+        <div class="two-col stretch">
+          <div id="w2t-results" class="results"></div>
+          <aside class="panel side">
+            <h3>人找任务</h3>
+            <p class="muted small">按 worker 的偏好、专长、负载与历史协作，推荐最适合接取的开放任务。</p>
+            <div id="w2t-adopt" class="adopt-slot"></div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- 人才库 / 简历视图 -->
+      <section id="tab-talent" class="tab-panel">
+        <div class="panel controls wrap">
+          <div class="field grow">
+            <label for="talent-select">候选人</label>
+            <select id="talent-select"></select>
+          </div>
+          <button id="talent-load" class="btn primary">查看简历</button>
+          <button id="talent-toggle" class="btn">查看平台原始数据</button>
+          <span class="muted small">表面是简历；技能分、负载与信誉明细默认隐藏</span>
+        </div>
+        <div id="talent-resume" class="resume-sheet"></div>
+      </section>
+
+      <!-- 反馈与权重 -->
+      <section id="tab-feedback" class="tab-panel">
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><h3>新用户画像</h3><span class="pill subtle">冷启动</span></div>
+            <div class="form-grid">
+              <div class="field"><label for="onboard-type">用户类型</label>
+                <select id="onboard-type"><option value="worker">Worker</option><option value="customer">Customer</option></select>
+              </div>
+              <div class="field"><label for="onboard-id">用户 ID</label><input id="onboard-id" value="w0001" /></div>
+              <div class="field"><label for="onboard-role">角色</label><input id="onboard-role" value="engineer" /></div>
+              <div class="field"><label for="onboard-industry">行业</label><input id="onboard-industry" value="software" /></div>
+              <div class="field"><label for="onboard-years">经验年限</label><input id="onboard-years" type="number" min="0" value="4" /></div>
+              <button id="onboard-run" class="btn primary">生成初始权重</button>
+            </div>
+            <div id="onboard-result" class="bars"></div>
+            <div class="inline-actions">
+              <button id="load-curve" class="btn ghost">查看学习曲线</button>
+              <span id="curve-meta" class="muted small"></span>
+            </div>
+            <div id="learning-curve" class="table-wrap"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head"><h3>全局权重版本</h3><span id="weights-version" class="pill">—</span></div>
+            <div id="weights-bars" class="bars"></div>
+            <div class="inline-actions">
+              <button id="recompute-weights" class="btn ghost">用反馈重估</button>
+              <button id="rollback-weights" class="btn danger-ghost">回滚到 v0000</button>
+            </div>
+            <div class="diff-controls">
+              <div class="field"><label for="diff-from">From</label><input id="diff-from" value="v0000" /></div>
+              <div class="field"><label for="diff-to">To</label><input id="diff-to" value="" /></div>
+              <button id="diff-run" class="btn ghost">查看差异</button>
+            </div>
+            <div id="diff-result" class="table-wrap"></div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <div class="panel-head"><h3>进步曲线</h3><span class="muted small">权重恢复 cosine + NDCG@10</span></div>
+          <div id="progress-chart-feedback" class="chart"></div>
+          <p class="muted small chart-note">数据来自 `reports/phase2_metrics.json` 的 200 用户学习曲线；不是单个用户的一次快照。</p>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head"><h3>学习事件日志</h3><span class="muted small">权重创建 / 回滚 / 重估</span></div>
+          <div id="changelog" class="table-wrap"></div>
+        </article>
+      </section>
+
+      <!-- 任务链 -->
+      <section id="tab-chain" class="tab-panel">
+        <div class="panel controls wrap">
+          <div class="field grow"><label for="chain-task">选择任务</label><select id="chain-task"></select></div>
+          <div class="field"><label for="chain-mode">拆解模式</label>
+            <select id="chain-mode"><option value="template">单模板</option><option value="compose">多模板组合</option></select>
+          </div>
+          <div class="field"><label for="chain-variant">变体</label>
+            <select id="chain-variant"><option value="standard">standard</option><option value="simple">simple</option><option value="complex">complex</option></select>
+          </div>
+          <button id="chain-decompose" class="btn primary">拆解任务</button>
+        </div>
+        <div class="panel hidden" id="chain-categories-panel">
+          <div class="panel-head"><h3>组合类别</h3><span class="muted small">最多 15 个节点，超出会返回 422</span></div>
+          <div id="chain-categories" class="chips"></div>
+        </div>
+
+        <div id="chain-summary" class="hidden">
+          <div class="stat-grid">
+            <article class="stat panel"><span>节点数</span><strong id="chain-nodes">—</strong><small>DAG nodes</small></article>
+            <article class="stat panel"><span>质量分</span><strong id="chain-quality">—</strong><small>coverage / granularity / feasibility</small></article>
+            <article class="stat panel"><span>关键路径</span><strong id="chain-critical">—</strong><small>critical path</small></article>
+            <article class="stat panel"><span>计划版本</span><strong id="chain-plan-version">—</strong><small>active plan</small></article>
+          </div>
+          <div class="two-col">
+            <article class="panel"><div class="panel-head"><h3>链节点</h3></div><div id="chain-node-table" class="table-wrap"></div></article>
+            <article class="panel"><div class="panel-head"><h3>链级计划</h3><span id="plan-meta" class="muted small">—</span></div><div id="plan-table" class="table-wrap"></div></article>
+          </div>
+        </div>
+
+        <div class="grid-3">
+          <article class="panel">
+            <div class="panel-head"><h3>规划与版本</h3></div>
+            <div class="inline-actions">
+              <button id="chain-plan" class="btn primary">生成计划</button>
+              <button id="chain-plans" class="btn ghost">刷新版本</button>
+            </div>
+            <div id="plan-versions" class="table-wrap"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>自动重规划</h3></div>
+            <div class="form-grid">
+              <div class="field"><label for="replan-failed">失败节点</label><select id="replan-failed"></select></div>
+              <div class="field"><label for="replan-delay">延期小时</label><input id="replan-delay" type="number" min="0" value="4" /></div>
+              <div class="field"><label for="replan-locked">锁定节点</label><select id="replan-locked" multiple></select></div>
+              <button id="replan-run" class="btn primary">重规划</button>
+            </div>
+            <div id="replan-result" class="muted small"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>节点状态</h3></div>
+            <div class="form-grid">
+              <div class="field"><label for="status-node">节点</label><select id="status-node"></select></div>
+              <div class="field"><label for="status-value">状态</label>
+                <select id="status-value"><option value="in_progress">in_progress</option><option value="completed">completed</option><option value="pending">pending</option></select>
+              </div>
+              <div class="field"><label for="status-worker">Worker</label><input id="status-worker" placeholder="w0001" /></div>
+              <button id="status-run" class="btn ghost">更新状态</button>
+            </div>
+            <p class="muted small">completed / in_progress 节点会在重规划时自动锁定。</p>
+          </article>
+        </div>
+      </section>
+
+      <!-- 验收闭环 -->
+      <section id="tab-acceptance" class="tab-panel">
+        <div class="panel controls wrap">
+          <button id="acceptance-load" class="btn primary">加载 B2B 调研验收演示</button>
+          <button id="acceptance-learn" class="btn">连续验收 5 次看学习</button>
+          <button id="acceptance-metrics" class="btn">刷新指标</button>
+          <span class="muted small">机器校验 → 同行/客户评分 → 决策 → 权重学习</span>
+        </div>
+        <div id="acceptance-task" class="panel task-preview hidden"></div>
+        <div class="two-col stretch">
+          <article class="panel">
+            <div class="panel-head"><h3>验收标准</h3><span id="acceptance-spec-meta" class="muted small">—</span></div>
+            <div id="acceptance-spec" class="table-wrap"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>平台指标</h3><span class="muted small">一次通过率 / 返工 / 争议</span></div>
+            <div id="acceptance-metrics-box" class="classify-fields"></div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><h3>提交与机器校验</h3><span id="acceptance-submission-meta" class="muted small">尚未提交</span></div>
+          <div class="controls wrap">
+            <button id="acceptance-submit-good" class="btn primary">提交合格交付物</button>
+            <button id="acceptance-submit-bad" class="btn">提交缺章节版本</button>
+            <button id="acceptance-review" class="btn">同行/客户评分</button>
+            <button id="acceptance-accept" class="btn primary">接受</button>
+            <button id="acceptance-rework" class="btn">返工</button>
+            <button id="acceptance-reject" class="btn ghost">驳回</button>
+          </div>
+          <div id="acceptance-machine" class="results"></div>
+        </article>
+        <div id="acceptance-final" class="classify-result"></div>
+        <div id="acceptance-learning" class="classify-result"></div>
+      </section>
+
+      <!-- 对答案学习 -->
+      <section id="tab-benchmark" class="tab-panel">
+        <div class="panel controls wrap">
+          <button id="benchmark-run" class="btn primary">跑 5 轮对答案学习</button>
+          <button id="benchmark-load" class="btn">加载已保存结果</button>
+          <span class="muted small">每轮：清空推荐缓存 → 推荐 → 对答案 → 只用训练集学习</span>
+        </div>
+        <div id="benchmark-stats" class="resume-stats"></div>
+        <article class="panel">
+          <div class="panel-head"><h3>命中率曲线</h3><span id="benchmark-meta" class="muted small">—</span></div>
+          <div id="benchmark-chart"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><h3>逐轮结果</h3><span class="muted small">标签只在评分和学习阶段读取</span></div>
+          <div id="benchmark-table" class="table-wrap"></div>
+        </article>
+      </section>
+
+      <!-- 评委演示 -->
+      <section id="tab-demo" class="tab-panel">
+        <div class="two-col">
+          <article class="panel">
+            <span class="eyebrow">JUDGE MODE</span>
+            <h2>一条可复现的学习链</h2>
+            <p class="muted">依次跑通：推荐 → 采纳 → 评分 → 权重更新 → 任务链拆解 → 计划 → 重规划 → 回滚。</p>
+            <div class="inline-actions">
+              <button id="demo-run" class="btn primary">运行完整演示</button>
+              <button id="demo-clear" class="btn ghost">清空日志</button>
+            </div>
+            <ol class="steps">
+              <li><b>01 推荐</b><span>固定任务，展示 Top-N 与解释</span></li>
+              <li><b>02 评分</b><span>提交客户评分，观察权重版本变化</span></li>
+              <li><b>03 证据</b><span>权重 diff + 学习日志</span></li>
+              <li><b>04 任务链</b><span>拆解、计划、重规划、计划回滚</span></li>
+              <li><b>05 回滚</b><span>退回 v0000，验证基线恢复</span></li>
+            </ol>
+          </article>
+          <article class="panel log-panel">
+            <div class="panel-head"><h3>演示控制台</h3><span class="dot live"></span></div>
+            <pre id="demo-log" class="console">等待运行…</pre>
+          </article>
+        </div>
+
+        <article class="panel rounds-panel">
+          <div class="panel-head">
+            <h3>20 轮对照实验：学习 vs 不学习</h3>
+            <span class="pill subtle">每轮 50 次选择 · 20 个候选人</span>
+          </div>
+          <div id="rounds-chart" class="chart"></div>
+          <div id="rounds-stats" class="rounds-stats"></div>
+          <p class="chart-note">学习组每轮用客户的选择结果做 pairwise 更新；对照组固定初始权重。曲线为 20 个客户的平均 Top-1/Top-5 准确率。</p>
+        </article>
+
+        <article class="panel growth-panel">
+          <div class="panel-head">
+            <h3>新用户成长：从画像到修正</h3>
+            <span class="pill subtle">同任务 / 同用户 / 只改初始偏好</span>
+          </div>
+          <p class="muted small">A/B 两种初始选择会得到不同权重与 Top-N；再用与初始选择相反的反馈，观察权重和推荐被修正。</p>
+          <div class="form-grid growth-form">
+            <div class="field"><label for="growth-worker">新用户 ID</label><input id="growth-worker" value="w0001" /></div>
+            <div class="field"><label for="growth-task">任务</label><select id="growth-task"></select></div>
+            <div class="field"><label for="growth-pref-a">真实偏好 / 选择 A</label>
+              <select id="growth-pref-a">
+                <option value="quality">结果质量优先</option>
+                <option value="specialty">专长匹配优先</option>
+                <option value="speed">交付速度优先</option>
+                <option value="flexibility">灵活低负载优先</option>
+              </select>
+            </div>
+            <div class="field"><label for="growth-pref-b">初始选择 B</label>
+              <select id="growth-pref-b">
+                <option value="speed">交付速度优先</option>
+                <option value="quality">结果质量优先</option>
+                <option value="specialty">专长匹配优先</option>
+                <option value="flexibility">灵活低负载优先</option>
+              </select>
+            </div>
+            <button id="growth-compare" class="btn primary">对比两种初始选择</button>
+            <button id="growth-learn" class="btn ghost">模拟反馈修正</button>
+          </div>
+          <div id="growth-output" class="growth-output">
+            <div class="empty">选择初始偏好后运行「对比」或「模拟反馈修正」</div>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>TASKWEAVE · Phase 3 demo</span>
+      <span class="muted">FastAPI + 静态 SPA · 无 LLM</span>
+    </footer>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

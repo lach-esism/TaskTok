@@ -1,0 +1,727 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-18 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\main.py
+CHANGED app\service.py
+CHANGED tests\test_api_events.py
+CHANGED tests\test_pairwise_learning.py
+
+## Diff
+
+--- a/app\main.py
++++ b/app\main.py
+@@ -1,43 +1,57 @@
+ """FastAPI application factory and routes."""
+ 
+ from __future__ import annotations
+ 
+ import json
++import os
+ import uuid
+ from dataclasses import asdict
+ from pathlib import Path
+ 
+ from fastapi import FastAPI, HTTPException, Query
+ from fastapi.responses import RedirectResponse
+ from fastapi.staticfiles import StaticFiles
+ 
+ from app.acceptance.service import AcceptanceService
+ from app.benchmark.db import BenchmarkRepository, build_benchmark_db
+ from app.benchmark.runner import BenchmarkRoundRunner
+ from app.chains.compose import compose_templates
+ from app.chains.decompose import decompose, quality_score
+ from app.chains.plan_store import ChainPlanStore
+ from app.chains.planner import plan_chain, propagate_breach, replan_chain
+ from app.config import APP_VERSION, DEFAULT_WEIGHTS
+ from app.data.store import Store
+ from app.data.synthetic import generate_dataset
+ from app.data.templates import load_templates
+-from app.domain import Task, TaskChain, Worker
++from app.domain import (
++    Impression,
++    RecommendationEvent,
++    Task,
++    TaskChain,
++    Worker,
++)
+ from app.evaluation_phase2 import evaluate_two_runs
+ from app.events import EventService
+ from app.feedback import FeedbackService
+ from app.features import candidate_features, pay_fit_score, skill_score
+ from app.learning.acceptance import AcceptanceModel, accept_features
++from app.learning.choice import (
++    NEGATIVE_ACTIONS,
++    POSITIVE_ACTIONS,
++    ListwiseChoiceLearner,
++    PairwiseChoiceLearner,
++    build_pairs,
++)
+ from app.learning.exploration import ExplorationPolicy
+ from app.learning.online import OnlineWeightLearner
+-from app.learning.weights import AHP_PRIOR
++from app.learning.weights import AHP_PRIOR, project_weights_with_report
+ from app.semantic import (
+     SemanticMatcher,
+     build_matcher,
+     build_task_text,
+     build_worker_text,
+ )
+ from app.nlp.classifier import get_default_classifier
+ from app.personalization.segments import Segmenter
+ from app.resume import build_resume
+ from app.personalization.user_weights import PersonalizationService
+@@ -174,20 +188,155 @@
+                 1 if event.action == "accept" else 0,
+             )
+         )
+     try:
+         model = AcceptanceModel().fit(samples)
+     except Exception:  # noqa: BLE001 - an unfitted model degrades to prior
+         return None
+     return model if model.is_fitted else None
+ 
+ 
++#: Choice-learning objective used by ``POST /weights/recompute``. The
++#: default pairwise learner is exact-event based; ``listwise`` fits one
++#: softmax step per logged impression instead.
++CHOICE_LEARNING_MODE = os.environ.get(
++    "CHOICE_LEARNING_MODE", "pairwise"
++).strip().lower()
++CHOICE_ACTIONS = POSITIVE_ACTIONS | NEGATIVE_ACTIONS
++
++
++def _find_impression(
++    impressions: list[Impression], request_id: str
++) -> Impression | None:
++    for impression in reversed(impressions):
++        if impression.request_id == request_id:
++            return impression
++    return None
++
++
++def _event_target(
++    event: RecommendationEvent,
++    impressions_by_request: dict[str, Impression],
++) -> tuple[str, str] | None:
++    """Map an event to the ``(task_id, worker_id)`` pair it refers to."""
++    if event.candidate_type == "task":
++        impression = impressions_by_request.get(event.request_id)
++        if impression is None:
++            return None
++        return event.candidate_id, impression.query_id
++    if not event.task_id:
++        return None
++    return event.task_id, event.candidate_id
++
++
++def _impression_candidate_target(
++    impression: Impression, candidate_id: str
++) -> tuple[str, str]:
++    """Map an impression candidate to ``(task_id, worker_id)``."""
++    if impression.metadata.get("candidate_type") == "task":
++        return candidate_id, impression.query_id
++    return impression.query_id, candidate_id
++
++
++def _features_with_cache(
++    service: RecommendationService,
++    cache: dict[tuple[str, str], dict[str, float]],
++    target: tuple[str, str],
++) -> dict[str, float]:
++    cached = cache.get(target)
++    if cached is None:
++        cached = service.features_for(*target)
++        cache[target] = cached
++    return cached
++
++
++def _events_with_features(
++    events: list[RecommendationEvent],
++    service: RecommendationService,
++) -> tuple[list[RecommendationEvent], dict[str, dict[str, float]]]:
++    """Resolve feature vectors for events that still map to store entities.
++
++    Events whose impression, task, or worker is unavailable are dropped so a
++    stale log row can never fail choice learning.
++    """
++    impressions_by_request = {
++        impression.request_id: impression
++        for impression in service.store.impressions
++    }
++    cache: dict[tuple[str, str], dict[str, float]] = {}
++    usable: list[RecommendationEvent] = []
++    features_by_event: dict[str, dict[str, float]] = {}
++    for event in events:
++        if event.action not in CHOICE_ACTIONS:
++            continue
++        target = _event_target(event, impressions_by_request)
++        if target is None:
++            continue
++        try:
++            features = _features_with_cache(service, cache, target)
++        except KeyError:
++            continue
++        features_by_event[event.event_id] = features
++        usable.append(event)
++    return usable, features_by_event
++
++
++def _listwise_choice_weights(
++    store: Store,
++    service: RecommendationService,
++    prior: dict[str, float],
++) -> tuple[dict[str, float], int]:
++    """Run one listwise softmax pass over each logged impression."""
++    events_by_request: dict[str, list[RecommendationEvent]] = {}
++    for event in store.events:
++        events_by_request.setdefault(event.request_id, []).append(event)
++
++    learner = ListwiseChoiceLearner(prior)
++    cache: dict[tuple[str, str], dict[str, float]] = {}
++    updates = 0
++    for impression in store.impressions:
++        request_events = events_by_request.get(impression.request_id, [])
++        positives = [
++            event
++            for event in request_events
++            if event.action in POSITIVE_ACTIONS
++            and event.candidate_id in impression.candidate_ids
++        ]
++        if not positives:
++            continue
++        chosen = min(positives, key=lambda event: event.rank)
++        candidate_features: list[dict[str, float]] = []
++        try:
++            for candidate_id in impression.candidate_ids:
++                candidate_features.append(
++                    _features_with_cache(
++                        service,
++                        cache,
++                        _impression_candidate_target(
++                            impression, candidate_id
++                        ),
++                    )
++                )
++        except KeyError:
++            continue
++        chosen_index = impression.candidate_ids.index(chosen.candidate_id)
++        propensity = max(float(chosen.propensity), 1e-12)
++        sample_weight = max(0.1, min(10.0, 1.0 / propensity))
++        learner.learn(
++            candidate_features,
++            chosen_index,
++            sample_weight=sample_weight,
++        )
++        updates += 1
++    return dict(learner.weights), updates
++
++
+ def _node_candidates(
+     chain: TaskChain,
+     node_id: str,
+     current: Store,
+     top_n: int,
+     exploration: ExplorationPolicy,
+     weights: dict[str, float] | None = None,
+     semantic_matcher: SemanticMatcher | None = None,
+     acceptance_model: AcceptanceModel | None = None,
+ ) -> RecommendResponse:
+@@ -275,20 +424,22 @@
+     app.state.acceptance_model = _build_acceptance_model(store)
+     app.state.chains = {}
+     app.state.drafts = {}
+     app.state.plan_store = ChainPlanStore()
+     resolved_weights_dir = weights_dir or (
+         Path(__file__).resolve().parent.parent / "data" / "weights"
+     )
+     app.state.weight_store = WeightStore(
+         resolved_weights_dir, prior=DEFAULT_WEIGHTS
+     )
++    app.state.choice_learning_mode = CHOICE_LEARNING_MODE
++    app.state.last_binding = None
+     app.state.personalizer = PersonalizationService(
+         store, Segmenter(), AHP_PRIOR
+     )
+     app.state.acceptance = AcceptanceService(
+         store, personalizer=app.state.personalizer
+     )
+     app.state.benchmark_db = Path(benchmark_db or BENCHMARK_DB_PATH)
+     if not TEMPLATE_PATH.exists():
+         raise RuntimeError(f"template file not found: {TEMPLATE_PATH}")
+     app.state.templates = load_templates(TEMPLATE_PATH)
+@@ -582,24 +733,33 @@
+                 request.recommendation_context,
+             )
+         except KeyError:
+             raise HTTPException(
+                 status_code=404, detail="task or worker not found"
+             )
+         except ValueError as error:
+             raise HTTPException(status_code=409, detail=str(error))
+         context = request.recommendation_context
+         if context is not None and context.request_id:
++            candidate_id = request.worker_id
++            impression = _find_impression(
++                current.impressions, context.request_id
++            )
++            if (
++                impression is not None
++                and impression.metadata.get("candidate_type") == "task"
++            ):
++                candidate_id = request.task_id
+             try:
+                 app.state.events.record_event(
+                     context.request_id,
+-                    request.worker_id,
++                    candidate_id,
+                     "accept",
+                     user_id=request.customer_id,
+                     role="customer",
+                     metadata={
+                         "weights_version": app.state.weight_store.active().version
+                     },
+                 )
+             except (KeyError, ValueError):
+                 # The assignment still succeeds when the recommendation
+                 # request is unknown, e.g. it predates this process, or the
+@@ -760,22 +920,26 @@
+         current = require_store()
+         if worker_id not in current.workers:
+             raise HTTPException(status_code=404, detail="worker not found")
+         return [
+             asdict(snapshot)
+             for snapshot in current.learning_snapshots
+             if snapshot.user_id == worker_id
+         ]
+ 
+     @app.post("/weights/recompute")
+-    def recompute_weights() -> dict:
+-        current = require_store()
++    def recompute_weights(
++        include_events: bool = Query(default=True),
++    ) -> dict:
++        current = require_store()
++        active = app.state.weight_store.active()
++        prior = dict(active.weights)
+         feedback_by_assignment = {
+             feedback.assignment_id: feedback
+             for feedback in current.feedback
+         }
+         records = []
+         for assignment in current.assignments:
+             feedback = feedback_by_assignment.get(assignment.assignment_id)
+             if feedback is None:
+                 continue
+             task = current.tasks.get(assignment.task_id)
+@@ -786,27 +950,82 @@
+             if task is None or worker is None or customer is None:
+                 continue
+             features = candidate_features(
+                 worker,
+                 task,
+                 customer,
+                 cf_score=0.0,
+                 now=current.reference_time,
+             )
+             records.append((features, feedback.overall_rating))
+-        active = app.state.weight_store.active()
+-        learner = OnlineWeightLearner(active.weights)
++
++        learner = OnlineWeightLearner(prior)
+         learner.batch_fit(records, epochs=1)
++        merged = dict(learner.weights)
++        updates = len(records)
++        choice_updates = 0
++        mode = getattr(
++            app.state, "choice_learning_mode", CHOICE_LEARNING_MODE
++        )
++        mode = "listwise" if mode == "listwise" else "pairwise"
++        if include_events:
++            service = RecommendationService(
++                current,
++                weights=prior,
++                semantic_matcher=app.state.semantic_matcher,
++                acceptance_model=app.state.acceptance_model,
++            )
++            if mode == "listwise":
++                choice_weights, choice_updates = _listwise_choice_weights(
++                    current, service, prior
++                )
++            else:
++                usable, features_by_event = _events_with_features(
++                    current.events, service
++                )
++                pairs = build_pairs(
++                    usable,
++                    lambda event: features_by_event[event.event_id],
++                )
++                choice_learner = PairwiseChoiceLearner(prior=prior)
++                choice_weights = choice_learner.fit(pairs)
++                choice_updates = len(pairs)
++            updates += choice_updates
++            if choice_updates:
++                merged = {
++                    key: 0.5 * merged.get(key, 0.0)
++                    + 0.5 * choice_weights.get(key, 0.0)
++                    for key in prior
++                }
++        final, report = project_weights_with_report(merged)
++        binding = asdict(report)
++        app.state.last_binding = binding
++        source = (
++            f"batch+{mode}"
++            if include_events and choice_updates
++            else "batch"
++        )
+         version = app.state.weight_store.create(
+-            learner.weights, len(records), "batch"
+-        )
+-        return asdict(version)
++            final, updates, source
++        )
++        payload = asdict(version)
++        payload["updates"] = updates
++        payload["binding"] = binding
++        payload["mode"] = mode
++        return payload
++
++    @app.get("/weights/binding")
++    def weight_binding() -> dict:
++        binding = app.state.last_binding
++        if binding is None:
++            return {"available": False}
++        return {"available": True, **binding}
+ 
+     @app.get("/metrics/compare")
+     def metrics_compare(
+         run_a: str | None = None,
+         run_b: str | None = None,
+     ) -> dict:
+         if run_a is not None or run_b is not None:
+             if not run_a or not run_b:
+                 raise HTTPException(
+                     status_code=422,
+@@ -863,47 +1082,112 @@
+         data = json.loads(path.read_text(encoding="utf-8"))
+         return data.get("learning_curve", {})
+ 
+     @app.get("/metrics/learning-rounds")
+     def metrics_learning_rounds() -> dict:
+         path = REPORTS_DIR / "learning_rounds.json"
+         if not path.exists():
+             return {"available": False}
+         return json.loads(path.read_text(encoding="utf-8"))
+ 
++    def _learn_pairs_from_events(
++        recorded: list[RecommendationEvent],
++    ) -> None:
++        """Apply one pairwise personalization update per completed choice."""
++        if not recorded:
++            return
++        current = require_store()
++        impressions_by_request = {
++            impression.request_id: impression
++            for impression in current.impressions
++        }
++        service = RecommendationService(
++            current,
++            weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
++        )
++        grouped: dict[str, list[RecommendationEvent]] = {}
++        for event in recorded:
++            grouped.setdefault(event.request_id, []).append(event)
++        for request_events in grouped.values():
++            positives = [
++                event
++                for event in request_events
++                if event.action == "accept"
++            ]
++            negatives = [
++                event
++                for event in request_events
++                if event.action == "reject"
++            ]
++            if not positives or not negatives:
++                continue
++            user_id = next(
++                (
++                    event.user_id
++                    for event in positives + negatives
++                    if event.user_id
++                ),
++                None,
++            )
++            if not user_id:
++                continue
++            chosen_target = _event_target(
++                positives[0], impressions_by_request
++            )
++            rejected_target = _event_target(
++                negatives[0], impressions_by_request
++            )
++            if chosen_target is None or rejected_target is None:
++                continue
++            try:
++                chosen = service.features_for(*chosen_target)
++                rejected = service.features_for(*rejected_target)
++                app.state.personalizer.update_pair(
++                    user_id, chosen, rejected
++                )
++            except KeyError:
++                # Choice personalization is best-effort: event ingestion
++                # must not fail when the user/entity no longer resolves.
++                continue
++
+     @app.post("/events", response_model=EventsResponse)
+     def record_events(request: EventsRequest) -> EventsResponse:
+         weights_version = app.state.weight_store.active().version
+         accepted = 0
++        recorded: list[RecommendationEvent] = []
+         for item in request.events:
+             metadata = dict(item.metadata)
+             if "candidate_type" in item.model_fields_set:
+                 metadata["candidate_type"] = item.candidate_type
+             if "task_id" in item.model_fields_set:
+                 metadata["task_id"] = item.task_id
+             metadata["weights_version"] = weights_version
+             try:
+-                app.state.events.record_event(
++                event = app.state.events.record_event(
+                     item.request_id,
+                     item.candidate_id,
+                     item.action,
+                     user_id=item.user_id,
+                     role=item.role,
+                     metadata=metadata,
+                 )
+             except KeyError as error:
+                 raise HTTPException(
+                     status_code=404, detail=f"unknown event target: {error}"
+                 )
+             except ValueError as error:
+                 raise HTTPException(status_code=409, detail=str(error))
++            recorded.append(event)
+             accepted += 1
++        _learn_pairs_from_events(recorded)
+         return EventsResponse(accepted=accepted)
+ 
+     @app.get("/events/metrics")
+     def event_metrics() -> dict:
+         return app.state.events.funnel_metrics()
+ 
+     @app.post("/recommend/workers", response_model=RecommendResponse)
+     def recommend_workers(request: RecommendWorkersRequest) -> RecommendResponse:
+         current = require_store()
+         service = RecommendationService(
+
+--- a/app\service.py
++++ b/app\service.py
+@@ -242,20 +242,56 @@
+                 accept_counts,
+             ),
+             recent_impressions=recent_impressions,
+             pay_fit=pay_fit,
+             communication=self._communication(worker),
+             collaboration=collaboration_counts.get(
+                 (customer.customer_id, worker.worker_id), 0
+             ),
+         )
+ 
++    def features_for(
++        self, task_id: str, worker_id: str
++    ) -> dict[str, float]:
++        """Build the seven fusion features for one (task, worker) pair.
++
++        Uses the same feature construction as recommendation: the service's
++        ItemCF score, stored preference profiles, and a neutral semantic
++        similarity. ``KeyError`` is raised for unknown task or worker IDs so
++        callers can skip events that no longer resolve to store entities.
++        """
++        task = self.store.tasks.get(task_id)
++        if task is None:
++            raise KeyError(task_id)
++        worker = self.store.workers.get(worker_id)
++        if worker is None:
++            raise KeyError(worker_id)
++        customer = self.store.customers.get(task.customer_id)
++        if customer is None:
++            customer = Customer(
++                customer_id=task.customer_id,
++                name="Unknown",
++                region=task.region,
++            )
++        return candidate_features(
++            worker,
++            task,
++            customer,
++            cf_score=self.itemcf.score(worker_id, task_id),
++            now=self.reference_time,
++            worker_profile=self.store.worker_preferences.get(worker_id),
++            customer_profile=self.store.customer_preferences.get(
++                task.customer_id
++            ),
++            semantic_similarity=0.5,
++        )
++
+     def recommend_workers(
+         self, task_id: str, top_n: int = 10, user_id: str | None = None
+     ) -> list[ScoredCandidate]:
+         task = self.store.tasks.get(task_id)
+         if task is None:
+             raise KeyError(task_id)
+         return self.recommend_workers_for_task(
+             task, top_n=top_n, user_id=user_id
+         )
+ 
+
+--- a/tests\test_api_events.py
++++ b/tests\test_api_events.py
+@@ -87,20 +87,106 @@
+     tasks = client.post(
+         "/recommend/tasks", json={"worker_id": "w_bad"}
+     ).json()
+     assert workers["candidates"] == []
+     assert tasks["candidates"] == []
+     assert workers["request_id"]
+     assert tasks["request_id"]
+     assert client.get("/events/metrics").json()["impressions"] == before
+ 
+ 
++def test_recompute_with_events_changes_weights(client):
++    before = client.get("/weights").json()["weights"]
++    response = client.post("/recommend/workers", json={"task_id": "t1", "top_n": 2})
++    body = response.json()
++    chosen = body["candidates"][0]["candidate_id"]
++    rejected = body["candidates"][1]["candidate_id"]
++    client.post("/events", json={"events": [
++        {"request_id": body["request_id"], "candidate_id": chosen, "action": "accept", "task_id": "t1", "user_id": "c1"},
++        {"request_id": body["request_id"], "candidate_id": rejected, "action": "reject", "task_id": "t1", "user_id": "c1"},
++    ]})
++    recomputed = client.post("/weights/recompute?include_events=true")
++    assert recomputed.status_code == 200
++    payload = recomputed.json()
++    assert payload["weights"]
++    assert payload.get("updates", 0) > 0
++    assert payload["weights"] != before
++    assert abs(sum(payload["weights"].values()) - 1.0) < 1e-9
++
++
++def test_assignment_from_task_recommendation_records_accept(client):
++    response = client.post(
++        "/recommend/tasks", json={"worker_id": "w_good", "top_n": 2}
++    )
++    body = response.json()
++    chosen_task = body["candidates"][0]["candidate_id"]
++    assignment = client.post(
++        "/assignments",
++        json={
++            "task_id": chosen_task,
++            "worker_id": "w_good",
++            "customer_id": "c1",
++            "recommendation_context": {"request_id": body["request_id"]},
++        },
++    )
++    assert assignment.status_code == 200
++    stored = client.app.state.store.events[-1]
++    assert stored.action == "accept"
++    assert stored.request_id == body["request_id"]
++    assert stored.candidate_id == chosen_task
++    assert stored.candidate_type == "task"
++    assert client.get("/events/metrics").json()["accepts"] == 1
++
++
++def test_recompute_with_listwise_mode_changes_weights(client):
++    client.app.state.choice_learning_mode = "listwise"
++    before = client.get("/weights").json()["weights"]
++    response = client.post(
++        "/recommend/workers", json={"task_id": "t1", "top_n": 2}
++    )
++    body = response.json()
++    chosen = body["candidates"][0]["candidate_id"]
++    rejected = body["candidates"][1]["candidate_id"]
++    client.post("/events", json={"events": [
++        {
++            "request_id": body["request_id"],
++            "candidate_id": chosen,
++            "action": "accept",
++            "task_id": "t1",
++            "user_id": "c1",
++        },
++        {
++            "request_id": body["request_id"],
++            "candidate_id": rejected,
++            "action": "reject",
++            "task_id": "t1",
++            "user_id": "c1",
++        },
++    ]})
++    recomputed = client.post("/weights/recompute?include_events=true")
++    assert recomputed.status_code == 200
++    payload = recomputed.json()
++    assert payload["updates"] > 0
++    assert payload["weights"] != before
++    assert abs(sum(payload["weights"].values()) - 1.0) < 1e-9
++
++
++def test_weight_binding_endpoint_reports_last_recompute(client):
++    assert client.get("/weights/binding").json() == {"available": False}
++    recomputed = client.post("/weights/recompute?include_events=false")
++    assert recomputed.status_code == 200
++    binding = client.get("/weights/binding").json()
++    assert binding["available"] is True
++    assert binding["min_hits"]
++    assert binding["iterations"] >= 1
++
++
+ def test_assignment_succeeds_after_duplicate_accept_event(client):
+     response = client.post(
+         "/recommend/workers", json={"task_id": "t1", "top_n": 3}
+     )
+     body = response.json()
+     candidate = body["candidates"][0]["candidate_id"]
+     accept = client.post(
+         "/events",
+         json={"events": [{
+             "request_id": body["request_id"],
+
+--- a/tests\test_pairwise_learning.py
++++ b/tests\test_pairwise_learning.py
+@@ -23,20 +23,35 @@
+ def test_propensity_clipping():
+     learner = PairwiseChoiceLearner(dict(DEFAULT_WEIGHTS))
+     pair = ChoicePair(chosen=_features(skill=1.0), rejected=_features(skill=0.0), weight=20.0)
+     weights = learner.fit([pair])
+     assert abs(sum(weights.values()) - 1.0) < 1e-9
+ 
+ 
+ from app.learning.choice import ListwiseChoiceLearner
+ 
+ 
++def test_service_features_for_builds_choice_vectors(client):
++    from app.service import RecommendationService
++
++    service = RecommendationService(
++        client.app.state.store, weights=DEFAULT_WEIGHTS
++    )
++    features = service.features_for("t1", "w_good")
++    assert set(features) == set(DEFAULT_WEIGHTS)
++    assert all(0.0 <= value <= 1.0 for value in features.values())
++    with pytest.raises(KeyError):
++        service.features_for("missing-task", "w_good")
++    with pytest.raises(KeyError):
++        service.features_for("t1", "missing-worker")
++
++
+ def test_listwise_learner_prefers_chosen_candidate():
+     prior = dict(DEFAULT_WEIGHTS)
+     learner = ListwiseChoiceLearner(prior, learning_rate=0.5)
+     candidates = [
+         _features(skill=1.0, reputation=1.0),
+         _features(skill=0.1, reputation=0.1),
+         _features(skill=0.2, reputation=0.2),
+     ]
+     weights = prior
+     for _ in range(20):
+

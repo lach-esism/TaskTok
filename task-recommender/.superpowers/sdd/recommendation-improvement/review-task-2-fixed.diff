@@ -1,0 +1,282 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-1 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+ADDED   app\events.py
+CHANGED tests\test_events.py
+
+## Diff
+
+--- a/app\events.py
++++ b/app\events.py
+@@ -0,0 +1,159 @@
++"""Impression and event capture with funnel metrics."""
++
++from __future__ import annotations
++
++import json
++import uuid
++from dataclasses import asdict
++from pathlib import Path
++
++from app.data.store import Store
++from app.domain import Impression, RecommendationEvent
++
++ACTIONS = {"click", "apply", "accept", "reject", "ignore"}
++
++
++class EventService:
++    """Records recommendation impressions/events and computes funnel rates."""
++
++    def __init__(
++        self,
++        store: Store,
++        persist_dir: Path | None = None,
++        max_events: int = 1_000_000,
++    ) -> None:
++        self.store = store
++        self.persist_dir = Path(persist_dir) if persist_dir else None
++        self.max_events = max_events
++        if self.persist_dir is not None:
++            self.persist_dir.mkdir(parents=True, exist_ok=True)
++
++    @staticmethod
++    def _line_count(path: Path) -> int:
++        if not path.exists():
++            return 0
++        with path.open("r", encoding="utf-8") as handle:
++            return sum(1 for _ in handle)
++
++    @staticmethod
++    def _rotate(path: Path) -> None:
++        index = 1
++        while True:
++            archived = path.with_name(f"{path.stem}.{index}.jsonl")
++            if not archived.exists():
++                path.replace(archived)
++                return
++            index += 1
++
++    def _persist(self, name: str, payload: dict) -> None:
++        if self.persist_dir is None:
++            return
++        path = self.persist_dir / f"{name}.jsonl"
++        if self.max_events > 0 and self._line_count(path) >= self.max_events:
++            self._rotate(path)
++        with path.open("a", encoding="utf-8") as handle:
++            handle.write(json.dumps(payload, ensure_ascii=False, default=str))
++            handle.write("\n")
++
++    def _impression_for(self, request_id: str) -> Impression:
++        for impression in reversed(self.store.impressions):
++            if impression.request_id == request_id:
++                return impression
++        raise KeyError(request_id)
++
++    def record_impression(
++        self,
++        request_id: str,
++        query_id: str,
++        candidate_ids: list[str],
++        propensities: dict[str, float],
++        policy: str,
++        metadata: dict | None = None,
++    ) -> Impression:
++        impression = Impression(
++            request_id=request_id,
++            query_id=query_id,
++            candidate_ids=list(candidate_ids),
++            propensities=dict(propensities),
++            policy=policy,
++            created_at=self.store.reference_time,
++            metadata=dict(metadata or {}),
++        )
++        self.store.impressions.append(impression)
++        self._persist("impressions", asdict(impression))
++        return impression
++
++    def record_event(
++        self,
++        request_id: str,
++        candidate_id: str,
++        action: str,
++        user_id: str | None = None,
++        role: str = "customer",
++        metadata: dict | None = None,
++    ) -> RecommendationEvent:
++        if action not in ACTIONS:
++            raise ValueError(f"unknown action: {action}")
++        impression = self._impression_for(request_id)
++        if candidate_id not in impression.candidate_ids:
++            raise KeyError(candidate_id)
++        if any(
++            event.request_id == request_id
++            and event.candidate_id == candidate_id
++            and event.action == action
++            for event in self.store.events
++        ):
++            raise ValueError(
++                "duplicate event for "
++                f"({request_id}, {candidate_id}, {action})"
++            )
++        context = dict(metadata or {})
++        event = RecommendationEvent(
++            event_id=uuid.uuid4().hex,
++            request_id=request_id,
++            user_id=user_id,
++            role=role,
++            task_id=impression.query_id,
++            candidate_id=candidate_id,
++            candidate_type=context.get("candidate_type", "worker"),
++            rank=impression.candidate_ids.index(candidate_id) + 1,
++            score=float(context.get("score", 0.0)),
++            propensity=impression.propensities[candidate_id],
++            weights_version=str(context.get("weights_version", "v0000")),
++            action=action,
++            created_at=self.store.reference_time,
++            metadata=context,
++        )
++        self.store.events.append(event)
++        self._persist("events", asdict(event))
++        return event
++
++    def funnel_metrics(self) -> dict:
++        impressions = len(self.store.impressions)
++        candidates = sum(
++            len(impression.candidate_ids)
++            for impression in self.store.impressions
++        )
++        counts = {action: 0 for action in ACTIONS}
++        for event in self.store.events:
++            if event.action in counts:
++                counts[event.action] += 1
++        clicks = counts["click"]
++        applies = counts["apply"]
++        accepts = counts["accept"]
++        rejects = counts["reject"]
++        ignores = counts["ignore"]
++        return {
++            "impressions": impressions,
++            "candidates": candidates,
++            "clicks": clicks,
++            "applies": applies,
++            "accepts": accepts,
++            "rejects": rejects,
++            "ignores": ignores,
++            "click_rate": clicks / max(1, candidates),
++            "apply_rate": applies / max(1, clicks),
++            "accept_rate": accepts / max(1, applies),
++            "reject_rate": rejects / max(1, candidates),
++            "ignore_rate": ignores / max(1, candidates),
++        }
+
+--- a/tests\test_events.py
++++ b/tests\test_events.py
+@@ -274,10 +274,107 @@
+ def test_dataset_split_time_normalizes_naive_train_timestamps():
+     assignment = Assignment(
+         assignment_id="a1", task_id="t1", worker_id="w1", customer_id="c1",
+         status="completed", created_at=datetime(2026, 1, 10),
+     )
+     dataset = Dataset(
+         workers=[], customers=[], tasks=[], assignments=[assignment],
+         feedback=[], train=[assignment], test=[],
+     )
+     assert dataset.split_time.tzinfo is not None
++
++
++import json
++
++import pytest
++from app.events import EventService
++
++
++def test_event_service_records_and_counts(tmp_path):
++    store = Store(workers=[_worker()], customers=[], tasks=[], assignments=[], feedback=[])
++    service = EventService(store, persist_dir=tmp_path)
++    service.record_impression(
++        "r1", "t1", ["w1", "w2"], {"w1": 0.9, "w2": 0.1}, "test",
++    )
++    service.record_event("r1", "w1", "click", user_id="c1")
++    service.record_event("r1", "w1", "accept", user_id="c1")
++    metrics = service.funnel_metrics()
++    assert metrics["impressions"] == 1
++    assert metrics["candidates"] == 2
++    assert metrics["clicks"] == 1
++    assert metrics["accepts"] == 1
++    assert metrics["click_rate"] == pytest.approx(0.5)
++    assert (tmp_path / "events.jsonl").exists()
++    assert (tmp_path / "impressions.jsonl").exists()
++
++
++def test_event_service_rejects_duplicates_and_unknowns(tmp_path):
++    store = Store(workers=[_worker()], customers=[], tasks=[], assignments=[], feedback=[])
++    service = EventService(store)
++    service.record_impression("r1", "t1", ["w1"], {"w1": 1.0}, "test")
++    service.record_event("r1", "w1", "click")
++    with pytest.raises(ValueError):
++        service.record_event("r1", "w1", "click")
++    with pytest.raises(KeyError):
++        service.record_event("r_missing", "w1", "click")
++    with pytest.raises(KeyError):
++        service.record_event("r1", "w_missing", "click")
++    with pytest.raises(ValueError):
++        service.record_event("r1", "w1", "invalid_action")
++
++
++def test_event_service_rotates_jsonl(tmp_path):
++    store = Store(workers=[_worker()], customers=[], tasks=[], assignments=[], feedback=[])
++    service = EventService(store, persist_dir=tmp_path, max_events=2)
++    for request_id in ("r1", "r2", "r3"):
++        service.record_impression(
++            request_id, "t1", ["w1"], {"w1": 1.0}, "test",
++        )
++    service.record_event("r1", "w1", "click")
++    service.record_event("r1", "w1", "apply")
++    service.record_event("r1", "w1", "accept")
++    assert (tmp_path / "events.1.jsonl").exists()
++    assert len(
++        (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
++    ) == 1
++    assert (tmp_path / "impressions.1.jsonl").exists()
++    assert len(
++        (tmp_path / "impressions.jsonl")
++        .read_text(encoding="utf-8")
++        .splitlines()
++    ) == 1
++
++
++def test_event_service_funnel_rates_and_jsonl_fields(tmp_path):
++    store = Store(workers=[_worker()], customers=[], tasks=[], assignments=[], feedback=[])
++    service = EventService(store, persist_dir=tmp_path)
++    service.record_impression(
++        "r1", "t1", ["w1", "w2", "w3"],
++        {"w1": 0.6, "w2": 0.2, "w3": 0.2}, "test",
++    )
++    service.record_event("r1", "w1", "click")
++    service.record_event("r1", "w1", "apply")
++    service.record_event("r1", "w1", "accept")
++    reject = service.record_event(
++        "r1", "w2", "reject", metadata={"weights_version": 7},
++    )
++    service.record_event("r1", "w3", "ignore")
++
++    metrics = service.funnel_metrics()
++    assert metrics["click_rate"] == pytest.approx(1 / 3)
++    assert metrics["apply_rate"] == pytest.approx(1.0)
++    assert metrics["accept_rate"] == pytest.approx(1.0)
++    assert metrics["reject_rate"] == pytest.approx(1 / 3)
++    assert metrics["ignore_rate"] == pytest.approx(1 / 3)
++    assert reject.weights_version == "7"
++
++    lines = [
++        json.loads(line)
++        for line in (tmp_path / "events.jsonl")
++        .read_text(encoding="utf-8")
++        .splitlines()
++    ]
++    reject_line = next(line for line in lines if line["action"] == "reject")
++    assert reject_line["candidate_id"] == "w2"
++    assert reject_line["rank"] == 2
++    assert reject_line["propensity"] == pytest.approx(0.2)
++    assert reject_line["weights_version"] == "7"
+

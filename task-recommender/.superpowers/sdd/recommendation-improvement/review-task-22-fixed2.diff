@@ -1,0 +1,3049 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-21 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\main.py
+CHANGED app\schemas.py
+CHANGED app\semantic.py
+ADDED   app\upload\__init__.py
+ADDED   app\upload\analyze.py
+ADDED   app\upload\extract.py
+CHANGED frontend\app.js
+CHANGED frontend\index.html
+CHANGED frontend\styles.css
+CHANGED requirements.txt
+ADDED   tests\test_upload.py
+ADDED   tests\test_upload_api.py
+
+## Diff
+
+--- a/app\main.py
++++ b/app\main.py
+@@ -1,23 +1,27 @@
+ """FastAPI application factory and routes."""
+ 
+ from __future__ import annotations
+ 
++import copy
+ import json
+ import os
+ import uuid
+ from dataclasses import asdict
+ from pathlib import Path
+ 
+-from fastapi import FastAPI, HTTPException, Query
++from fastapi import FastAPI, HTTPException, Query, Request
+ from fastapi.responses import RedirectResponse
+ from fastapi.staticfiles import StaticFiles
++from starlette.datastructures import UploadFile
++from starlette.exceptions import HTTPException as StarletteHTTPException
++from starlette.formparsers import MultiPartParser
+ 
+ from app.acceptance.service import AcceptanceService
+ from app.benchmark.db import BenchmarkRepository, build_benchmark_db
+ from app.benchmark.runner import BenchmarkRoundRunner
+ from app.chains.compose import compose_templates
+ from app.chains.decompose import decompose, quality_score
+ from app.chains.plan_store import ChainPlanStore
+ from app.chains.planner import plan_chain, propagate_breach, replan_chain
+ from app.config import APP_VERSION, DEFAULT_WEIGHTS
+ from app.data.store import Store
+@@ -75,23 +79,26 @@
+     NodeRecommendRequest,
+     NodeStatusRequest,
+     ReviewRequest,
+     SubmissionRequest,
+     OnboardingRequest,
+     PlanRollbackRequest,
+     RecommendResponse,
+     RecommendTasksRequest,
+     RecommendWorkersRequest,
+     ReplanRequest,
++    ResumeAnalyzeRequest,
+     RollbackRequest,
+ )
+ from app.service import RecommendationService
++from app.upload import analyze as upload_analyze
++from app.upload import extract as upload_extract
+ from app.versioning import WeightStore
+ 
+ TEMPLATE_PATH = (
+     Path(__file__).resolve().parent.parent
+     / "data"
+     / "chain_templates"
+     / "common_task_chains.json"
+ )
+ REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
+ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+@@ -389,29 +396,157 @@
+                 reasons=candidate.reasons,
+                 cold_start=candidate.cold_start,
+                 propensity=candidate.propensity,
+             )
+             for candidate in candidates
+         ],
+         reason=None if candidates else "no eligible candidates",
+     )
+ 
+ 
++def _candidate_payload(candidate) -> dict:
++    """Serialize a ``ScoredCandidate`` without mutating or logging anything."""
++    return {
++        "candidate_id": candidate.candidate_id,
++        "score": round(float(candidate.score), 4),
++        "breakdown": dict(candidate.breakdown),
++        "reasons": list(candidate.reasons),
++        "cold_start": bool(candidate.cold_start),
++        "propensity": float(candidate.propensity),
++    }
++
++
++def _ephemeral_store_with_worker(store: Store, worker: Worker) -> Store:
++    """Return a shallow store copy whose only difference is one temp worker.
++
++    ``RecommendationService.recommend_tasks`` looks the worker up by ID, but
++    uploads must never write into the real store. A shallow copy plus a new
++    ``workers`` mapping gives the service a valid lookup without touching the
++    live data.
++    """
++    clone = copy.copy(store)
++    clone.workers = dict(store.workers)
++    clone.workers[worker.worker_id] = worker
++    return clone
++
++
++async def _parse_upload_form(request: Request) -> tuple[UploadFile, int]:
++    """Parse the upload form with explicit file/field caps.
++
++    FastAPI's implicit parsing uses Starlette's broad defaults; parsing here
++    lets us cap ``max_files=1`` / ``max_fields=8`` while the ASGI middleware
++    has already rejected over-limit bodies before this point.
++    """
++    try:
++        form = await request.form(max_files=1, max_fields=8)
++    except StarletteHTTPException as error:
++        raise HTTPException(
++            status_code=422, detail=f"multipart 表单无效：{error.detail}"
++        ) from None
++
++    file = form.get("file")
++    if not isinstance(file, UploadFile):
++        await form.close()
++        raise HTTPException(
++            status_code=422, detail="缺少 multipart 文件字段 file"
++        )
++    raw_top_n = form.get("top_n", "5")
++    try:
++        top_n = int(raw_top_n)
++    except (TypeError, ValueError):
++        await form.close()
++        raise HTTPException(
++            status_code=422, detail="top_n 必须是整数"
++        ) from None
++    if not 1 <= top_n <= 50:
++        await form.close()
++        raise HTTPException(
++            status_code=422, detail="top_n 必须在 1 到 50 之间"
++        )
++    return file, top_n
++
++
++async def _read_upload(file: UploadFile) -> bytes:
++    """Read at most the upload limit, then reject anything larger."""
++    limit = upload_extract.MAX_UPLOAD_BYTES
++    declared_size = getattr(file, "size", None)
++    if declared_size is not None and declared_size > limit:
++        await file.close()
++        raise HTTPException(
++            status_code=422,
++            detail=(
++                "文件超过上传大小限制"
++                f"（{upload_extract.upload_limit_label(limit)}）"
++            ),
++        )
++    raw = await file.read(limit + 1)
++    await file.close()
++    if len(raw) > limit:
++        raise HTTPException(
++            status_code=422,
++            detail=(
++                "文件超过上传大小限制"
++                f"（{upload_extract.upload_limit_label(limit)}）"
++            ),
++        )
++    return raw
++
++
++def _text_preview(text: str, limit: int = 600) -> str:
++    return " ".join(text.split())[:limit]
++
++
++# The upload handlers take ``Request`` so they can call
++# ``request.form(max_files=1, max_fields=8)`` after the ASGI body cap. That
++# removes FastAPI's automatic File/Form parameters, so document the multipart
++# contract explicitly for OpenAPI clients.
++_UPLOAD_OPENAPI_EXTRA = {
++    "requestBody": {
++        "required": True,
++        "content": {
++            "multipart/form-data": {
++                "schema": {
++                    "type": "object",
++                    "required": ["file"],
++                    "properties": {
++                        "file": {
++                            "type": "string",
++                            "format": "binary",
++                            "description": ".txt, .md, .pdf, or .docx (≤10 MB)",
++                        },
++                        "top_n": {
++                            "type": "integer",
++                            "default": 5,
++                            "minimum": 1,
++                            "maximum": 50,
++                        },
++                    },
++                }
++            }
++        },
++    }
++}
++
++
+ def create_app(
+     store: Store | None = None,
+     weights_dir: Path | None = None,
+     benchmark_db: Path | None = None,
+     events_dir: Path | None = None,
+     exploration_seed: int | None = None,
+ ) -> FastAPI:
+     """Create the Phase 2 application."""
++    # Accepted uploads are capped at MAX_UPLOAD_BYTES before form parsing, so
++    # this spool threshold keeps the accepted file parts in RAM.
++    MultiPartParser.spool_max_size = upload_extract.MAX_UPLOAD_BYTES
+     app = FastAPI(title="Task Assignment Recommender", version=APP_VERSION)
++    app.add_middleware(upload_extract.UploadBodyLimitMiddleware)
+     test_assignments = []
+     if store is None:
+         dataset = generate_dataset()
+         store = Store(
+             workers=dataset.workers,
+             customers=dataset.customers,
+             tasks=dataset.tasks,
+             assignments=dataset.train,
+             feedback=dataset.train_feedback,
+             events=dataset.train_events,
+@@ -519,20 +654,172 @@
+             raise HTTPException(status_code=422, detail=str(error))
+         result["suggested_template"] = result["category"]
+         # Additive, evidence-bearing fields. ``confidence``, ``margin``,
+         # ``calibrated_confidence``, ``confidence_threshold``, ``evidence``
+         # and ``extracted_v2`` already come from the classifier; ``fields_v2``
+         # is a stable alias for Task 22's upload/resume analysis to consume.
+         result["fields_v2"] = result.get("extracted_v2", {})
+         return result
+ 
+     # ------------------------------------------------------------------
++    # Bidirectional upload / paste analysis (drafts only, no store writes)
++    # ------------------------------------------------------------------
++    def _upload_service(current: Store) -> RecommendationService:
++        return RecommendationService(
++            current,
++            weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
++        )
++
++    def _task_upload_payload(
++        current: Store,
++        text: str,
++        filename: str,
++        content_type: str | None,
++        size_bytes: int,
++        top_n: int,
++    ) -> dict:
++        if not text.strip():
++            raise HTTPException(status_code=422, detail="任务文本不能为空")
++        analysis = upload_analyze.analyze_task_text(text)
++        customer_id = next(iter(current.customers), "customer_upload")
++        draft_task = upload_analyze.task_from_analysis(
++            analysis, customer_id=customer_id, text=text
++        )
++        candidates = _upload_service(current).recommend_workers_for_task(
++            draft_task, top_n=top_n
++        )
++        return {
++            "kind": "task",
++            "filename": filename,
++            "content_type": content_type,
++            "size_bytes": size_bytes,
++            "text_preview": _text_preview(text),
++            "analysis": analysis,
++            "draft": upload_analyze.build_task_draft(analysis=analysis, task=draft_task),
++            "candidates": [
++                _candidate_payload(candidate) for candidate in candidates
++            ],
++            "request_id": uuid.uuid4().hex,
++            "persisted": False,
++        }
++
++    def _resume_payload(
++        current: Store,
++        text: str,
++        filename: str | None,
++        content_type: str | None,
++        size_bytes: int,
++        top_n: int,
++    ) -> dict:
++        if not text.strip():
++            raise HTTPException(status_code=422, detail="简历文本不能为空")
++        analysis = upload_analyze.analyze_resume_text(text)
++        draft_worker = analysis["draft_worker"]
++        worker = upload_analyze.worker_from_draft(draft_worker)
++        ephemeral = _ephemeral_store_with_worker(current, worker)
++        candidates = _upload_service(ephemeral).recommend_tasks(
++            worker.worker_id, top_n=top_n
++        )
++        return {
++            "kind": "resume",
++            "filename": filename,
++            "content_type": content_type,
++            "size_bytes": size_bytes,
++            "text_preview": _text_preview(text),
++            "analysis": analysis,
++            "draft": draft_worker,
++            "candidates": [
++                _candidate_payload(candidate) for candidate in candidates
++            ],
++            "request_id": uuid.uuid4().hex,
++            "persisted": False,
++        }
++
++    @app.post("/upload/task", openapi_extra=_UPLOAD_OPENAPI_EXTRA)
++    async def upload_task(request: Request) -> dict:
++        """Analyze an uploaded task document and return Top-N workers.
++
++        The body cap is enforced by ``UploadBodyLimitMiddleware`` before form
++        parsing. The file is parsed in memory and never persisted; the returned
++        task is a draft. The store is not written to.
++        """
++        current = require_store()
++        file, top_n = await _parse_upload_form(request)
++        raw = await _read_upload(file)
++        filename = upload_extract.sanitize_filename(
++            file.filename or "document.txt"
++        )
++        try:
++            text = upload_extract.extract_text(
++                filename, raw, content_type=file.content_type
++            )
++            return _task_upload_payload(
++                current,
++                text,
++                filename,
++                file.content_type,
++                len(raw),
++                top_n,
++            )
++        except upload_extract.UploadError as error:
++            raise HTTPException(status_code=422, detail=str(error))
++
++    @app.post("/upload/resume", openapi_extra=_UPLOAD_OPENAPI_EXTRA)
++    async def upload_resume(request: Request) -> dict:
++        """Analyze an uploaded resume and return Top-N open tasks.
++
++        A temporary ``Worker`` profile is placed in an ephemeral store copy so
++        ``RecommendationService.recommend_tasks`` can score it. The real store
++        is never mutated and the returned worker is a draft.
++        """
++        current = require_store()
++        file, top_n = await _parse_upload_form(request)
++        raw = await _read_upload(file)
++        filename = upload_extract.sanitize_filename(
++            file.filename or "document.txt"
++        )
++        try:
++            text = upload_extract.extract_text(
++                filename, raw, content_type=file.content_type
++            )
++            return _resume_payload(
++                current,
++                text,
++                filename,
++                file.content_type,
++                len(raw),
++                top_n,
++            )
++        except upload_extract.UploadError as error:
++            raise HTTPException(status_code=422, detail=str(error))
++
++    @app.post("/resume/analyze")
++    def analyze_resume_text(request: ResumeAnalyzeRequest) -> dict:
++        """Paste-text resume path: same analyzer, no file and no persistence."""
++        current = require_store()
++        if not request.text.strip():
++            raise HTTPException(status_code=422, detail="简历文本不能为空")
++        try:
++            return _resume_payload(
++                current,
++                request.text,
++                None,
++                None,
++                len(request.text.encode("utf-8")),
++                request.top_n,
++            )
++        except upload_extract.UploadError as error:
++            raise HTTPException(status_code=422, detail=str(error))
++
++    # ------------------------------------------------------------------
+     # Acceptance workflow
+     # ------------------------------------------------------------------
+     def _acceptance() -> AcceptanceService:
+         return app.state.acceptance
+ 
+     @app.get("/acceptance/demo")
+     def acceptance_demo() -> dict:
+         try:
+             payload = _acceptance().demo_payload()
+         except ValueError as error:
+
+--- a/app\schemas.py
++++ b/app\schemas.py
+@@ -54,20 +54,27 @@
+ 
+ 
+ class EventsResponse(BaseModel):
+     accepted: int
+     rejected: list[dict] = Field(default_factory=list)
+ 
+ 
+ class ClassifyRequest(BaseModel):
+     text: str = Field(min_length=4, max_length=5000)
+     top_k: int = Field(default=3, ge=1, le=6)
++
++
++class ResumeAnalyzeRequest(BaseModel):
++    """Paste-text resume path for ``POST /resume/analyze`` (no file upload)."""
++
++    text: str = Field(min_length=4, max_length=50000)
++    top_n: int = Field(default=5, ge=1, le=50)
+ 
+ 
+ class SubmissionRequest(BaseModel):
+     worker_id: str
+     artifacts: dict
+     submitted_at: datetime | None = None
+ 
+ 
+ class ReviewRequest(BaseModel):
+     reviewer_id: str = "customer"
+
+--- a/app\semantic.py
++++ b/app\semantic.py
+@@ -76,20 +76,27 @@
+         return NEUTRAL_SIMILARITY
+     return max(0.0, min(1.0, value))
+ 
+ 
+ def _clean(text: str | None) -> str:
+     return "" if text is None else str(text)
+ 
+ 
+ class SemanticMatcher:
+     """Compute a bounded semantic similarity between task and worker texts."""
++
++    #: Upload drafts introduce unseen text pairs on every request, so the pair
++    #: cache must be bounded rather than growing for the process lifetime.
++    MAX_CACHE_ENTRIES = 2_048
++    #: The text→vector cache has the same problem: on-demand transforms for
++    #: unseen upload texts would otherwise accumulate for the process lifetime.
++    MAX_VECTOR_ENTRIES = 4_096
+ 
+     def __init__(
+         self,
+         provider: str = DEFAULT_PROVIDER,
+         model: str | None = None,
+         cache_dir: Path | None = None,
+         random_state: int = 42,
+     ) -> None:
+         provider = (provider or DEFAULT_PROVIDER).strip().lower()
+         if provider not in PROVIDERS:
+@@ -172,20 +179,23 @@
+         if self._provider == DISABLED_PROVIDER:
+             return NEUTRAL_SIMILARITY
+         if not task_text.strip() or not worker_text.strip():
+             return NEUTRAL_SIMILARITY
+ 
+         key = (task_text, worker_text)
+         cached = self._cache.get(key)
+         if cached is not None:
+             return cached
+         value = self._compute_similarity(task_text, worker_text)
++        if len(self._cache) >= self.MAX_CACHE_ENTRIES:
++            # dict preserves insertion order; evict the oldest entry.
++            self._cache.pop(next(iter(self._cache)))
+         self._cache[key] = value
+         return value
+ 
+     def similarity_batch(
+         self, task_text: str, worker_texts: list[str]
+     ) -> list[float]:
+         """Score one task text against several worker texts."""
+         return [
+             self.similarity(task_text, worker_text)
+             for worker_text in worker_texts
+@@ -322,37 +332,44 @@
+             show_progress_bar=False,
+         )
+         vectors = np.asarray(vectors, dtype=float)
+         if vectors.ndim == 1:
+             vectors = vectors.reshape(1, -1)
+         vectors = normalize(vectors)
+         return {
+             text: vectors[index] for index, text in enumerate(unique)
+         }
+ 
++    def _remember_vectors(self, vectors: dict[str, np.ndarray]) -> None:
++        """Insert vectors with an oldest-entry eviction bound."""
++        for text, vector in vectors.items():
++            if len(self._vectors) >= self.MAX_VECTOR_ENTRIES:
++                self._vectors.pop(next(iter(self._vectors)))
++            self._vectors[text] = vector
++
+     def _embedding_for(self, text: str) -> np.ndarray | None:
+         vector = self._vectors.get(text)
+         if vector is not None:
+             return vector
+-        self._vectors.update(self._encode_texts([text]))
++        self._remember_vectors(self._encode_texts([text]))
+         return self._vectors.get(text)
+ 
+     def _vector_for(self, text: str) -> np.ndarray | None:
+         vector = self._vectors.get(text)
+         if vector is not None:
+             return vector
+         if self._vectorizer is None or self._svd is None:
+             return None
+         transformed = self._transform_texts([text])
+         vector = transformed.get(text)
+         if vector is not None:
+-            self._vectors[text] = vector
++            self._remember_vectors({text: vector})
+         return vector
+ 
+ 
+ def build_matcher(provider: str | None = None) -> SemanticMatcher:
+     """Build a matcher, using ``app.config`` defaults when not overridden."""
+     configured_provider = getattr(app_config, "SEMANTIC_PROVIDER", None)
+     configured_model = getattr(app_config, "SEMANTIC_MODEL", None)
+     configured_cache_dir = getattr(
+         app_config, "SEMANTIC_CACHE_DIR", None
+     )
+
+--- a/app\upload\__init__.py
++++ b/app\upload\__init__.py
+@@ -0,0 +1,41 @@
++"""Bidirectional upload/analysis support (Task 22).
++
++* :mod:`app.upload.extract` — secure, in-memory document text extraction.
++* :mod:`app.upload.analyze` — task/resume analysis and draft builders.
++
++Nothing in this package writes uploaded content to the store or to disk.
++"""
++
++from app.upload.analyze import (
++    analyze_resume_text,
++    analyze_task_text,
++    build_task_draft,
++    task_from_analysis,
++    worker_from_draft,
++)
++from app.upload.extract import (
++    MAX_UPLOAD_BYTES,
++    MAX_UPLOAD_MB,
++    SUPPORTED_EXTENSIONS,
++    UploadBodyLimitMiddleware,
++    UploadError,
++    extract_text,
++    sanitize_filename,
++    upload_limit_label,
++)
++
++__all__ = [
++    "MAX_UPLOAD_BYTES",
++    "MAX_UPLOAD_MB",
++    "SUPPORTED_EXTENSIONS",
++    "UploadBodyLimitMiddleware",
++    "UploadError",
++    "analyze_resume_text",
++    "analyze_task_text",
++    "build_task_draft",
++    "extract_text",
++    "sanitize_filename",
++    "task_from_analysis",
++    "upload_limit_label",
++    "worker_from_draft",
++]
+
+--- a/app\upload\analyze.py
++++ b/app\upload\analyze.py
+@@ -0,0 +1,657 @@
++"""Deterministic analysis of uploaded task postings and resumes (no LLM).
++
++Two entry points mirror the two upload directions:
++
++* :func:`analyze_task_text` uses the Task 23 classifier plus evidence-bearing
++  field extraction and returns a category, calibrated confidence, the top-3
++  categories, and the fields the recommender needs.
++* :func:`analyze_resume_text` uses the resume section parser, the skill
++  lexicon/aliases, and small rule-based extractors for experience, region,
++  remote preference and expected pay. It returns a draft ``Worker`` profile.
++
++Neither function writes to the store. The API layer builds a temporary
++``Task`` / ``Worker`` object from these results and only returns drafts.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import re
++from dataclasses import asdict, fields as dataclass_fields
++from datetime import datetime, timedelta, timezone
++
++from app.domain import Task, Worker
++from app.nlp.classifier import extract_fields, get_default_classifier
++from app.nlp.extract import extract_fields_v2
++from app.nlp.lexicon import CATEGORY_LABELS, SKILL_KEYWORDS, normalize_skill
++from app.nlp.normalize import normalize_text
++from app.nlp.sections import parse_resume_sections
++from app.resume import CATEGORY_SKILLS, CITIES, REGION_LABELS
++
++_MAX_SKILLS = 40
++_MAX_SKILL_TOKEN_LENGTH = 30
++
++_SKILL_HEADER_WORDS = {
++    "技能",
++    "专业技能",
++    "技能特长",
++    "核心技能",
++    "技术栈",
++    "擅长",
++}
++_SECTION_BOUNDARY_WORDS = {
++    "教育经历",
++    "教育背景",
++    "教育",
++    "学历",
++    "学习经历",
++    "工作经历",
++    "工作经验",
++    "职业经历",
++    "工作",
++    "任职经历",
++    "项目经历",
++    "项目经验",
++    "项目",
++    "证书",
++    "认证",
++    "资格证书",
++    "证书与认证",
++    "语言",
++    "语言能力",
++    "外语",
++    "自我评价",
++    "个人简介",
++    "个人信息",
++    "联系方式",
++    "求职意向",
++    "期望薪资",
++    "兴趣爱好",
++}
++
++_TOKEN_SPLIT_RE = re.compile(r"[|;；·、,，/／\s()（）\[\]【】{}<>:：]+")
++# Raw skill tokens are only kept when they are ASCII tool/language names
++# (python, figma, ...). Chinese free text is already covered by the lexicon
++# scan, and keeping arbitrary Chinese tokens would turn city/location lines
++# into fake skills.
++_RAW_SKILL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+#.]{1,29}$")
++_GENERIC_SKILL_WORDS = {
++    "熟练",
++    "熟悉",
++    "掌握",
++    "精通",
++    "了解",
++    "使用",
++    "具备",
++    "能力",
++    "经验",
++    "相关",
++    "以上",
++    "负责",
++    "参与",
++    "技能",
++    "专业",
++    "良好",
++    "较强",
++}
++
++# Raw tool/language tokens are mapped to a category for the inferred-category
++# display. Unknown raw tokens still become worker skills; they simply do not
++# vote on a category.
++_RAW_SKILL_CATEGORY = {
++    "python": "software_dev",
++    "java": "software_dev",
++    "golang": "software_dev",
++    "go": "software_dev",
++    "javascript": "software_dev",
++    "typescript": "software_dev",
++    "sql": "software_dev",
++    "mysql": "software_dev",
++    "postgresql": "software_dev",
++    "redis": "software_dev",
++    "react": "software_dev",
++    "vue": "software_dev",
++    "node": "software_dev",
++    "docker": "software_dev",
++    "kubernetes": "software_dev",
++    "aws": "software_dev",
++    "linux": "software_dev",
++    "figma": "ui_ux_design",
++    "sketch": "ui_ux_design",
++    "axure": "ui_ux_design",
++    "photoshop": "brand_design",
++    "illustrator": "brand_design",
++    "premiere": "video_production",
++    "aftereffects": "video_production",
++    "excel": "consulting_research",
++    "tableau": "consulting_research",
++    "ppt": "consulting_research",
++}
++
++_REMOTE_CUES = ("远程", "线上", "居家", "异地", "可远程")
++_ONSITE_CUES = ("现场", "线下", "驻场", "到岗", "坐班", "坐班制")
++
++_REGION_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
++    (
++        "US",
++        ("美国", *CITIES.get("US", [])),
++    ),
++    (
++        "EU",
++        ("欧洲", *CITIES.get("EU", [])),
++    ),
++    (
++        "CN",
++        ("中国", "中国大陆", "国内", *CITIES.get("CN", [])),
++    ),
++)
++
++_EXPECTED_PAY_RE = re.compile(
++    r"(?P<label>期望(?:薪资|薪酬|报酬|日薪|时薪|月薪)?|"
++    r"薪资要求|报价|日薪|时薪|月薪)\s*[:：]?\s*"
++    r"(?P<amount>\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万|千|k|w)?\s*元?"
++    r"(?:\s*(?:/|每)\s*(?P<period>天|日|月|小时|时))?",
++    re.IGNORECASE,
++)
++_PAY_UNIT_SCALE = {"万": 10000.0, "w": 10000.0, "千": 1000.0, "k": 1000.0}
++
++
++def _utcnow(value: datetime | None = None) -> datetime:
++    current = value or datetime.now(timezone.utc)
++    if current.tzinfo is None:
++        current = current.replace(tzinfo=timezone.utc)
++    return current
++
++
++def _as_float(value) -> float | None:
++    if value is None:
++        return None
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return None
++
++
++# ---------------------------------------------------------------------------
++# Task analysis
++# ---------------------------------------------------------------------------
++
++
++def analyze_task_text(
++    text: str, now: datetime | None = None
++) -> dict:
++    """Classify a posting and return its structured fields (no store write).
++
++    Raises :class:`ValueError` for blank input so the API can return 422.
++    """
++    normalized = normalize_text(text)
++    if not normalized:
++        raise ValueError("任务文本不能为空")
++
++    # Pass the original text so line-based requirement sentences survive;
++    # the classifier normalizes internally for matching.
++    prediction = get_default_classifier().predict(text, top_k=3, now=now)
++    extracted = prediction.get("extracted") or extract_fields(normalized)
++    fields_v2 = prediction.get("extracted_v2") or extract_fields_v2(
++        normalized, now=now
++    )
++
++    budget = fields_v2.get("budget", {}).get("value")
++    budget_min = budget_max = None
++    if budget:
++        budget_min, budget_max = min(budget), max(budget)
++
++    skills = fields_v2.get("skills", {}).get("value") or extracted.get(
++        "skills", []
++    )
++    remote_ok = fields_v2.get("remote", {}).get("value")
++    if remote_ok is None:
++        remote_ok = extracted.get("remote_ok")
++    duration_days = fields_v2.get("duration", {}).get("value")
++    deadline = fields_v2.get("date", {}).get("value")
++
++    requirements = extracted.get("requirements") or []
++    region = _infer_region(normalized)
++    fields = {
++        "budget": budget,
++        "budget_min": budget_min,
++        "budget_max": budget_max,
++        "duration_days": duration_days,
++        "deadline": deadline,
++        "skills": list(skills),
++        "remote_ok": remote_ok,
++        "requirements": list(requirements),
++        "suggested_title": extracted.get("suggested_title", ""),
++        "experience_years": fields_v2.get("experience", {}).get("value"),
++        "language": fields_v2.get("language", {}).get("value", []),
++        "region": region,
++        "region_label": REGION_LABELS.get(region, "中国大陆"),
++    }
++
++    return {
++        "category": prediction["category"],
++        "label": prediction.get(
++            "label", CATEGORY_LABELS.get(prediction["category"], "")
++        ),
++        "confidence": prediction.get(
++            "calibrated_confidence", prediction.get("confidence", 0.0)
++        ),
++        "confidence_raw": prediction.get("confidence", 0.0),
++        "needs_clarification": bool(prediction.get("needs_clarification")),
++        "top_categories": list(prediction.get("candidates", []))[:3],
++        "evidence": list(prediction.get("evidence", [])),
++        "fields": fields,
++        "fields_v2": fields_v2,
++    }
++
++
++def _parse_deadline(value: str | None, now: datetime) -> datetime:
++    if value:
++        try:
++            parsed = datetime.strptime(value, "%Y-%m-%d").replace(
++                tzinfo=timezone.utc
++            )
++        except (TypeError, ValueError):
++            parsed = None
++        if parsed is not None:
++            parsed = parsed.replace(hour=23, minute=59, second=59)
++            if parsed > now:
++                return parsed
++    return now + timedelta(days=14)
++
++
++def task_from_analysis(
++    analysis: dict,
++    *,
++    customer_id: str = "draft_customer",
++    text: str = "",
++    task_id: str | None = None,
++    now: datetime | None = None,
++) -> Task:
++    """Build an in-memory ``Task`` that the recommender can score.
++
++    The task is never inserted into the store. ``status`` stays ``open`` so
++    eligibility rules behave exactly as they do for catalog tasks.
++    """
++    reference = _utcnow(now)
++    fields = analysis.get("fields", {})
++    digest = hashlib.sha256(
++        normalize_text(text or analysis.get("category", "")).encode("utf-8")
++    ).hexdigest()[:12]
++    resolved_id = task_id or f"draft_task_{digest}"
++
++    skills = [skill for skill in fields.get("skills", []) if skill]
++    required_skills = {skill: 2 for skill in dict.fromkeys(skills)}
++    duration = fields.get("duration_days")
++    estimated_hours = max(
++        4.0, min(float(duration) if duration else 8.0, 16.0)
++    )
++    budget_min = _as_float(fields.get("budget_min"))
++    budget_max = _as_float(fields.get("budget_max"))
++    if budget_min is None and budget_max is not None:
++        budget_min = budget_max
++    if budget_max is None and budget_min is not None:
++        budget_max = budget_min
++    budget = (
++        (budget_min + budget_max) / 2.0
++        if budget_min is not None and budget_max is not None
++        else 0.0
++    )
++
++    return Task(
++        task_id=resolved_id,
++        customer_id=customer_id,
++        title=fields.get("suggested_title") or "上传任务书",
++        description=(text or "")[:4000],
++        category=analysis.get("category", "consulting_research"),
++        required_skills=required_skills,
++        required_level=2,
++        difficulty=3,
++        priority=3,
++        estimated_hours=estimated_hours,
++        deadline=_parse_deadline(fields.get("deadline"), reference),
++        region=fields.get("region") or "CN",
++        remote_ok=(
++            fields.get("remote_ok")
++            if fields.get("remote_ok") is not None
++            else True
++        ),
++        status="open",
++        budget=budget,
++        budget_min=budget_min or 0.0,
++        budget_max=budget_max or 0.0,
++        requirements=list(fields.get("requirements") or []),
++    )
++
++
++def build_task_draft(task: Task, analysis: dict) -> dict:
++    """Return the JSON-safe draft payload shown to the user."""
++    return {
++        "task_id": task.task_id,
++        "customer_id": task.customer_id,
++        "title": task.title,
++        "description": task.description,
++        "category": task.category,
++        "category_label": CATEGORY_LABELS.get(task.category, task.category),
++        "required_skills": dict(task.required_skills),
++        "required_level": task.required_level,
++        "difficulty": task.difficulty,
++        "priority": task.priority,
++        "estimated_hours": task.estimated_hours,
++        "deadline": task.deadline.isoformat(),
++        "region": task.region,
++        "region_label": REGION_LABELS.get(task.region, task.region),
++        "remote_ok": task.remote_ok,
++        "budget": task.budget,
++        "budget_min": task.budget_min,
++        "budget_max": task.budget_max,
++        "requirements": list(task.requirements),
++        "confidence": analysis.get("confidence", 0.0),
++        "needs_clarification": analysis.get("needs_clarification", False),
++        "status": "draft",
++    }
++
++
++# ---------------------------------------------------------------------------
++# Resume analysis
++# ---------------------------------------------------------------------------
++
++
++def _infer_region(text: str) -> str:
++    for region, cues in _REGION_CUES:
++        if any(cue and cue in text for cue in cues):
++            return region
++    return "CN"
++
++
++def _infer_remote_preference(text: str) -> bool | None:
++    if any(cue in text for cue in _REMOTE_CUES):
++        return True
++    if any(cue in text for cue in _ONSITE_CUES):
++        return False
++    return None
++
++
++def _canonical_skills_from_text(normalized: str) -> list[str]:
++    lowered = normalized.lower()
++    found: list[str] = []
++    for skill, phrases in SKILL_KEYWORDS.items():
++        if any(phrase.lower() in lowered for phrase in phrases):
++            found.append(skill)
++    return found
++
++
++def _skills_section_lines(text: str) -> list[str]:
++    lines = [
++        normalize_text(line)
++        for line in str(text or "").splitlines()
++        if normalize_text(line)
++    ]
++    collected: list[str] = []
++    inside = False
++    for line in lines:
++        header = line.strip().strip(":：").strip()
++        if header in _SKILL_HEADER_WORDS:
++            inside = True
++            continue
++        if header in _SECTION_BOUNDARY_WORDS:
++            if inside:
++                break
++            inside = False
++            continue
++        if inside:
++            if any(
++                marker in line
++                for marker in (
++                    "期望",
++                    "薪资",
++                    "电话",
++                    "邮箱",
++                    "联系",
++                    "地址",
++                    "居住",
++                    "城市",
++                )
++            ):
++                break
++            collected.append(line)
++    return collected
++
++
++def _clean_skill_token(token: str) -> str | None:
++    token = token.strip().strip("。.、；;:：-*•·\"'“”‘’")
++    if not token or len(token) > _MAX_SKILL_TOKEN_LENGTH:
++        return None
++    if token in _GENERIC_SKILL_WORDS:
++        return None
++    if token.isdigit():
++        return None
++    return token
++
++
++def _raw_skill_tokens(text: str) -> list[str]:
++    tokens: list[str] = []
++    for line in _skills_section_lines(text):
++        for token in _TOKEN_SPLIT_RE.split(line):
++            cleaned = _clean_skill_token(token)
++            if not cleaned:
++                continue
++            canonical = normalize_skill(cleaned)
++            tokens.append(canonical or cleaned.lower())
++    return tokens
++
++
++def _collect_skills(text: str, normalized: str) -> list[str]:
++    skills: list[str] = []
++    for skill in _canonical_skills_from_text(normalized):
++        if skill not in skills:
++            skills.append(skill)
++    for token in _raw_skill_tokens(text):
++        if not token or token in skills:
++            continue
++        if _RAW_SKILL_RE.fullmatch(token):
++            skills.append(token)
++    return skills[:_MAX_SKILLS]
++
++
++def _infer_categories(
++    skills: list[str], normalized: str
++) -> list[dict]:
++    reverse = {
++        skill: category
++        for category, category_skills in CATEGORY_SKILLS.items()
++        for skill in category_skills
++    }
++    scores: dict[str, float] = {}
++    for skill in skills:
++        category = reverse.get(skill) or _RAW_SKILL_CATEGORY.get(skill)
++        if category:
++            scores[category] = scores.get(category, 0.0) + 1.0
++
++    if not scores:
++        # Without recognizable skills, fall back to the task classifier as a
++        # weak, clearly low-confidence signal.
++        try:
++            prediction = get_default_classifier().predict(normalized, top_k=3)
++        except (ValueError, ImportError):
++            return []
++        return [
++            {
++                "category": item["category"],
++                "label": item.get(
++                    "label",
++                    CATEGORY_LABELS.get(item["category"], item["category"]),
++                ),
++                "confidence": round(float(item["confidence"]), 4),
++            }
++            for item in prediction.get("candidates", [])[:3]
++        ]
++
++    top_score = max(scores.values())
++    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
++    return [
++        {
++            "category": category,
++            "label": CATEGORY_LABELS.get(category, category),
++            "confidence": round(score / top_score, 4),
++        }
++        for category, score in ranked[:3]
++    ]
++
++
++def _infer_expected_pay(text: str) -> dict:
++    match = _EXPECTED_PAY_RE.search(text)
++    if not match:
++        return {"value": None, "period": None, "evidence": ""}
++    value = float(match.group("amount").replace(",", ""))
++    unit = (match.group("unit") or "").lower()
++    value *= _PAY_UNIT_SCALE.get(unit, 1.0)
++    period = match.group("period") or ""
++    if not period:
++        # Label-only forms such as “月薪 15000 元” and “期望时薪 100 元”
++        # carry the period in the label rather than a “/月” suffix.
++        label = match.group("label")
++        if "月薪" in label:
++            period = "月"
++        elif "时薪" in label:
++            period = "小时"
++        elif "日薪" in label:
++            period = "天"
++    if period in {"日", "天"}:
++        period = "天"
++    elif period in {"时", "小时"}:
++        period = "小时"
++    return {
++        "value": value,
++        "period": period or None,
++        "evidence": match.group(0).strip(),
++    }
++
++
++def _worker_level(experience_years: float) -> int:
++    return max(1, min(5, 1 + int(experience_years // 2)))
++
++
++def _worker_expected_pay(expected_pay: dict) -> float:
++    """Return only a per-task-compatible pay figure.
++
++    Monthly and hourly quotes cannot be compared with a task budget, so they
++    stay in the analysis payload and map to ``0.0`` (unknown per-task pay).
++    Per-day quotes and unqualified amounts are kept as-is.
++    """
++    value = expected_pay.get("value")
++    if value is None:
++        return 0.0
++    if expected_pay.get("period") in {"月", "小时"}:
++        return 0.0
++    return float(value)
++
++
++def _build_worker(
++    skills: list[str],
++    categories: list[dict],
++    *,
++    experience_years: float,
++    region: str,
++    remote_preference: bool | None,
++    expected_pay: float,
++    worker_id: str,
++) -> Worker:
++    top_score = categories[0]["confidence"] if categories else 1.0
++    specialties = {
++        item["category"]: max(
++            1, min(5, 2 + int(round(item["confidence"] * 3)))
++        )
++        for item in categories
++    }
++    preferred_categories = {
++        item["category"]: round(item["confidence"] / top_score, 3)
++        for item in categories
++    }
++    return Worker(
++        worker_id=worker_id,
++        name="候选人草稿",
++        skills={skill: 3 for skill in skills},
++        specialties=specialties,
++        level=_worker_level(experience_years),
++        capacity_hours=40.0,
++        current_load_hours=0.0,
++        preferred_categories=preferred_categories,
++        preferred_difficulty=(2, 4),
++        region=region,
++        remote_ok=(
++            remote_preference if remote_preference is not None else True
++        ),
++        status="active",
++        expected_pay=float(expected_pay or 0.0),
++    )
++
++
++def analyze_resume_text(
++    text: str,
++    now: datetime | None = None,
++    worker_id: str | None = None,
++) -> dict:
++    """Parse a resume and return a draft ``Worker`` plus inferred profile.
++
++    The draft is not written anywhere. ``worker_id`` is derived from a hash of
++    the normalized text by default, so repeating an upload reuses the semantic
++    text caches instead of growing them.
++    """
++    normalized_all = normalize_text(text)
++    if not normalized_all or not re.search(r"[一-鿿A-Za-z0-9]", normalized_all):
++        raise ValueError("简历文本不能为空")
++
++    sections = parse_resume_sections(text, now=now)
++    skills = _collect_skills(text, normalized_all)
++    categories = _infer_categories(skills, normalized_all)
++    experience_years = float(sections.get("experience_years") or 0.0)
++    region = _infer_region(normalized_all)
++    remote_preference = _infer_remote_preference(normalized_all)
++    expected_pay = _infer_expected_pay(normalized_all)
++
++    digest = hashlib.sha256(normalized_all.encode("utf-8")).hexdigest()[:12]
++    resolved_worker_id = worker_id or f"draft_resume_{digest}"
++    worker = _build_worker(
++        skills,
++        categories,
++        experience_years=experience_years,
++        region=region,
++        remote_preference=remote_preference,
++        expected_pay=_worker_expected_pay(expected_pay),
++        worker_id=resolved_worker_id,
++    )
++    draft = asdict(worker)
++    draft.update(
++        {
++            "draft": True,
++            "categories": categories,
++            "confidence": (
++                categories[0]["confidence"] if categories else 0.0
++            ),
++            "expected_pay_period": expected_pay["period"],
++        }
++    )
++
++    return {
++        "sections": sections,
++        "skills": skills,
++        "categories": categories,
++        "experience_years": experience_years,
++        "region": region,
++        "region_label": REGION_LABELS.get(region, region),
++        "remote_preference": remote_preference,
++        "expected_pay": expected_pay,
++        "draft_worker": draft,
++        "worker_id": resolved_worker_id,
++    }
++
++
++def worker_from_draft(draft: dict) -> Worker:
++    """Rebuild a ``Worker`` from ``analyze_resume_text``'s draft payload."""
++    known = {item.name for item in dataclass_fields(Worker)}
++    values = {key: value for key, value in draft.items() if key in known}
++    difficulty = values.get("preferred_difficulty", (2, 4))
++    values["preferred_difficulty"] = tuple(difficulty)
++    values.setdefault("worker_id", "draft_resume")
++    return Worker(**values)
+
+--- a/app\upload\extract.py
++++ b/app\upload\extract.py
+@@ -0,0 +1,366 @@
++"""In-memory, whitelist-only text extraction for uploaded documents.
++
++Security posture (Task 22):
++
++* the filename is sanitized before it is used anywhere (path separators and
++  control characters are removed);
++* only ``.txt`` / ``.md`` / ``.pdf`` / ``.docx`` are accepted, and the declared
++  MIME type (when meaningful) must agree with the extension;
++* the upload is capped at :data:`MAX_UPLOAD_BYTES` (10 MB);
++* bytes are parsed in memory from ``io.BytesIO``; nothing is written to disk,
++  and no macro / script / embedded object is executed;
++* optional parsers (``pypdf`` for PDF, ``python-docx`` for DOCX) are imported
++  lazily. When absent, the caller receives an :class:`UploadError` whose
++  message explains which extra to install instead of an ``ImportError``.
++"""
++
++from __future__ import annotations
++
++import io
++import json
++import re
++import zipfile
++from pathlib import PurePosixPath
++
++MAX_UPLOAD_BYTES = 10 * 1024 * 1024
++MAX_UPLOAD_MB = 10
++# A small DOCX/PDF can inflate to a very large document; keep parsing bounded.
++MAX_EXTRACTED_CHARS = 5_000_000
++MAX_PDF_PAGES = 200
++MAX_ZIP_ENTRIES = 2_048
++MAX_ZIP_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024
++MAX_ZIP_ENTRY_UNCOMPRESSED = 32 * 1024 * 1024
++MAX_ZIP_COMPRESSION_RATIO = 100
++_ZIP_RATIO_MIN_SIZE = 1024 * 1024
++
++SUPPORTED_EXTENSIONS = (".txt", ".md", ".pdf", ".docx")
++TEXT_EXTENSIONS = (".txt", ".md")
++UPLOAD_PATHS = frozenset({"/upload/task", "/upload/resume", "/resume/analyze"})
++
++_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
++_SAFE_NAME_RE = re.compile(r"[^0-9A-Za-z一-鿿._\-()（） ]+")
++_MAX_FILENAME_LENGTH = 180
++
++_MIME_BY_EXTENSION = {
++    ".txt": {"text/plain", "text/x-markdown", "text/markdown"},
++    ".md": {"text/markdown", "text/x-markdown", "text/plain"},
++    ".pdf": {"application/pdf", "application/x-pdf"},
++    ".docx": {
++        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
++    },
++}
++_GENERIC_MIME_TYPES = {"", "application/octet-stream", "binary/octet-stream"}
++
++
++class UploadError(ValueError):
++    """A user-facing upload/parse failure that maps to HTTP 422."""
++
++    status_code = 422
++
++
++def upload_limit_label(limit: int | None = None) -> str:
++    """Render a byte limit without assuming it is always exactly 10 MB."""
++    value = MAX_UPLOAD_BYTES if limit is None else int(limit)
++    if value and value % (1024 * 1024) == 0:
++        return f"{value // (1024 * 1024)} MB"
++    if value and value % 1024 == 0:
++        return f"{value // 1024} KB"
++    return f"{value} 字节"
++
++
++class _BodyTooLarge(Exception):
++    """Raised inside the receive wrapper when a chunked body exceeds the cap."""
++
++
++class UploadBodyLimitMiddleware:
++    """Pure ASGI body cap applied before multipart/JSON parsing.
++
++    Starlette normally receives and spools a multipart body before the route
++    handler runs. This middleware runs outside form parsing, rejects an
++    over-limit ``Content-Length`` immediately, and counts streamed chunks for
++    chunked bodies. An over-limit request never reaches the endpoint.
++    """
++
++    def __init__(self, app, paths: frozenset[str] | None = None) -> None:
++        self.app = app
++        self.paths = paths or UPLOAD_PATHS
++
++    async def __call__(self, scope, receive, send) -> None:
++        path = (scope.get("path") or "").rstrip("/") or "/"
++        if scope.get("type") != "http" or path not in self.paths:
++            await self.app(scope, receive, send)
++            return
++
++        limit = MAX_UPLOAD_BYTES
++        headers = {
++            key.decode("latin-1").lower(): value.decode("latin-1")
++            for key, value in scope.get("headers", [])
++        }
++        declared = headers.get("content-length")
++        if declared is not None:
++            try:
++                declared_size = int(declared)
++            except ValueError:
++                await self._reject(
++                    send, 413, "无效的 Content-Length 请求头"
++                )
++                return
++            if declared_size > limit:
++                await self._reject(
++                    send,
++                    413,
++                    f"请求体超过上传大小限制（{upload_limit_label(limit)}）",
++                )
++                return
++
++        received = 0
++
++        async def limited_receive():
++            nonlocal received
++            message = await receive()
++            if message.get("type") == "http.request":
++                received += len(message.get("body", b""))
++                if received > limit:
++                    raise _BodyTooLarge
++            return message
++
++        try:
++            await self.app(scope, limited_receive, send)
++        except _BodyTooLarge:
++            await self._reject(
++                send,
++                413,
++                f"请求体超过上传大小限制（{upload_limit_label(limit)}）",
++            )
++
++    @staticmethod
++    async def _reject(send, status: int, detail: str) -> None:
++        body = json.dumps(
++            {"detail": detail}, ensure_ascii=False
++        ).encode("utf-8")
++        await send(
++            {
++                "type": "http.response.start",
++                "status": status,
++                "headers": [
++                    (b"content-type", b"application/json; charset=utf-8"),
++                    (b"content-length", str(len(body)).encode("ascii")),
++                ],
++            }
++        )
++        await send({"type": "http.response.body", "body": body})
++
++
++def sanitize_filename(filename: str | None) -> str:
++    """Return a display-only, path-free filename.
++
++    ``..`` traversal, Windows/POSIX separators and control characters are
++    removed. The extension is preserved for the whitelist check, and an empty
++    result falls back to ``document.txt`` (which then fails the whitelist only
++    if the caller ignores the returned name).
++    """
++    raw = str(filename or "")
++    raw = raw.replace("\\", "/")
++    name = PurePosixPath(raw).name
++    name = _CONTROL_RE.sub("", name).strip()
++    name = _SAFE_NAME_RE.sub("", name).strip(" .")
++    if not name:
++        return "document.txt"
++    if len(name) > _MAX_FILENAME_LENGTH:
++        stem, dot, extension = name.rpartition(".")
++        if dot and len(extension) <= 10:
++            keep = _MAX_FILENAME_LENGTH - len(extension) - 1
++            name = f"{stem[:keep]}.{extension}"
++        else:
++            name = name[:_MAX_FILENAME_LENGTH]
++    return name
++
++
++def _extension(filename: str) -> str:
++    name = sanitize_filename(filename).lower()
++    dot = name.rfind(".")
++    return name[dot:] if dot >= 0 else ""
++
++
++def _content_type_allowed(extension: str, content_type: str | None) -> bool:
++    if not content_type:
++        return True
++    normalized = content_type.split(";", 1)[0].strip().lower()
++    if normalized in _GENERIC_MIME_TYPES:
++        return True
++    allowed = _MIME_BY_EXTENSION.get(extension, set())
++    if extension in TEXT_EXTENSIONS and normalized.startswith("text/"):
++        return True
++    return normalized in allowed
++
++
++def _import_pypdf():
++    """Import ``pypdf`` lazily so the fallback can be tested and documented."""
++    import pypdf
++
++    return pypdf
++
++
++def _import_docx():
++    """Import ``python-docx`` lazily so the fallback can be tested."""
++    import docx
++
++    return docx
++
++
++def _decode_text(content: bytes) -> str:
++    if b"\x00" in content:
++        raise UploadError("文本文件包含二进制内容，无法作为 .txt/.md 解析")
++    for encoding in ("utf-8-sig", "gb18030"):
++        try:
++            return content.decode(encoding)
++        except UnicodeDecodeError:
++            continue
++    raise UploadError("文本编码无法识别，请使用 UTF-8 或 GB18030 编码")
++
++
++def _extract_pdf(content: bytes) -> str:
++    if not content.lstrip().startswith(b"%PDF-"):
++        raise UploadError("文件不是有效的 PDF（缺少 %PDF 文件头）")
++    try:
++        pypdf = _import_pypdf()
++    except ImportError:
++        raise UploadError(
++            "PDF 解析需要可选依赖 pypdf；请安装：pip install pypdf"
++        ) from None
++    try:
++        reader = pypdf.PdfReader(io.BytesIO(content))
++        if getattr(reader, "is_encrypted", False):
++            raise UploadError("PDF 已加密，无法解析")
++        if len(reader.pages) > MAX_PDF_PAGES:
++            raise UploadError(
++                f"PDF 页数超过限制（最多 {MAX_PDF_PAGES} 页）"
++            )
++        collected: list[str] = []
++        total_chars = 0
++        for page in reader.pages:
++            chunk = page.extract_text() or ""
++            total_chars += len(chunk)
++            if total_chars > MAX_EXTRACTED_CHARS:
++                raise UploadError("PDF 解析后的文本过大，请上传更小的文件")
++            collected.append(chunk)
++    except UploadError:
++        raise
++    except Exception as error:  # noqa: BLE001 - parser errors are user-facing
++        raise UploadError(
++            f"PDF 文件无法解析（文件可能损坏）：{type(error).__name__}"
++        ) from None
++    return "\n".join(page for page in collected if page.strip())
++
++
++def _inspect_docx_zip(content: bytes) -> None:
++    """Reject suspicious ZIP expansion before ``docx.Document`` parses it."""
++    try:
++        archive = zipfile.ZipFile(io.BytesIO(content))
++    except zipfile.BadZipFile:
++        raise UploadError("DOCX 文件不是有效的 ZIP 结构") from None
++    try:
++        entries = archive.infolist()
++        if len(entries) > MAX_ZIP_ENTRIES:
++            raise UploadError(
++                f"DOCX 内部条目过多（最多 {MAX_ZIP_ENTRIES} 个）"
++            )
++        total_uncompressed = 0
++        for entry in entries:
++            if entry.flag_bits & 0x1:
++                raise UploadError("DOCX 包含加密条目，无法解析")
++            if entry.file_size > MAX_ZIP_ENTRY_UNCOMPRESSED:
++                raise UploadError("DOCX 单条目解压后过大")
++            total_uncompressed += entry.file_size
++            if total_uncompressed > MAX_ZIP_TOTAL_UNCOMPRESSED:
++                raise UploadError("DOCX 解压后总体积过大")
++            if (
++                entry.file_size >= _ZIP_RATIO_MIN_SIZE
++                and entry.compress_size > 0
++                and entry.file_size / entry.compress_size
++                > MAX_ZIP_COMPRESSION_RATIO
++            ):
++                raise UploadError("DOCX 压缩比异常（疑似压缩炸弹）")
++    finally:
++        archive.close()
++
++
++def _extract_docx(content: bytes) -> str:
++    if not content.startswith(b"PK\x03\x04"):
++        raise UploadError("文件不是有效的 DOCX（缺少 ZIP 文件头）")
++    try:
++        docx = _import_docx()
++    except ImportError:
++        raise UploadError(
++            "DOCX 解析需要可选依赖 python-docx；请安装：pip install python-docx"
++        ) from None
++    _inspect_docx_zip(content)
++    try:
++        document = docx.Document(io.BytesIO(content))
++        parts = [
++            paragraph.text.strip()
++            for paragraph in document.paragraphs
++            if paragraph.text and paragraph.text.strip()
++        ]
++        for table in document.tables:
++            for row in table.rows:
++                cells = [
++                    cell.text.strip()
++                    for cell in row.cells
++                    if cell.text and cell.text.strip()
++                ]
++                if cells:
++                    parts.append(" | ".join(cells))
++    except Exception as error:  # noqa: BLE001 - parser errors are user-facing
++        raise UploadError(
++            f"DOCX 文件无法解析（文件可能损坏）：{type(error).__name__}"
++        ) from None
++    return "\n".join(parts)
++
++
++def extract_text(
++    filename: str,
++    content: bytes,
++    content_type: str | None = None,
++) -> str:
++    """Extract plain text from an uploaded document without touching disk.
++
++    ``filename`` drives the extension whitelist and is sanitized first. When
++    ``content_type`` is a concrete value it must agree with the extension;
++    generic browser fallbacks such as ``application/octet-stream`` are allowed.
++    Any rejection raises :class:`UploadError` (HTTP 422 at the API layer).
++    """
++    if not isinstance(content, (bytes, bytearray)):
++        raise UploadError("文件内容格式无效")
++    content = bytes(content)
++    if len(content) > MAX_UPLOAD_BYTES:
++        raise UploadError(
++            f"文件超过上传大小限制（{upload_limit_label()}）"
++        )
++    if not content:
++        raise UploadError("文件为空")
++
++    safe_name = sanitize_filename(filename)
++    extension = _extension(safe_name)
++    if extension not in SUPPORTED_EXTENSIONS:
++        supported = "、".join(SUPPORTED_EXTENSIONS)
++        raise UploadError(
++            f"不支持的文件类型 {extension or '(无扩展名)'}；仅支持 {supported}"
++        )
++    if not _content_type_allowed(extension, content_type):
++        raise UploadError(
++            f"文件类型 {content_type} 与扩展名 {extension} 不匹配"
++        )
++
++    if extension in TEXT_EXTENSIONS:
++        text = _decode_text(content)
++    elif extension == ".pdf":
++        text = _extract_pdf(content)
++    else:  # .docx
++        text = _extract_docx(content)
++
++    if len(text) > MAX_EXTRACTED_CHARS:
++        raise UploadError("文档解析后的文本过大，请上传更小的文件")
++    if not text.strip():
++        raise UploadError("未能从文件中解析到文本内容")
++    return text
+
+--- a/frontend\app.js
++++ b/frontend\app.js
+@@ -43,20 +43,23 @@
+   acceptance: null,
+   acceptanceSpec: null,
+   acceptanceSubmission: null,
+   talentList: [],
+   talentResume: null,
+   talentRawVisible: false,
+   pendingAdopt: null,
+   profileUser: null,
+   profileType: "worker",
+   rating: 0,
++  uploadTask: null,
++  resumeUpload: null,
++  confirmedDraft: null,
+ };
+ 
+ const $ = (selector, root = document) => root.querySelector(selector);
+ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+ const esc = (value) =>
+   String(value ?? "").replace(/[&<>"']/g, (char) => ({
+     "&": "&amp;",
+     "<": "&lt;",
+     ">": "&gt;",
+     '"': "&quot;",
+@@ -84,20 +87,39 @@
+ const fmtPct = (value) =>
+   value == null ? "—" : `${(Number(value) * 100).toFixed(1)}%`;
+ const REGION_LABELS = { CN: "中国大陆", US: "美国", EU: "欧洲" };
+ const openTasks = () => state.tasks.filter((task) => task.status === "open");
+ 
+ async function api(path, options = {}) {
+   const response = await fetch(path, {
+     headers: { "Content-Type": "application/json" },
+     ...options,
+   });
++  const text = await response.text();
++  let data = null;
++  try {
++    data = text ? JSON.parse(text) : null;
++  } catch {
++    data = text;
++  }
++  if (!response.ok) {
++    let detail = data && data.detail ? data.detail : `${response.status} ${response.statusText}`;
++    if (Array.isArray(detail)) {
++      detail = detail.map((item) => item.msg || JSON.stringify(item)).join("; ");
++    }
++    throw new Error(detail);
++  }
++  return data;
++}
++
++async function apiForm(path, form) {
++  const response = await fetch(path, { method: "POST", body: form });
+   const text = await response.text();
+   let data = null;
+   try {
+     data = text ? JSON.parse(text) : null;
+   } catch {
+     data = text;
+   }
+   if (!response.ok) {
+     let detail = data && data.detail ? data.detail : `${response.status} ${response.statusText}`;
+     if (Array.isArray(detail)) {
+@@ -1642,21 +1664,21 @@
+     renderCandidates($("#w2t-results"), data.candidates, "worker", workerId);
+     $("#w2t-adopt").innerHTML = "";
+     if (!data.candidates.length) {
+       toast("没有符合条件的任务", "error");
+     }
+   } catch (error) {
+     toast(error.message, "error");
+   }
+ }
+ 
+-function renderCandidates(container, candidates, mode, queryId) {
++function renderCandidates(container, candidates, mode, queryId, options = {}) {
+   container.innerHTML = "";
+   if (!candidates || !candidates.length) {
+     container.innerHTML = '<div class="empty">暂无候选</div>';
+     return;
+   }
+   candidates.forEach((candidate, index) => {
+     const card = document.createElement("article");
+     card.className = "candidate";
+     const badges = [];
+     if (candidate.cold_start) badges.push('<span class="badge cold">冷启动</span>');
+@@ -1678,37 +1700,50 @@
+           </div>`;
+       })
+       .join("");
+     const reasons = (candidate.reasons || [])
+       .map((reason) => `<span class="reason">${esc(reason)}</span>`)
+       .join("");
+     const candidateTask =
+       mode === "worker"
+         ? state.tasks.find((task) => task.task_id === candidate.candidate_id)
+         : null;
++    const candidateWorker =
++      mode === "task"
++        ? state.workers.find((worker) => worker.worker_id === candidate.candidate_id)
++        : null;
+     const heading = candidateTask
+       ? `<strong>${esc(candidateTask.title)}</strong>
+          <span class="candidate-sub">${fmtMoney(candidateTask.budget_min)}–${fmtMoney(candidateTask.budget_max)} · 截止 ${fmtDate(candidateTask.deadline)}</span>`
+-      : `<strong>${esc(candidate.candidate_id)}</strong>`;
++      : candidateWorker
++        ? `<strong>${esc(candidateWorker.name || candidateWorker.worker_id)}</strong>
++           <span class="candidate-sub">${esc(REGION_LABELS[candidateWorker.region] || candidateWorker.region)} · L${candidateWorker.level}</span>`
++        : `<strong>${esc(candidate.candidate_id)}</strong>`;
++    const allowAdopt = options.allowAdopt !== false;
++    const adoptButton = allowAdopt
++      ? '<button class="btn primary adopt-btn">采纳并评分</button>'
++      : "";
+     card.innerHTML = `
+       <div class="candidate-head">
+         <span class="rank">#${index + 1}</span>
+         ${heading}
+         <span class="score">${fmt(candidate.score)}</span>
+       </div>
+       <div class="badges">${badges.join("") || '<span class="badge">常规候选</span>'}</div>
+       <div class="breakdown">${bars}</div>
+       <div class="reasons">${reasons}</div>
+-      <button class="btn primary adopt-btn">采纳并评分</button>`;
+-    card.querySelector(".adopt-btn").addEventListener("click", () =>
+-      adoptCandidate(mode, queryId, candidate)
+-    );
++      ${adoptButton}`;
++    if (allowAdopt) {
++      card.querySelector(".adopt-btn").addEventListener("click", () =>
++        adoptCandidate(mode, queryId, candidate)
++      );
++    }
+     container.appendChild(card);
+   });
+ }
+ 
+ async function adoptCandidate(mode, queryId, candidate) {
+   const taskId = mode === "task" ? queryId : candidate.candidate_id;
+   const workerId = mode === "task" ? candidate.candidate_id : queryId;
+   const task = state.tasks.find((item) => item.task_id === taskId);
+   try {
+     const assignment = await api("/assignments", {
+@@ -2429,20 +2464,265 @@
+       (response) => response.version
+     );
+     await refreshWeights();
+     demoLog("demo complete — baseline restored", "ok");
+   } catch (error) {
+     demoLog(`demo stopped: ${error.message}`, "error");
+     toast(error.message, "error");
+   }
+ }
+ 
++function formatBytes(value) {
++  const bytes = Number(value || 0);
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
++}
++
++function categoryBarsHtml(items) {
++  return (items || [])
++    .map(
++      (item, index) => `
++      <div class="classify-candidate ${index === 0 ? "top" : ""}">
++        <span>${esc(item.label || item.category)}</span>
++        <div class="bar-track"><div class="bar-fill" style="width:${Math.max(4, Number(item.confidence || 0) * 100)}%"></div></div>
++        <span class="mono">${fmt(item.confidence, 2)}</span>
++      </div>`
++    )
++    .join("");
++}
++
++function skillsHtml(skills) {
++  return (skills || [])
++    .map((skill) => `<span class="reason">${esc(skill)}</span>`)
++    .join("") || '<span class="muted small">未识别技能</span>';
++}
++
++function renderUploadPreview(container, title, text, sizeBytes = null) {
++  if (!container) return;
++  container.className = "upload-preview";
++  container.innerHTML = `
++    <div class="upload-preview-head">
++      <strong>${esc(title || "文本预览")}</strong>
++      ${sizeBytes == null ? "" : `<span class="pill subtle">${formatBytes(sizeBytes)}</span>`}
++    </div>
++    <div class="preview-text">${esc(text || "（无文本）")}</div>`;
++}
++
++function renderTaskUpload(data) {
++  const analysis = data.analysis || {};
++  const fields = analysis.fields || {};
++  const budget =
++    fields.budget != null
++      ? `${fmtMoney(fields.budget_min)} – ${fmtMoney(fields.budget_max)}`
++      : "未识别";
++  const remote =
++    fields.remote_ok === true ? "可远程" : fields.remote_ok === false ? "需现场" : "未提及";
++  const requirements =
++    (fields.requirements || []).map((item) => `<li>${esc(item)}</li>`).join("") ||
++    "<li>未识别</li>";
++  const confidence = Math.round(Number(analysis.confidence || 0) * 100);
++
++  renderUploadPreview(
++    $("#upload-task-preview"),
++    data.filename,
++    data.text_preview,
++    data.size_bytes
++  );
++  $("#upload-task-analysis").innerHTML = `
++    <article class="upload-analysis-block">
++      <div class="panel-head">
++        <h4>任务画像</h4>
++        <span class="pill">${esc(analysis.label || analysis.category || "未分类")} · ${confidence}%</span>
++      </div>
++      <div class="classify-candidates">${categoryBarsHtml(analysis.top_categories)}</div>
++      <div class="upload-field-grid">
++        <div class="classify-field"><span>预算</span><strong>${budget}</strong></div>
++        <div class="classify-field"><span>交付周期</span><strong>${fields.duration_days ? `${fields.duration_days} 天` : "未识别"}</strong></div>
++        <div class="classify-field"><span>截止日期</span><strong>${esc(fields.deadline || "未识别")}</strong></div>
++        <div class="classify-field"><span>远程</span><strong>${remote}</strong></div>
++      </div>
++      <div class="task-reqs">
++        <h4>技能与要求</h4>
++        <div class="reasons">${skillsHtml(fields.skills)}</div>
++        <ul>${requirements}</ul>
++      </div>
++      <div class="draft-note">草稿 ${esc(data.draft.task_id)} · 截止 ${fmtDate(data.draft.deadline)} · 尚未写入数据</div>
++    </article>`;
++  renderCandidates(
++    $("#upload-task-results"),
++    data.candidates,
++    "task",
++    data.draft.task_id,
++    { allowAdopt: false }
++  );
++  renderDraftConfirm($("#upload-task-confirm"), "task", data.draft);
++}
++
++function renderResumeUpload(data) {
++  const analysis = data.analysis || {};
++  const draft = data.draft || analysis.draft_worker || {};
++  const expectedPay = analysis.expected_pay || {};
++  const remote =
++    analysis.remote_preference === true
++      ? "可远程"
++      : analysis.remote_preference === false
++        ? "需现场"
++        : "未提及";
++  const pay =
++    expectedPay.value == null
++      ? "未识别"
++      : `${fmtMoney(expectedPay.value)}${expectedPay.period ? ` / ${expectedPay.period}` : ""}`;
++  const categories = (analysis.categories || []).map((item) => ({
++    label: item.label,
++    confidence: item.confidence,
++  }));
++
++  renderUploadPreview(
++    $("#resume-preview"),
++    data.filename || "粘贴文本",
++    data.text_preview,
++    data.size_bytes
++  );
++  $("#resume-analysis").innerHTML = `
++    <article class="upload-analysis-block">
++      <div class="panel-head">
++        <h4>候选人画像</h4>
++        <span class="pill">草稿</span>
++      </div>
++      <div class="classify-candidates">${categoryBarsHtml(categories)}</div>
++      <div class="upload-field-grid">
++        <div class="classify-field"><span>经验年限</span><strong>${fmt(analysis.experience_years, 1)} 年</strong></div>
++        <div class="classify-field"><span>地区</span><strong>${esc(analysis.region_label || analysis.region)}</strong></div>
++        <div class="classify-field"><span>远程偏好</span><strong>${remote}</strong></div>
++        <div class="classify-field"><span>期望报酬</span><strong>${pay}</strong></div>
++        <div class="classify-field"><span>画像等级</span><strong>L${draft.level ?? "—"}</strong></div>
++        <div class="classify-field"><span>草稿 ID</span><strong class="mono">${esc(draft.worker_id || "—")}</strong></div>
++      </div>
++      <div class="task-reqs">
++        <h4>识别到的技能</h4>
++        <div class="reasons">${skillsHtml(analysis.skills)}</div>
++      </div>
++      <div class="draft-note">临时画像仅用于本次推荐，尚未写入数据</div>
++    </article>`;
++  renderCandidates(
++    $("#resume-results"),
++    data.candidates,
++    "worker",
++    draft.worker_id,
++    { allowAdopt: false }
++  );
++  renderDraftConfirm($("#resume-confirm"), "resume", draft);
++}
++
++function renderDraftConfirm(container, kind, draft) {
++  if (!container) return;
++  const label = kind === "task" ? "任务" : "候选人";
++  container.innerHTML = `
++    <div class="confirm-box">
++      <div>
++        <strong>${label}草稿已生成，尚未写入数据</strong>
++        <p class="muted small">确认只表示采用这份草稿；本演示不会自动创建记录。</p>
++      </div>
++      <button class="btn primary" data-confirm-draft>确认创建${label}草稿</button>
++    </div>`;
++  const button = container.querySelector("[data-confirm-draft]");
++  if (button) {
++    button.addEventListener("click", () =>
++      confirmDraft(kind, draft, container)
++    );
++  }
++}
++
++function confirmDraft(kind, draft, container) {
++  const label = kind === "task" ? "任务" : "候选人";
++  state.confirmedDraft = { kind, draft };
++  if (!container) return;
++  container.innerHTML = `
++    <div class="confirm-box confirmed">
++      <div>
++        <strong>已确认${label}草稿</strong>
++        <span class="pill subtle">未写入数据</span>
++      </div>
++      <details>
++        <summary>查看草稿 JSON</summary>
++        <pre class="draft-json">${esc(JSON.stringify(draft, null, 2))}</pre>
++      </details>
++    </div>`;
++  toast(`${label}草稿已确认（演示环境不自动写入数据）`);
++}
++
++async function runUploadTask() {
++  const file = $("#upload-task-file").files[0];
++  if (!file) return toast("请选择任务书文件", "error");
++  const topN = Math.max(1, Number($("#upload-task-topn").value || 5));
++  renderUploadPreview($("#upload-task-preview"), file.name, "正在解析…", file.size);
++  $("#upload-task-analysis").innerHTML = "";
++  $("#upload-task-results").innerHTML = "";
++  $("#upload-task-confirm").innerHTML = "";
++  const form = new FormData();
++  form.append("file", file);
++  form.append("top_n", String(topN));
++  try {
++    const data = await apiForm("/upload/task", form);
++    state.uploadTask = data;
++    renderTaskUpload(data);
++    toast(`解析完成：Top-${data.candidates.length} 候选人`);
++  } catch (error) {
++    $("#upload-task-preview").className = "upload-preview empty";
++    $("#upload-task-preview").textContent = "解析失败";
++    toast(error.message, "error");
++  }
++}
++
++async function runResumeAnalyze() {
++  const file = $("#resume-file").files[0];
++  const text = $("#resume-text").value.trim();
++  if (!file && !text) return toast("请粘贴简历文本或选择文件", "error");
++  const topN = Math.max(1, Number($("#resume-topn").value || 5));
++  renderUploadPreview(
++    $("#resume-preview"),
++    file ? file.name : "粘贴文本",
++    file ? "正在解析…" : text.slice(0, 400),
++    file ? file.size : null
++  );
++  $("#resume-analysis").innerHTML = "";
++  $("#resume-results").innerHTML = "";
++  $("#resume-confirm").innerHTML = "";
++  try {
++    let data;
++    if (file) {
++      const form = new FormData();
++      form.append("file", file);
++      form.append("top_n", String(topN));
++      data = await apiForm("/upload/resume", form);
++    } else {
++      data = await api("/resume/analyze", {
++        method: "POST",
++        body: JSON.stringify({ text, top_n: topN }),
++      });
++    }
++    state.resumeUpload = data;
++    renderResumeUpload(data);
++    toast(`分析完成：Top-${data.candidates.length} 任务`);
++  } catch (error) {
++    $("#resume-preview").className = "upload-preview empty";
++    $("#resume-preview").textContent = "分析失败";
++    toast(error.message, "error");
++  }
++}
++
++function bindUpload() {
++  $("#upload-task-run").addEventListener("click", runUploadTask);
++  $("#resume-run").addEventListener("click", runResumeAnalyze);
++}
++
+ function bindClassify() {
+   $("#classify-run").addEventListener("click", runClassification);
+   $("#classify-sample").addEventListener("click", () => {
+     $("#classify-text").value = CLASSIFY_SAMPLE;
+     runClassification();
+   });
+ }
+ 
+ function bindBenchmark() {
+   $("#benchmark-run").addEventListener("click", runBenchmark);
+@@ -2514,20 +2794,21 @@
+ 
+ async function init() {
+   bindTabs();
+   bindTheme();
+   bindClassify();
+   bindTalent();
+   bindBenchmark();
+   bindAcceptance();
+   bindTaskToWorker();
+   bindWorkerToTask();
++  bindUpload();
+   bindFeedback();
+   bindChain();
+   bindDemo();
+   fillChainCategories();
+   updateChainMode();
+   try {
+     const [health, tasks, workers, weights, changelog, curve, rounds] =
+       await Promise.all([
+         api("/health"),
+         api("/tasks"),
+
+--- a/frontend\index.html
++++ b/frontend\index.html
+@@ -35,20 +35,21 @@
+         <span id="version-pill" class="pill">v0.3.0</span>
+         <button id="theme-toggle" class="icon-btn" title="切换主题">◐</button>
+       </div>
+     </header>
+ 
+     <nav class="tabs" aria-label="演示导航">
+       <button class="tab active" data-tab="overview">概览</button>
+       <button class="tab" data-tab="classify">需求分类</button>
+       <button class="tab" data-tab="task-to-worker">任务 → 人</button>
+       <button class="tab" data-tab="worker-to-task">人 → 任务</button>
++      <button class="tab" data-tab="upload">双向解析</button>
+       <button class="tab" data-tab="talent">人才库</button>
+       <button class="tab" data-tab="feedback">反馈与权重</button>
+       <button class="tab" data-tab="chain">任务链</button>
+       <button class="tab" data-tab="acceptance">验收闭环</button>
+       <button class="tab" data-tab="benchmark">对答案学习</button>
+       <button class="tab" data-tab="demo">评委演示</button>
+     </nav>
+ 
+     <main>
+       <!-- 概览 -->
+@@ -164,20 +165,66 @@
+         <div class="two-col stretch">
+           <div id="w2t-results" class="results"></div>
+           <aside class="panel side">
+             <h3>人找任务</h3>
+             <p class="muted small">按 worker 的偏好、专长、负载与历史协作，推荐最适合接取的开放任务。</p>
+             <div id="w2t-adopt" class="adopt-slot"></div>
+           </aside>
+         </div>
+       </section>
+ 
++      <!-- 双向解析：任务书 → 人 / 简历 → 任务 -->
++      <section id="tab-upload" class="tab-panel">
++        <div class="upload-grid">
++          <article class="panel upload-card">
++            <div class="panel-head">
++              <h3>上传任务书</h3>
++              <span class="pill subtle">任务 → 人</span>
++            </div>
++            <p class="muted small">.txt / .md 原生解析；安装可选依赖后支持 .pdf / .docx。文件仅在内存解析，最大 10 MB，不落盘。</p>
++            <div class="upload-controls">
++              <input id="upload-task-file" type="file" accept=".txt,.md,.pdf,.docx" />
++              <div class="field narrow">
++                <label for="upload-task-topn">Top N</label>
++                <input id="upload-task-topn" type="number" min="1" max="20" value="5" />
++              </div>
++              <button id="upload-task-run" class="btn primary">解析任务书</button>
++            </div>
++            <div id="upload-task-preview" class="upload-preview empty">尚未选择文件</div>
++            <div id="upload-task-analysis" class="upload-analysis"></div>
++            <div id="upload-task-results" class="results"></div>
++            <div id="upload-task-confirm" class="adopt-slot"></div>
++          </article>
++
++          <article class="panel upload-card">
++            <div class="panel-head">
++              <h3>输入/上传简历</h3>
++              <span class="pill subtle">人 → 任务</span>
++            </div>
++            <p class="muted small">粘贴简历文本或上传 .txt / .md / .pdf / .docx。只生成临时画像与任务草稿，不自动写入数据。</p>
++            <textarea id="resume-text" rows="6" placeholder="粘贴简历文本，例如：&#10;张三&#10;工作经历&#10;2020 - 至今 云启科技 后端工程师&#10;技能&#10;Python、后端开发、数据库、接口&#10;期望薪资：15000 元/月&#10;上海 · 可远程"></textarea>
++            <div class="upload-controls">
++              <input id="resume-file" type="file" accept=".txt,.md,.pdf,.docx" />
++              <div class="field narrow">
++                <label for="resume-topn">Top N</label>
++                <input id="resume-topn" type="number" min="1" max="20" value="5" />
++              </div>
++              <button id="resume-run" class="btn primary">分析简历</button>
++            </div>
++            <div id="resume-preview" class="upload-preview empty">尚未输入简历</div>
++            <div id="resume-analysis" class="upload-analysis"></div>
++            <div id="resume-results" class="results"></div>
++            <div id="resume-confirm" class="adopt-slot"></div>
++          </article>
++        </div>
++      </section>
++
+       <!-- 人才库 / 简历视图 -->
+       <section id="tab-talent" class="tab-panel">
+         <div class="panel controls wrap">
+           <div class="field grow">
+             <label for="talent-select">候选人</label>
+             <select id="talent-select"></select>
+           </div>
+           <button id="talent-load" class="btn primary">查看简历</button>
+           <button id="talent-toggle" class="btn">查看平台原始数据</button>
+           <span class="muted small">表面是简历；技能分、负载与信誉明细默认隐藏</span>
+
+--- a/frontend\styles.css
++++ b/frontend\styles.css
+@@ -217,23 +217,77 @@
+ .classify-candidates { display: grid; gap: 10px; margin: 14px 0; }
+ .classify-candidate { display: grid; grid-template-columns: 82px 1fr 44px; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+ .classify-candidate.top { color: var(--text); font-weight: 600; }
+ .classify-candidate .bar-track { height: 7px; }
+ .classify-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+ .classify-field { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+ .classify-field span { color: var(--muted); font-size: 11px; }
+ .classify-field strong { font-size: 14px; }
+ .ok-text { color: var(--accent-2); }
+ .bad-text { color: var(--danger); }
++
++/* Bidirectional upload analysis */
++.upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
++.upload-card { display: flex; flex-direction: column; gap: 10px; }
++.upload-card textarea { width: 100%; resize: vertical; line-height: 1.6; }
++.upload-controls { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; }
++.upload-controls input[type="file"] {
++  flex: 1; min-width: 180px; padding: 8px 10px; color: var(--muted); font-size: 12px;
++  border: 1px dashed var(--border-strong); background: rgba(147, 170, 220, .04);
++}
++.upload-controls input[type="file"]::file-selector-button {
++  margin-right: 10px; padding: 6px 10px; border-radius: 8px;
++  border: 1px solid var(--border-strong); background: var(--panel-2);
++  color: var(--text); font: inherit; font-size: 12px; cursor: pointer;
++}
++.upload-preview {
++  border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
++  padding: 12px 14px; background: rgba(147, 170, 220, .04);
++}
++.upload-preview.empty { color: var(--faint); text-align: center; padding: 22px; }
++.upload-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
++.upload-preview-head strong { font-family: var(--mono); font-size: 13px; }
++.preview-text {
++  margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.65;
++  white-space: pre-wrap; max-height: 128px; overflow: auto;
++}
++.upload-analysis { display: grid; gap: 12px; }
++.upload-analysis-block {
++  border: 1px solid var(--border); border-radius: var(--radius-sm);
++  background: rgba(147, 170, 220, .035); padding: 14px;
++}
++.upload-analysis-block h4 { margin: 0; font-size: 14px; }
++.upload-analysis-block .panel-head { margin-bottom: 8px; }
++.upload-analysis-block .classify-candidates { margin: 8px 0 12px; }
++.upload-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
++.draft-note { margin-top: 10px; color: var(--faint); font-size: 11px; }
++.confirm-box {
++  display: flex; align-items: center; justify-content: space-between; gap: 14px;
++  border: 1px solid rgba(255, 180, 84, .3); border-radius: var(--radius-sm);
++  background: rgba(255, 180, 84, .07); padding: 12px 14px; margin-top: 10px;
++}
++.confirm-box strong { font-size: 13px; }
++.confirm-box p { margin: 4px 0 0; }
++.confirm-box.confirmed { align-items: flex-start; flex-direction: column; border-color: rgba(57, 210, 192, .35); background: rgba(57, 210, 192, .07); }
++.confirm-box details { width: 100%; }
++.confirm-box summary { cursor: pointer; color: var(--muted); font-size: 12px; }
++.draft-json {
++  max-height: 260px; overflow: auto; margin: 10px 0 0; padding: 12px;
++  background: var(--panel-solid); border: 1px solid var(--border); border-radius: 10px;
++  font-family: var(--mono); font-size: 11px; line-height: 1.5; white-space: pre-wrap;
++}
++
+ @media (max-width: 900px) {
+   .classify-result { grid-template-columns: 1fr; }
+   .classify-fields { grid-template-columns: 1fr; }
++  .upload-grid { grid-template-columns: 1fr; }
++  .upload-field-grid { grid-template-columns: 1fr; }
+ }
+ 
+ .resume-sheet { max-width: 1040px; margin: 0 auto; }
+ .resume-paper {
+   position: relative; overflow: hidden; background: var(--panel-solid);
+   border: 1px solid var(--border); border-radius: var(--radius);
+   padding: 28px 32px; box-shadow: var(--shadow);
+ }
+ .resume-paper::before {
+   content: ""; position: absolute; inset: 0 0 auto 0; height: 4px;
+
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,17 +1,25 @@
+ fastapi>=0.115
+ uvicorn>=0.30
+ numpy>=1.26
+ pandas>=2.2
+ scikit-learn>=1.4
+ scipy>=1.11
+ pytest>=8.0
+ httpx>=0.27
++# Required by FastAPI multipart file uploads (/upload/task, /upload/resume).
++python-multipart>=0.0.9
+ 
+ # --- Optional extras (not required; the app falls back automatically) ---
++# PDF text extraction for /upload/task and /upload/resume. When absent, PDF
++# uploads return a clear 422 and .txt/.md keep working.
++#   pip install pypdf
++# DOCX text extraction for /upload/task and /upload/resume. When absent, DOCX
++# uploads return a clear 422 and .txt/.md keep working.
++#   pip install python-docx
+ # Word segmentation for the NLP tokenizer (app/nlp/tokenizer.py). When
+ # absent, the tokenizer uses a character bigram fallback.
+ #   pip install jieba
+ # Char-level BIO CRF for resume section parsing (app/nlp/sections.py). When
+ # absent (or without a trained model artifact), the dictionary+rule parser is
+ # used instead.
+ #   pip install sklearn-crfsuite
+
+--- a/tests\test_upload.py
++++ b/tests\test_upload.py
+@@ -0,0 +1,495 @@
++"""Unit tests for secure upload text extraction and text analyzers.
++
++These tests cover the four documented formats, the optional-dependency
++fallback contract (a clear 422-shaped error instead of ``ImportError``), the
++10 MB limit, extension/MIME whitelists, filename sanitization, and the two
++analysis functions. No file is written to disk by any path under test.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import io
++import json
++import zipfile
++from datetime import datetime, timezone
++from types import SimpleNamespace
++
++import pytest
++
++from app.semantic import SemanticMatcher
++from app.upload import extract
++from app.upload.analyze import (
++    analyze_resume_text,
++    analyze_task_text,
++    build_task_draft,
++    task_from_analysis,
++    worker_from_draft,
++)
++from app.upload.extract import (
++    MAX_UPLOAD_BYTES,
++    UploadError,
++    extract_text,
++    sanitize_filename,
++)
++
++TASK_TEXT = (
++    "我们需要开发一个会员小程序，包含前端页面、接口联调和后台管理，"
++    "预算 8000-20000 元，30 天内交付，可以远程。"
++)
++
++RESUME_TEXT = """张三
++教育经历
++复旦大学 计算机科学与技术 本科
++工作经历
++2020 - 至今 云启科技 后端工程师
++负责接口开发与数据库设计
++技能
++Python、后端开发、数据库、接口、Figma
++期望薪资：15000 元/月
++上海 · 可远程
++"""
++
++
++# ---------------------------------------------------------------------------
++# Text extraction
++# ---------------------------------------------------------------------------
++
++
++def test_max_upload_limit_is_ten_megabytes():
++    assert MAX_UPLOAD_BYTES == 10 * 1024 * 1024
++
++
++def test_extract_txt_and_md_native():
++    assert extract_text("task.txt", "任务书正文".encode("utf-8")) == "任务书正文"
++    assert extract_text("resume.md", "# 简历\n后端工程师".encode("utf-8")) == "# 简历\n后端工程师"
++
++
++def test_extract_accepts_utf8_bom():
++    assert extract_text("task.txt", "\ufeff正文".encode("utf-8")) == "正文"
++
++
++def test_extract_rejects_unsupported_extension_with_clear_message():
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("payload.exe", b"MZ binary")
++    assert excinfo.value.status_code == 422
++    message = str(excinfo.value)
++    assert ".txt" in message and ".md" in message and ".pdf" in message and ".docx" in message
++
++
++def test_extract_rejects_oversized_file():
++    payload = b"x" * (MAX_UPLOAD_BYTES + 1)
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("big.txt", payload)
++    assert excinfo.value.status_code == 422
++    assert "10 MB" in str(excinfo.value)
++
++
++def test_extract_rejects_empty_file_and_empty_text():
++    with pytest.raises(UploadError):
++        extract_text("empty.txt", b"")
++    with pytest.raises(UploadError):
++        extract_text("blank.txt", b"   \n\t  ")
++
++
++def test_extract_rejects_binary_content_in_text_file():
++    with pytest.raises(UploadError):
++        extract_text("fake.txt", b"\x00\x01\x02binary\x00")
++
++
++def test_extract_rejects_mime_extension_mismatch():
++    with pytest.raises(UploadError):
++        extract_text("notes.txt", b"plain text", content_type="image/png")
++
++
++def test_extract_allows_generic_octet_stream():
++    assert extract_text(
++        "notes.txt", b"plain text", content_type="application/octet-stream"
++    ) == "plain text"
++
++
++def _run_body_limit_middleware(path: str, headers: list, chunks: list[bytes]):
++    """Drive the pure ASGI middleware directly and record handler calls."""
++    reached: list[bool] = []
++    sent: list[dict] = []
++
++    async def inner_app(scope, receive, send):
++        # Simulate form parsing: the body stream is consumed before the
++        # endpoint logic is considered reached.
++        while True:
++            message = await receive()
++            if not message.get("more_body", False):
++                break
++        reached.append(True)
++        await send(
++            {"type": "http.response.start", "status": 200, "headers": []}
++        )
++        await send({"type": "http.response.body", "body": b"ok"})
++
++    middleware = extract.UploadBodyLimitMiddleware(inner_app)
++    pending = [
++        {"type": "http.request", "body": chunk, "more_body": index < len(chunks) - 1}
++        for index, chunk in enumerate(chunks)
++    ]
++
++    async def receive():
++        if pending:
++            return pending.pop(0)
++        return {"type": "http.request", "body": b"", "more_body": False}
++
++    async def send(message):
++        sent.append(message)
++
++    scope = {"type": "http", "path": path, "headers": headers}
++    asyncio.run(middleware(scope, receive, send))
++    return reached, sent
++
++
++def test_content_length_over_limit_is_rejected_before_handler():
++    headers = [
++        (b"content-length", str(MAX_UPLOAD_BYTES + 1).encode("ascii"))
++    ]
++    reached, sent = _run_body_limit_middleware("/upload/task", headers, [b""])
++    assert reached == []
++    assert sent[0]["status"] == 413
++    assert "10 MB" in json.loads(sent[1]["body"])["detail"]
++
++
++def test_chunked_body_over_limit_never_reaches_handler(monkeypatch):
++    monkeypatch.setattr(extract, "MAX_UPLOAD_BYTES", 16)
++    reached, sent = _run_body_limit_middleware(
++        "/upload/task", [], [b"x" * 10, b"x" * 10]
++    )
++    assert reached == []
++    assert sent[0]["status"] == 413
++    assert "16 字节" in json.loads(sent[1]["body"])["detail"]
++
++
++def test_resume_analyze_json_body_has_the_same_cap():
++    headers = [
++        (b"content-length", str(MAX_UPLOAD_BYTES + 1).encode("ascii"))
++    ]
++    reached, sent = _run_body_limit_middleware(
++        "/resume/analyze", headers, [b""]
++    )
++    assert reached == []
++    assert sent[0]["status"] == 413
++
++
++def test_zip_bomb_like_docx_is_rejected_before_document_parse(monkeypatch):
++    document_calls: list[bool] = []
++
++    def _fake_document(stream):
++        document_calls.append(True)
++        return SimpleNamespace(paragraphs=[], tables=[])
++
++    # The ZIP expansion check must run even when python-docx is not installed,
++    # and it must reject before any Document parsing happens.
++    monkeypatch.setattr(
++        extract,
++        "_import_docx",
++        lambda: SimpleNamespace(Document=_fake_document),
++    )
++
++    buffer = io.BytesIO()
++    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
++        # 2 MB of zeros compresses to a few KB, well above the ratio budget.
++        archive.writestr("word/document.xml", b"0" * (2 * 1024 * 1024))
++
++    with pytest.raises(UploadError) as excinfo:
++        extract_text(
++            "bomb.docx",
++            buffer.getvalue(),
++            content_type=(
++                "application/vnd.openxmlformats-officedocument."
++                "wordprocessingml.document"
++            ),
++        )
++    assert "压缩" in str(excinfo.value) or "解压" in str(excinfo.value)
++    assert document_calls == []
++
++
++def test_pdf_page_cap_is_enforced(monkeypatch):
++    class FakePage:
++        def extract_text(self) -> str:
++            return "x"
++
++    class FakeReader:
++        is_encrypted = False
++        pages = [FakePage() for _ in range(extract.MAX_PDF_PAGES + 1)]
++
++    monkeypatch.setattr(
++        extract,
++        "_import_pypdf",
++        lambda: SimpleNamespace(PdfReader=lambda stream: FakeReader()),
++    )
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("big.pdf", b"%PDF-1.4\nfake")
++    assert "页数" in str(excinfo.value)
++
++
++def test_pdf_text_cap_is_enforced_during_page_iteration(monkeypatch):
++    class FakePage:
++        def extract_text(self) -> str:
++            return "x" * 200
++
++    class FakeReader:
++        is_encrypted = False
++        pages = [FakePage()]
++
++    monkeypatch.setattr(extract, "MAX_EXTRACTED_CHARS", 100)
++    monkeypatch.setattr(
++        extract,
++        "_import_pypdf",
++        lambda: SimpleNamespace(PdfReader=lambda stream: FakeReader()),
++    )
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("long.pdf", b"%PDF-1.4\nfake")
++    assert "文本过大" in str(excinfo.value)
++
++
++def test_sanitize_filename_strips_paths_and_control_characters():
++    assert sanitize_filename("../../etc/passwd.txt") == "passwd.txt"
++    assert sanitize_filename("C:\\Users\\me\\resume.md") == "resume.md"
++    assert sanitize_filename("bad\x00name.txt") == "badname.txt"
++    assert sanitize_filename("") == "document.txt"
++
++
++def test_pdf_without_optional_dependency_raises_clear_upload_error(monkeypatch):
++    def _missing():
++        raise ImportError("No module named 'pypdf'")
++
++    monkeypatch.setattr(extract, "_import_pypdf", _missing)
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("task.pdf", b"%PDF-1.4\nfake")
++    assert excinfo.value.status_code == 422
++    assert "pypdf" in str(excinfo.value)
++
++
++def test_docx_without_optional_dependency_raises_clear_upload_error(monkeypatch):
++    def _missing():
++        raise ImportError("No module named 'docx'")
++
++    monkeypatch.setattr(extract, "_import_docx", _missing)
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("resume.docx", b"PK\x03\x04fake")
++    assert excinfo.value.status_code == 422
++    assert "python-docx" in str(excinfo.value)
++
++
++def test_pdf_parsing_stays_in_memory_and_joins_pages(monkeypatch):
++    class FakePage:
++        def __init__(self, text: str) -> None:
++            self._text = text
++
++        def extract_text(self) -> str:
++            return self._text
++
++    class FakeReader:
++        def __init__(self, stream) -> None:
++            self.is_encrypted = False
++            self.pages = [FakePage("第一页"), FakePage("第二页")]
++
++    fake_pypdf = SimpleNamespace(PdfReader=FakeReader)
++    monkeypatch.setattr(extract, "_import_pypdf", lambda: fake_pypdf)
++
++    text = extract_text("task.pdf", b"%PDF-1.4\nfake")
++    assert "第一页" in text and "第二页" in text
++
++
++def test_docx_parses_with_the_real_optional_dependency_when_installed():
++    docx = pytest.importorskip("docx")
++    document = docx.Document()
++    document.add_heading("个人简历", level=1)
++    document.add_paragraph("2020 - 至今 云启科技 后端工程师")
++    document.add_paragraph("Python、接口、数据库")
++    buffer = io.BytesIO()
++    document.save(buffer)
++
++    text = extract_text(
++        "resume.docx",
++        buffer.getvalue(),
++        content_type=(
++            "application/vnd.openxmlformats-officedocument."
++            "wordprocessingml.document"
++        ),
++    )
++    assert "个人简历" in text
++    assert "Python" in text
++
++
++def test_docx_parsing_reads_paragraphs_and_tables(monkeypatch):
++    class FakeParagraph:
++        def __init__(self, text: str) -> None:
++            self.text = text
++
++    class FakeCell:
++        def __init__(self, text: str) -> None:
++            self.text = text
++
++    class FakeRow:
++        cells = [FakeCell("表格甲"), FakeCell("表格乙")]
++
++    class FakeTable:
++        rows = [FakeRow()]
++
++    class FakeDocument:
++        paragraphs = [FakeParagraph("简历正文"), FakeParagraph("")]
++        tables = [FakeTable()]
++
++    fake_docx = SimpleNamespace(Document=lambda stream: FakeDocument())
++    monkeypatch.setattr(extract, "_import_docx", lambda: fake_docx)
++
++    buffer = io.BytesIO()
++    with zipfile.ZipFile(buffer, "w") as archive:
++        archive.writestr("word/document.xml", b"<w:document/>")
++    text = extract_text("resume.docx", buffer.getvalue())
++    assert "简历正文" in text
++    assert "表格甲" in text and "表格乙" in text
++
++
++# ---------------------------------------------------------------------------
++# Task analysis
++# ---------------------------------------------------------------------------
++
++
++def test_analyze_task_text_extracts_category_fields_and_top3():
++    analysis = analyze_task_text(TASK_TEXT)
++
++    assert analysis["category"] == "software_dev"
++    assert analysis["label"] == "软件开发"
++    assert 0.0 <= analysis["confidence"] <= 1.0
++    assert len(analysis["top_categories"]) == 3
++    assert analysis["top_categories"][0]["category"] == "software_dev"
++
++    fields = analysis["fields"]
++    assert fields["budget"] == [8000.0, 20000.0]
++    assert fields["budget_min"] == 8000.0
++    assert fields["budget_max"] == 20000.0
++    assert fields["duration_days"] == 30
++    assert fields["remote_ok"] is True
++    assert {"frontend", "backend"} & set(fields["skills"])
++    assert fields["requirements"]
++
++
++def test_analyze_task_text_rejects_blank_text():
++    with pytest.raises(ValueError):
++        analyze_task_text("   ")
++
++
++def test_task_from_analysis_builds_a_recommendable_draft():
++    analysis = analyze_task_text(TASK_TEXT)
++    task = task_from_analysis(
++        analysis,
++        customer_id="c1",
++        text=TASK_TEXT,
++        task_id="draft_task_test",
++    )
++    draft = build_task_draft(task, analysis)
++
++    assert task.task_id == "draft_task_test"
++    assert task.customer_id == "c1"
++    assert task.status == "open"
++    assert task.required_skills
++    assert task.deadline > datetime.now(timezone.utc)
++    assert draft["task_id"] == "draft_task_test"
++    assert draft["status"] == "draft"
++    assert draft["deadline"].startswith("20")
++    assert draft["confidence"] == analysis["confidence"]
++
++
++# ---------------------------------------------------------------------------
++# Resume analysis
++# ---------------------------------------------------------------------------
++
++
++def test_analyze_resume_text_detects_skills_experience_and_profile():
++    analysis = analyze_resume_text(RESUME_TEXT)
++
++    assert "backend" in analysis["skills"]
++    assert "python" in analysis["skills"]
++    assert analysis["experience_years"] >= 6.0
++    assert analysis["region"] == "CN"
++    assert analysis["remote_preference"] is True
++    assert analysis["expected_pay"]["value"] == 15000.0
++    assert analysis["expected_pay"]["period"] == "月"
++    assert any(
++        item["category"] == "software_dev" for item in analysis["categories"]
++    )
++
++    draft = analysis["draft_worker"]
++    assert draft["worker_id"].startswith("draft_")
++    assert draft["skills"]["backend"] >= 1
++    assert draft["skills"]["python"] >= 1
++    assert draft["status"] == "active"
++    assert draft["region"] == "CN"
++    assert draft["remote_ok"] is True
++    # A monthly quote is not a per-task budget, so the Worker draft must not
++    # feed 15000 into pay_fit; the raw figure stays in the analysis payload.
++    assert draft["expected_pay"] == 0.0
++
++    worker = worker_from_draft(draft)
++    assert worker.worker_id == draft["worker_id"]
++    assert worker.skills["backend"] >= 1
++    assert isinstance(worker.preferred_difficulty, tuple)
++
++
++@pytest.mark.parametrize(
++    ("pay_text", "expected_value", "expected_period", "worker_pay"),
++    [
++        ("月薪 15000 元", 15000.0, "月", 0.0),
++        ("期望月薪 15000", 15000.0, "月", 0.0),
++        ("时薪 100 元", 100.0, "小时", 0.0),
++        ("期望时薪 100 元", 100.0, "小时", 0.0),
++        # Non-monthly/hourly forms remain per-task-compatible.
++        ("日薪 800 元", 800.0, "天", 800.0),
++        ("期望薪资 8000 元", 8000.0, None, 8000.0),
++        ("期望薪资：15000 元/月", 15000.0, "月", 0.0),
++    ],
++)
++def test_expected_pay_labels_drive_period_and_worker_pay(
++    pay_text, expected_value, expected_period, worker_pay
++):
++    analysis = analyze_resume_text(f"张三\n技能\nPython\n{pay_text}")
++
++    assert analysis["expected_pay"]["value"] == expected_value
++    assert analysis["expected_pay"]["period"] == expected_period
++    assert analysis["draft_worker"]["expected_pay"] == worker_pay
++
++
++def test_analyze_resume_text_rejects_blank_text():
++    with pytest.raises(ValueError):
++        analyze_resume_text("\n \t ")
++
++
++# ---------------------------------------------------------------------------
++# Upload-specific semantic cache hardening
++# ---------------------------------------------------------------------------
++
++
++def test_semantic_pair_cache_is_bounded(monkeypatch):
++    matcher = SemanticMatcher(provider="tfidf_svd")
++    matcher.fit(
++        ["worker text alpha", "worker text beta"],
++        ["task text gamma", "task text delta"],
++    )
++    monkeypatch.setattr(SemanticMatcher, "MAX_CACHE_ENTRIES", 5)
++    for index in range(20):
++        matcher.similarity(
++            f"unseen task text {index}", f"unseen worker text {index}"
++        )
++    assert len(matcher._cache) <= 5
++
++
++def test_semantic_vector_cache_is_bounded(monkeypatch):
++    matcher = SemanticMatcher(provider="tfidf_svd")
++    matcher.fit(
++        ["worker text alpha", "worker text beta"],
++        ["task text gamma", "task text delta"],
++    )
++    monkeypatch.setattr(SemanticMatcher, "MAX_VECTOR_ENTRIES", 5)
++    for index in range(20):
++        matcher.similarity(
++            f"fresh task vector {index}", f"fresh worker vector {index}"
++        )
++    assert len(matcher._vectors) <= 5
+
+--- a/tests\test_upload_api.py
++++ b/tests\test_upload_api.py
+@@ -0,0 +1,293 @@
++"""API tests for multipart upload analysis and resume paste analysis.
++
++The critical invariant is that both upload directions are *read-only*: they
++return a draft plus Top-N candidates and never mutate the store or persist the
++uploaded bytes.
++"""
++
++from __future__ import annotations
++
++import tempfile
++
++from starlette.formparsers import MultiPartParser
++
++from app.upload import extract
++
++TASK_TEXT = (
++    "我们需要开发一个会员小程序，包含前端页面、接口联调和后台管理，"
++    "预算 8000-20000 元，30 天内交付，可以远程。"
++)
++
++RESUME_TEXT = """张三
++教育经历
++复旦大学 计算机科学与技术 本科
++工作经历
++2020 - 至今 云启科技 后端工程师
++负责接口开发与数据库设计
++技能
++Python、后端开发、数据库、接口、Figma
++期望薪资：15000 元/月
++上海 · 可远程
++"""
++
++
++def _upload(
++    client,
++    url: str,
++    filename: str,
++    content: bytes,
++    *,
++    content_type: str = "text/plain",
++    top_n: int = 3,
++):
++    return client.post(
++        url,
++        files={"file": (filename, content, content_type)},
++        data={"top_n": str(top_n)},
++    )
++
++
++def _store_snapshot(store) -> dict:
++    return {
++        "workers": sorted(store.workers),
++        "tasks": sorted(store.tasks),
++        "customers": sorted(store.customers),
++        "assignments": list(store.assignments),
++        "feedback": list(store.feedback),
++        "events": list(store.events),
++        "impressions": list(store.impressions),
++        "profiles": sorted(store.profiles),
++        "worker_preferences": sorted(store.worker_preferences),
++        "customer_preferences": sorted(store.customer_preferences),
++    }
++
++
++def test_upload_task_txt_returns_analysis_draft_and_top_workers(client, small_store):
++    before = _store_snapshot(small_store)
++
++    response = _upload(
++        client, "/upload/task", "task.txt", TASK_TEXT.encode("utf-8")
++    )
++    assert response.status_code == 200, response.text
++    body = response.json()
++
++    assert body["kind"] == "task"
++    assert body["persisted"] is False
++    assert body["filename"] == "task.txt"
++    assert body["size_bytes"] == len(TASK_TEXT.encode("utf-8"))
++    assert TASK_TEXT[:20] in body["text_preview"]
++    assert body["request_id"]
++
++    analysis = body["analysis"]
++    assert analysis["category"] == "software_dev"
++    assert analysis["fields"]["budget"] == [8000.0, 20000.0]
++    assert analysis["fields"]["duration_days"] == 30
++    assert len(analysis["top_categories"]) == 3
++
++    draft = body["draft"]
++    assert draft["task_id"].startswith("draft_task_")
++    assert draft["customer_id"] == "c1"
++    assert draft["category"] == "software_dev"
++    assert draft["required_skills"]
++    assert draft["status"] == "draft"
++
++    candidates = body["candidates"]
++    assert 1 <= len(candidates) <= 3
++    for candidate in candidates:
++        assert candidate["candidate_id"] in small_store.workers
++        assert {"score", "breakdown", "reasons", "cold_start"} <= set(candidate)
++
++    assert _store_snapshot(small_store) == before
++
++
++def test_upload_task_rejects_unsupported_extension(client):
++    response = _upload(
++        client, "/upload/task", "payload.exe", b"MZ binary", content_type="application/octet-stream"
++    )
++    assert response.status_code == 422
++    assert ".txt" in response.json()["detail"]
++
++
++def test_upload_task_rejects_oversized_file_before_form_parsing(client):
++    response = _upload(
++        client,
++        "/upload/task",
++        "task.txt",
++        b"x" * (extract.MAX_UPLOAD_BYTES + 1),
++    )
++    assert response.status_code == 413
++    assert "10 MB" in response.json()["detail"]
++
++
++def test_upload_task_rejects_mime_mismatch(client):
++    response = _upload(
++        client,
++        "/upload/task",
++        "task.txt",
++        b"plain text",
++        content_type="image/png",
++    )
++    assert response.status_code == 422
++    assert "类型" in response.json()["detail"] or "mime" in response.json()["detail"].lower()
++
++
++def test_upload_pdf_without_optional_dependency_returns_422(client, monkeypatch):
++    def _missing():
++        raise ImportError("No module named 'pypdf'")
++
++    monkeypatch.setattr(extract, "_import_pypdf", _missing)
++    response = _upload(
++        client,
++        "/upload/task",
++        "task.pdf",
++        b"%PDF-1.4\nfake",
++        content_type="application/pdf",
++    )
++    assert response.status_code == 422
++    assert "pypdf" in response.json()["detail"]
++
++
++def test_upload_docx_without_optional_dependency_returns_422(client, monkeypatch):
++    def _missing():
++        raise ImportError("No module named 'docx'")
++
++    monkeypatch.setattr(extract, "_import_docx", _missing)
++    response = _upload(
++        client,
++        "/upload/resume",
++        "resume.docx",
++        b"PK\x03\x04fake",
++        content_type=(
++            "application/vnd.openxmlformats-officedocument."
++            "wordprocessingml.document"
++        ),
++    )
++    assert response.status_code == 422
++    assert "python-docx" in response.json()["detail"]
++
++
++def test_upload_resume_txt_returns_profile_draft_and_top_tasks(client, small_store):
++    before = _store_snapshot(small_store)
++
++    response = _upload(
++        client, "/upload/resume", "resume.txt", RESUME_TEXT.encode("utf-8")
++    )
++    assert response.status_code == 200, response.text
++    body = response.json()
++
++    assert body["kind"] == "resume"
++    assert body["persisted"] is False
++    assert body["filename"] == "resume.txt"
++    assert "张三" in body["text_preview"]
++
++    analysis = body["analysis"]
++    assert "backend" in analysis["skills"]
++    assert "python" in analysis["skills"]
++    assert analysis["experience_years"] >= 6.0
++    assert analysis["expected_pay"]["value"] == 15000.0
++    assert analysis["categories"]
++
++    draft = body["draft"]
++    assert draft["worker_id"].startswith("draft_")
++    assert draft["skills"]["python"] >= 1
++    assert draft["status"] == "active"
++    assert draft["expected_pay"] == 0.0  # monthly quote is not per-task pay
++    assert body["draft"] is not None
++
++    candidates = body["candidates"]
++    assert 1 <= len(candidates) <= 3
++    for candidate in candidates:
++        assert candidate["candidate_id"] in small_store.tasks
++        assert {"score", "breakdown", "reasons", "cold_start"} <= set(candidate)
++
++    # No uploaded data was written back to the store.
++    assert _store_snapshot(small_store) == before
++
++
++def test_resume_analyze_json_paste_returns_top_tasks(client, small_store):
++    before = _store_snapshot(small_store)
++
++    response = client.post(
++        "/resume/analyze", json={"text": RESUME_TEXT, "top_n": 2}
++    )
++    assert response.status_code == 200, response.text
++    body = response.json()
++
++    assert body["kind"] == "resume"
++    assert body["filename"] is None
++    assert body["persisted"] is False
++    assert body["analysis"]["draft_worker"]["skills"]["backend"] >= 1
++    assert 1 <= len(body["candidates"]) <= 2
++    assert _store_snapshot(small_store) == before
++
++
++def test_resume_analyze_rejects_blank_text(client):
++    response = client.post("/resume/analyze", json={"text": "    "})
++    assert response.status_code == 422
++
++
++def test_resume_analyze_validates_top_n(client):
++    response = client.post(
++        "/resume/analyze", json={"text": RESUME_TEXT, "top_n": 0}
++    )
++    assert response.status_code == 422
++
++
++def test_upload_endpoints_do_not_persist_uploaded_files(
++    client, tmp_path, monkeypatch
++):
++    framework_tmp = tmp_path / "framework_tmp"
++    framework_tmp.mkdir()
++    monkeypatch.setattr(tempfile, "tempdir", str(framework_tmp))
++    # Accepted uploads stay in RAM: the spool threshold is at least the body
++    # cap, so no accepted file part should roll to the framework temp dir.
++    assert MultiPartParser.spool_max_size >= extract.MAX_UPLOAD_BYTES
++
++    before = sorted(str(path) for path in tmp_path.rglob("*"))
++
++    assert _upload(
++        client, "/upload/task", "task.txt", TASK_TEXT.encode("utf-8")
++    ).status_code == 200
++    assert _upload(
++        client, "/upload/resume", "resume.txt", RESUME_TEXT.encode("utf-8")
++    ).status_code == 200
++    assert client.post(
++        "/resume/analyze", json={"text": RESUME_TEXT, "top_n": 3}
++    ).status_code == 200
++
++    after = sorted(str(path) for path in tmp_path.rglob("*"))
++    assert after == before
++    assert list(framework_tmp.iterdir()) == []
++
++
++def test_upload_openapi_documents_multipart_contract(client):
++    spec = client.get("/openapi.json").json()
++    for path in ("/upload/task", "/upload/resume"):
++        request_body = spec["paths"][path]["post"]["requestBody"]
++        assert request_body["required"] is True
++        schema = request_body["content"]["multipart/form-data"]["schema"]
++        assert schema["required"] == ["file"]
++        assert schema["properties"]["file"]["type"] == "string"
++        assert schema["properties"]["file"]["format"] == "binary"
++        assert schema["properties"]["top_n"]["minimum"] == 1
++        assert schema["properties"]["top_n"]["maximum"] == 50
++
++
++def test_upload_ui_has_two_cards_and_no_auto_write_copy(client):
++    page = client.get("/ui/")
++    assert page.status_code == 200
++    for needle in (
++        "上传任务书",
++        "输入/上传简历",
++        "upload-task-file",
++        "resume-file",
++        "upload-task-confirm",
++        "resume-confirm",
++    ):
++        assert needle in page.text
++
++    script = client.get("/ui/app.js")
++    assert script.status_code == 200
++    assert "runUploadTask" in script.text
++    assert "runResumeAnalyze" in script.text
++    assert "confirmDraft" in script.text
+

@@ -1,0 +1,71 @@
+{"id":"h001","slice":"paraphrase","category":"software_dev","text":"我们想开发一个微信小程序，包含会员积分、下单支付和后台管理，预算 8000–30000 元，希望 30 天内交付，截止 2026-12-20，可以远程协作。要求熟悉微信小程序和支付接口。","fields":{"budget_min":8000,"budget_max":30000,"duration_days":30,"date":"2026-12-20","remote_ok":true,"skills":["frontend","backend"]}}
+{"id":"h002","slice":"paraphrase","category":"software_dev","text":"帮公司搭一个内部 ERP 库存系统，涉及接口联调、数据库设计和部署上线，预算 2 万左右，一个月内完成，支持远程。","fields":{"budget_min":20000,"budget_max":20000,"duration_days":30,"remote_ok":true,"skills":["backend","devops"]}}
+{"id":"h003","slice":"paraphrase","category":"ui_ux_design","text":"App 首页和下单流程要重新设计，需要 Figma 原型、线框图和设计规范，预算 6000–15000 元，两周交付，截止 2026-11-30，支持远程。","fields":{"budget_min":6000,"budget_max":15000,"duration_days":14,"date":"2026-11-30","remote_ok":true,"skills":["ui","ux"]}}
+{"id":"h004","slice":"paraphrase","category":"ui_ux_design","text":"我们现有 B 端后台交互太绕，想梳理信息架构并输出高保真原型，最好能做可用性测试，线上协作即可。","fields":{"remote_ok":true,"skills":["ux","ui"]}}
+{"id":"h005","slice":"paraphrase","category":"brand_design","text":"需要一套品牌 Logo、包装和门店物料设计，预算 5000 元，10 天交付，截止 2026-12-05，需线下沟通。","fields":{"budget_min":5000,"budget_max":5000,"duration_days":10,"date":"2026-12-05","remote_ok":false,"skills":["brand","graphic_design"]}}
+{"id":"h006","slice":"paraphrase","category":"brand_design","text":"新品牌要建视觉识别体系，包括标志、字体、色彩和礼盒包装，最好能出品牌手册，预算 1.2 万，两周内。","fields":{"budget_min":12000,"budget_max":12000,"duration_days":14,"skills":["brand","graphic_design"]}}
+{"id":"h007","slice":"paraphrase","category":"content_writing","text":"写一篇行业白皮书，要求逻辑清晰、有数据引用，预算 3000 元，一周交付，截止 2026-12-01，远程即可。","fields":{"budget_min":3000,"budget_max":3000,"duration_days":7,"date":"2026-12-01","remote_ok":true,"skills":["writing","research"]}}
+{"id":"h008","slice":"paraphrase","category":"content_writing","text":"帮我们官网重写产品介绍和客户案例，顺便写几篇公众号文章，稿费 4000 元，十天内交稿。","fields":{"budget_min":4000,"budget_max":4000,"duration_days":10,"skills":["writing","editing"]}}
+{"id":"h009","slice":"paraphrase","category":"video_production","text":"拍一支 30 秒的抖音投放短视频，包含脚本、拍摄和剪辑，预算 8000 元，10 天交付，截止 2026-12-15，需要线下拍摄。","fields":{"budget_min":8000,"budget_max":8000,"duration_days":10,"date":"2026-12-15","remote_ok":false,"skills":["video","shooting","video_editing"]}}
+{"id":"h010","slice":"paraphrase","category":"video_production","text":"做一个两分钟的产品功能介绍视频，要有分镜、配音和字幕，预算 1.5 万，三周内完成。","fields":{"budget_min":15000,"budget_max":15000,"duration_days":21,"skills":["video","audio"]}}
+{"id":"h011","slice":"paraphrase","category":"marketing_campaign","text":"策划双十一促销活动，包含投放、物料和复盘，预算 2 万，两周交付，截止 2026-12-10，支持远程。","fields":{"budget_min":20000,"budget_max":20000,"duration_days":14,"date":"2026-12-10","remote_ok":true,"skills":["marketing","analytics"]}}
+{"id":"h012","slice":"paraphrase","category":"marketing_campaign","text":"商场周年庆要做整合营销，线上投放加线下活动，需要渠道排期和复盘报告，预算 3 万左右。","fields":{"budget_min":30000,"budget_max":30000,"skills":["marketing","creative"]}}
+{"id":"h013","slice":"paraphrase","category":"data_annotation","text":"对 10 万张道路图片做标注，按规范交付并接受质检，预算 9000 元，20 天交付，截止 2026-12-25，远程。","fields":{"budget_min":9000,"budget_max":9000,"duration_days":20,"date":"2026-12-25","remote_ok":true,"count":100000,"skills":["data_labeling","qa_labeling"]}}
+{"id":"h014","slice":"paraphrase","category":"data_annotation","text":"有 5 万条语音对话需要转写成文本并做意图标注，要保证一致率，配合抽检返修。","fields":{"count":50000,"skills":["data_labeling","qa_labeling"]}}
+{"id":"h015","slice":"paraphrase","category":"translation_localization","text":"把产品说明书翻译成英文和日文，要求术语统一，预算 6000 元，一周交付，截止 2026-12-03，远程。","fields":{"budget_min":6000,"budget_max":6000,"duration_days":7,"date":"2026-12-03","remote_ok":true,"languages":["英文","日文"],"skills":["translation"]}}
+{"id":"h016","slice":"paraphrase","category":"translation_localization","text":"SaaS 产品要出海，需要把界面文案和帮助文档本地化成中文、英文和日文，并整理术语表。","fields":{"languages":["中文","英文","日文"],"skills":["localization","translation"]}}
+{"id":"h017","slice":"paraphrase","category":"ecommerce_ops","text":"负责天猫店铺日常运营和活动报名，对 GMV 负责，预算 15000 元，一个月交付，截止 2026-12-31，远程。","fields":{"budget_min":15000,"budget_max":15000,"duration_days":30,"date":"2026-12-31","remote_ok":true,"skills":["ecommerce","operations"]}}
+{"id":"h018","slice":"paraphrase","category":"ecommerce_ops","text":"帮我们的抖音小店做投放和私域复购，优化商品页和转化率，最好有独立站经验。","fields":{"skills":["ecommerce","marketing","analytics"]}}
+{"id":"h019","slice":"paraphrase","category":"recruitment","text":"招聘一名电池工艺工程师，要求 3 年以上经验，预算 10000 元，30 天交付，截止 2026-12-28，支持远程。","fields":{"budget_min":10000,"budget_max":10000,"duration_days":30,"date":"2026-12-28","remote_ok":true,"experience":3.0,"skills":["recruiting"]}}
+{"id":"h020","slice":"paraphrase","category":"recruitment","text":"制造业要批量招班组长，需要候选人寻访和面试安排，希望 40 天内到岗。","fields":{"duration_days":40,"skills":["recruiting","sourcing","interviewing"]}}
+{"id":"h021","slice":"paraphrase","category":"consulting_research","text":"做一份县域文旅产业升级调研报告，需要访谈和数据分析，预算 2 万，30 天交付，截止 2026-12-30，远程。","fields":{"budget_min":20000,"budget_max":20000,"duration_days":30,"date":"2026-12-30","remote_ok":true,"skills":["research","consulting","analysis"]}}
+{"id":"h022","slice":"paraphrase","category":"consulting_research","text":"帮我们对 SaaS 行业做竞品分析，访谈几家头部客户并输出汇报材料，预算 2.5 万。","fields":{"budget_min":25000,"budget_max":25000,"skills":["research","analysis"]}}
+{"id":"h023","slice":"paraphrase","category":"training_course","text":"给新员工做信息安全培训，需要课件和考试，预算 8000 元，15 天交付，截止 2026-12-12，支持远程。","fields":{"budget_min":8000,"budget_max":8000,"duration_days":15,"date":"2026-12-12","remote_ok":true,"skills":["training_design","content_development","security"]}}
+{"id":"h024","slice":"paraphrase","category":"training_course","text":"连锁门店店长要做管理训练营，需要课程设计和讲师手册，最好能现场授课。","fields":{"remote_ok":false,"skills":["training_design","content_development"]}}
+{"id":"h025","slice":"typo","category":"software_dev","text":"我们要做一个微信小程续，包含会员积分、下单支付和后台管理，希望有相关开发经验，预算 1 万，支持远程。","fields":{"budget_min":10000,"budget_max":10000,"remote_ok":true}}
+{"id":"h026","slice":"typo","category":"ui_ux_design","text":"帮我们重新设计 App 首页和下单流程，需要 Figma 原形和设计规范。","fields":{"skills":["ui","ux"]}}
+{"id":"h027","slice":"typo","category":"brand_design","text":"需要一套品牌 Logo、包庄和门店物料设计。","fields":{"skills":["brand","graphic_design"]}}
+{"id":"h028","slice":"typo","category":"content_writing","text":"写一篇行业白皮书，要求罗辑清晰、有数据引用。","fields":{"skills":["writing"]}}
+{"id":"h029","slice":"typo","category":"video_production","text":"拍一支 30 秒的抖音投放短视频，包含脚本、拍摄和剪缉。","fields":{"skills":["video","shooting"]}}
+{"id":"h030","slice":"typo","category":"data_annotation","text":"对 10 万张道路图片做标住，按规范交付并接受质检。","fields":{"count":100000}}
+{"id":"h031","slice":"typo","category":"recruitment","text":"招聘一名电池工艺工程湿，要求 3 年以上经验。","fields":{"experience":3.0}}
+{"id":"h032","slice":"typo","category":"consulting_research","text":"做一份县域文旅产业调妍报告，需要访谈和数据分析。","fields":{}}
+{"id":"h033","slice":"typo","category":"translation_localization","text":"把产品说明书翻译成英文和日文，要求述语统一。","fields":{"languages":["英文","日文"]}}
+{"id":"h034","slice":"paraphrase","category":"ecommerce_ops","text":"我们有个京东店需要日常托管，负责活动报名、商品页优化和转化率提升，预算 8000 元一个月，远程。","fields":{"budget_min":8000,"budget_max":8000,"duration_days":30,"remote_ok":true,"skills":["ecommerce"]}}
+{"id":"h035","slice":"paraphrase","category":"marketing_campaign","text":"新消费品牌要做新品上市 campaign，包含创意、渠道和投放预算规划，需要复盘。","fields":{"skills":["marketing","creative","analytics"]}}
+{"id":"h036","slice":"paraphrase","category":"training_course","text":"开发一门跨境电商运营实战课程，包含大纲、课件和考试评估。","fields":{"skills":["training_design","content_development"]}}
+{"id":"h037","slice":"paraphrase","category":"video_production","text":"文旅景区要拍招商宣传片，从分镜到成片全包，最好有航拍。","fields":{"skills":["video","shooting","video_editing"]}}
+{"id":"h038","slice":"paraphrase","category":"consulting_research","text":"给连锁餐饮做选址和单店模型咨询，需要测算和诊断报告。","fields":{"skills":["consulting","analysis"]}}
+{"id":"h039","slice":"paraphrase","category":"data_annotation","text":"医疗影像要做病灶区域标注，按规范批量交付，接受质检抽检。","fields":{"skills":["data_labeling","qa_labeling"]}}
+{"id":"h040","slice":"paraphrase","category":"recruitment","text":"帮 AI 创业公司搭建算法团队，寻访候选人并协调面试与 Offer。","fields":{"skills":["recruiting","sourcing","interviewing"]}}
+{"id":"h041","slice":"ambiguous","category":null,"text":"帮我做个东西，越快越好。","fields":{}}
+{"id":"h042","slice":"ambiguous","category":null,"text":"有个活需要人帮忙，预算不高，先聊聊。","fields":{}}
+{"id":"h043","slice":"paraphrase","category":"software_dev","text":"物流司机端 App 要改版，需要前端和后端联调，预算 2.5 万，45 天内上线，截止 2026-12-31，支持远程。","fields":{"budget_min":25000,"budget_max":25000,"duration_days":45,"date":"2026-12-31","remote_ok":true,"skills":["frontend","backend"]}}
+{"id":"h044","slice":"paraphrase","category":"content_writing","text":"写一篇金融科技行业的深度文章，需要选题、资料整理和成稿，费用 6000 元，两周交稿，截止 2026-12-18，远程。","fields":{"budget_min":6000,"budget_max":6000,"duration_days":14,"date":"2026-12-18","remote_ok":true,"skills":["writing","research"]}}
+{"id":"h045","slice":"paraphrase","category":"brand_design","text":"咖啡烘焙品牌要门店物料设计，包含菜单、海报和杯贴，预算 9000 元，一周交付，截止 2026-12-08，线下对接。","fields":{"budget_min":9000,"budget_max":9000,"duration_days":7,"date":"2026-12-08","remote_ok":false,"skills":["brand","graphic_design"]}}
+{"id":"h046","slice":"paraphrase","category":"translation_localization","text":"把法律合同翻译成英文和中文，需要审校，预算 5000 元，5 天交付，截止 2026-12-02，远程。","fields":{"budget_min":5000,"budget_max":5000,"duration_days":5,"date":"2026-12-02","remote_ok":true,"languages":["英文","中文"],"skills":["translation","editing"]}}
+{"id":"h047","slice":"paraphrase","category":"ecommerce_ops","text":"出海品牌要做 Amazon Listing 优化，预算 7000 元，20 天，远程。","fields":{"budget_min":7000,"budget_max":7000,"duration_days":20,"remote_ok":true,"skills":["ecommerce"]}}
+{"id":"h200","slice":"hard","category":"software_dev","text":"帮我们做一套线上的会员积分与下单工具，配一个管理页面，要求能自动结算积分并提供维护文档，预算 1.2 万，30 天内完成，支持远程。","fields":{"budget_min":12000,"budget_max":12000,"duration_days":30,"remote_ok":true}}
+{"id":"h201","slice":"hard","category":"software_dev","text":"把线下门店的订单结算改成线上自助办理，会员可以随时查询积分和下单，需要一个能多人同时使用的管理页面。","fields":{}}
+{"id":"h202","slice":"hard","category":"ui_ux_design","text":"把手机端首页和下单流程重新理一理，做出可点击的页面草图和线框，并统一视觉风格，最好能找人试用反馈，两周内完成。","fields":{"duration_days":14}}
+{"id":"h203","slice":"hard","category":"ui_ux_design","text":"我们现有管理后台的操作步骤太长，想简化并重新规划信息层级，做出能点着试的页面草图，预算 8000 元。","fields":{"budget_min":8000,"budget_max":8000}}
+{"id":"h204","slice":"hard","category":"brand_design","text":"给一家新店定一套标志、包装和门店陈列物料的视觉方案，最好出一份统一的手册，一周内交付，需线下对接。","fields":{"duration_days":7,"remote_ok":false}}
+{"id":"h205","slice":"hard","category":"brand_design","text":"想给一家咖啡店建立统一的视觉形象，包括门店的菜单、海报和纸杯，最好能出一份手册。","fields":{}}
+{"id":"h206","slice":"hard","category":"content_writing","text":"帮我们写几篇官网和公众号的稿子，需要自己查资料、搭提纲，最后交付可发布的成文，费用 3000 元。","fields":{"budget_min":3000,"budget_max":3000}}
+{"id":"h207","slice":"hard","category":"content_writing","text":"整理一份面向客户的行业深度内容，要求事实可查、引用有出处，一周内交稿，远程即可。","fields":{"duration_days":7,"remote_ok":true}}
+{"id":"h208","slice":"hard","category":"video_production","text":"做一条 30 秒的投放用竖屏片子，从脚本、现场录制到最后的成片和配乐字幕都要包，预算 9000 元。","fields":{"budget_min":9000,"budget_max":9000}}
+{"id":"h209","slice":"hard","category":"video_production","text":"客户要一条一分钟的产品介绍短片，需要前期的画面脚本和后期包装，最好有配音和字幕，三周内完成。","fields":{"duration_days":21}}
+{"id":"h210","slice":"hard","category":"marketing_campaign","text":"商场店庆要做一波整体方案，线上广告加线下活动，需要渠道排期和最后的总结材料，预算 2 万。","fields":{"budget_min":20000,"budget_max":20000}}
+{"id":"h211","slice":"hard","category":"marketing_campaign","text":"新品牌上市要做预热和渠道宣传，把声量做起来，最后给一份总结。","fields":{}}
+{"id":"h212","slice":"hard","category":"data_annotation","text":"对 10 万张道路图片逐张做标记并整理成训练数据，按统一规则交付，接受抽查，20 天内完成。","fields":{"count":100000,"duration_days":20}}
+{"id":"h213","slice":"hard","category":"data_annotation","text":"有 5 万条通话录音需要转成文字并做意图归类，要保证前后一致，配合返修。","fields":{"count":50000}}
+{"id":"h214","slice":"hard","category":"translation_localization","text":"把产品说明书改成英文和日文两个版本，需要统一专业用词，预算 6000 元，一周交付。","fields":{"budget_min":6000,"budget_max":6000,"duration_days":7,"languages":["英文","日文"]}}
+{"id":"h215","slice":"hard","category":"translation_localization","text":"SaaS 产品要面向海外市场，需要把界面上的文字和帮助文档都适配成中文、英文和日文三种语言，并整理一份用词对照表。","fields":{"languages":["中文","英文","日文"]}}
+{"id":"h216","slice":"hard","category":"ecommerce_ops","text":"负责一家网店的日常打理，对成交额和复购负责，还要优化商品页面，预算 8000 元，一个月，远程。","fields":{"budget_min":8000,"budget_max":8000,"duration_days":30,"remote_ok":true}}
+{"id":"h217","slice":"hard","category":"ecommerce_ops","text":"帮我们的网店做付费获客和会员召回，提升下单转化，最好有跨境平台经验。","fields":{}}
+{"id":"h218","slice":"hard","category":"recruitment","text":"帮我们物色一位电池工艺方向的工程人员，要求三年以上经验，协助安排面谈和后续沟通，预算 1 万，30 天内完成。","fields":{"budget_min":10000,"budget_max":10000,"duration_days":30,"experience":3.0}}
+{"id":"h219","slice":"hard","category":"recruitment","text":"公司要补齐制造方向的基层管理人员，希望对方能提供人选并帮忙约谈，40 天内完成。","fields":{"duration_days":40}}
+{"id":"h220","slice":"hard","category":"consulting_research","text":"针对县域文旅产业做一份现状分析，需要跟业内人士聊一聊并整理数据，最后给出建议，预算 2 万，30 天内交付。","fields":{"budget_min":20000,"budget_max":20000,"duration_days":30}}
+{"id":"h221","slice":"hard","category":"consulting_research","text":"帮我们对 SaaS 行业做竞对分析，约谈几家头部客户，最后输出可以汇报的结论，支持远程。","fields":{"remote_ok":true}}
+{"id":"h222","slice":"hard","category":"training_course","text":"给新员工讲一次信息安全的内容，需要准备讲义、练习和小测验，最好能现场讲授，预算 8000 元。","fields":{"budget_min":8000,"budget_max":8000,"remote_ok":false}}
+{"id":"h223","slice":"hard","category":"training_course","text":"连锁门店店长要参加一个四周的管理能力提升项目，需要提前设计内容和作业，结业时做测评。","fields":{"duration_days":28}}

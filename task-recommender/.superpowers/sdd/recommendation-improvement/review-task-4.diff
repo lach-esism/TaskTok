@@ -1,0 +1,213 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-3 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\data\synthetic.py
+CHANGED tests\test_synthetic.py
+
+## Diff
+
+--- a/app\data\synthetic.py
++++ b/app\data\synthetic.py
+@@ -4,21 +4,30 @@
+ worker reliability, task outcomes, breaches, and customer ratings so the
+ recommender and chain modules have realistic interaction history to score.
+ """
+ 
+ from __future__ import annotations
+ 
+ import random
+ from datetime import datetime, timedelta, timezone
+ 
+ from app.data.latent import true_weight_simplex
+-from app.domain import Assignment, Customer, Dataset, Feedback, Task, Worker
++from app.domain import (
++    Assignment,
++    Customer,
++    Dataset,
++    Feedback,
++    Impression,
++    RecommendationEvent,
++    Task,
++    Worker,
++)
+ 
+ CATEGORIES = [
+     "software_dev",
+     "ui_ux_design",
+     "brand_design",
+     "content_writing",
+     "video_production",
+     "marketing_campaign",
+     "data_annotation",
+     "translation_localization",
+@@ -540,20 +549,22 @@
+                 budget=posting["budget"],
+                 requirements=posting["requirements"],
+                 budget_min=posting["budget_min"],
+                 budget_max=posting["budget_max"],
+                 created_at=created_at,
+             )
+         )
+ 
+     assignments: list[Assignment] = []
+     feedback: list[Feedback] = []
++    impressions: list[Impression] = []
++    events: list[RecommendationEvent] = []
+     attempts = 0
+     max_attempts = n_assignments * 30
+     while len(assignments) < n_assignments and attempts < max_attempts:
+         attempts += 1
+         task = rng.choice(tasks)
+         assignment_time = task.created_at + timedelta(
+             days=rng.randint(0, 10), hours=rng.randint(0, 23)
+         )
+         candidates = [
+             worker
+@@ -644,20 +655,80 @@
+             task_id=task.task_id,
+             worker_id=worker.worker_id,
+             customer_id=task.customer_id,
+             status=status,
+             on_time=on_time,
+             rework_count=rework_count,
+             breach_type=breach_type,
+             created_at=assignment_time,
+         )
+         assignments.append(assignment)
++
++        # Log the synthetic recommendation context for this assignment: every
++        # candidate's logging-policy weight is normalized into a propensity so
++        # downstream learning can correct for the choice policy.
++        logging_weights = {
++            candidate.worker_id: weight(candidate) for candidate in candidates
++        }
++        total_logging_weight = sum(logging_weights.values())
++        candidate_ids = [
++            candidate.worker_id for candidate in candidates
++        ]
++        propensities = {
++            candidate_id: candidate_weight / total_logging_weight
++            for candidate_id, candidate_weight in logging_weights.items()
++        }
++        request_id = f"r{len(impressions) + 1:06d}"
++        impression = Impression(
++            request_id=request_id,
++            query_id=task.task_id,
++            candidate_ids=candidate_ids,
++            propensities=propensities,
++            policy="synthetic_weighted",
++            created_at=assignment_time,
++            metadata={"assignment_id": assignment.assignment_id},
++        )
++        impressions.append(impression)
++
++        event_metadata = {"assignment_id": assignment.assignment_id}
++
++        def make_event(
++            candidate_id: str, action: str
++        ) -> RecommendationEvent:
++            return RecommendationEvent(
++                event_id=f"e{len(events) + 1:06d}",
++                request_id=request_id,
++                user_id=task.customer_id,
++                role="customer",
++                task_id=task.task_id,
++                candidate_id=candidate_id,
++                candidate_type="worker",
++                rank=candidate_ids.index(candidate_id) + 1,
++                score=logging_weights[candidate_id],
++                propensity=propensities[candidate_id],
++                weights_version="v0000",
++                action=action,
++                created_at=assignment_time,
++                metadata=dict(event_metadata),
++            )
++
++        events.append(make_event(worker.worker_id, "accept"))
++        unchosen_ids = [
++            candidate_id
++            for candidate_id in candidate_ids
++            if candidate_id != worker.worker_id
++        ]
++        for candidate_id in rng.sample(
++            unchosen_ids, k=min(20, len(unchosen_ids))
++        ):
++            action = "reject" if rng.random() < 0.1 else "ignore"
++            events.append(make_event(candidate_id, action))
+ 
+         if status == "completed":
+             worker.completed += 1
+             if on_time:
+                 worker.on_time += 1
+             worker.rework_count += rework_count
+             if rng.random() < 0.7:
+                 leniency = customer_leniency[task.customer_id]
+                 rating = int(
+                     round(
+@@ -695,20 +766,21 @@
+                 )
+                 worker.ratings.append(float(rating))
+                 if communication_rating is not None:
+                     worker.communication_ratings.append(
+                         float(communication_rating)
+                     )
+         if breach:
+             worker.breach_dates.append(assignment_time)
+ 
+     assignments.sort(key=lambda a: a.created_at)
++    events.sort(key=lambda event: event.created_at)
+     split_index = int(len(assignments) * 0.8)
+     train = assignments[:split_index]
+     test = assignments[split_index:]
+ 
+     # Worker aggregates must reflect train-period outcomes only, otherwise
+     # offline evaluation leaks test feedback into reputation features.
+     worker_by_id = {worker.worker_id: worker for worker in workers}
+     for worker in workers:
+         worker.ratings = []
+         worker.completed = 0
+@@ -821,11 +893,13 @@
+     return Dataset(
+         workers=workers,
+         customers=customers,
+         tasks=tasks,
+         assignments=assignments,
+         feedback=feedback,
+         train=train,
+         test=test,
+         true_weights=true_weights,
+         new_users=new_users,
++        events=events,
++        impressions=impressions,
+     )
+
+--- a/tests\test_synthetic.py
++++ b/tests\test_synthetic.py
+@@ -127,10 +127,26 @@
+     expected: dict[str, list[float]] = {}
+     for item in dataset.train_feedback:
+         if item.communication_rating is not None:
+             expected.setdefault(item.worker_id, []).append(
+                 float(item.communication_rating)
+             )
+     for worker in dataset.workers:
+         assert sorted(worker.communication_ratings) == sorted(
+             expected.get(worker.worker_id, [])
+         )
++
++
++def test_synthetic_events_cover_assignments():
++    dataset = generate_dataset(
++        n_workers=10, n_tasks=20, n_assignments=40, seed=42, n_new_users=0,
++    )
++    assert len(dataset.impressions) == len(dataset.assignments)
++    for impression in dataset.impressions:
++        assert impression.candidate_ids
++        assert abs(sum(impression.propensities.values()) - 1.0) < 1e-6
++    accepts = [event for event in dataset.events if event.action == "accept"]
++    assert len(accepts) == len(dataset.assignments)
++    train_ids = {event.event_id for event in dataset.train_events}
++    test_ids = {event.event_id for event in dataset.test_events}
++    assert train_ids.isdisjoint(test_ids)
++    assert len(train_ids) + len(test_ids) == len(dataset.events)
+

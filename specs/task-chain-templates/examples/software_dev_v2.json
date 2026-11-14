@@ -1,0 +1,193 @@
+{
+  "schema_version": "1.1.0",
+  "template": {
+    "template_id": "software_dev_v2",
+    "category": "software_dev",
+    "name": "软件开发/网站（高级模板）",
+    "version": "1.1.0",
+    "target_hours": [2, 16],
+    "max_nodes": 12,
+    "optional_policy": "bypass",
+    "requirements": [
+      {"key": "requirements_doc", "text": "需求文档", "required": true},
+      {"key": "frontend", "text": "可用的前端页面", "required": true},
+      {"key": "backend", "text": "可用的后端接口", "required": true},
+      {"key": "testing", "text": "测试报告", "required": true},
+      {"key": "deployment", "text": "生产环境上线", "required": true},
+      {"key": "content", "text": "文案内容", "required": false},
+      {"key": "security", "text": "安全评审", "required": false}
+    ],
+    "variants": {
+      "simple": {
+        "max_nodes": 6,
+        "hours_multiplier": 0.8,
+        "exclude": ["solution_design", "accessibility_review", "content_copy", "security_review", "rework"]
+      },
+      "standard": {
+        "max_nodes": 8,
+        "hours_multiplier": 1.0
+      },
+      "complex": {
+        "max_nodes": 12,
+        "hours_multiplier": 1.2,
+        "include": ["security_review", "accessibility_review"]
+      }
+    },
+    "nodes": [
+      {
+        "key": "requirements",
+        "title": "需求澄清",
+        "type": "task",
+        "hours_range": [3, 4, 6],
+        "skills": {"requirements": 3},
+        "depends_on": [],
+        "acceptance": ["需求文档经客户确认"],
+        "optional": false,
+        "risk_flags": []
+      },
+      {
+        "key": "solution_design",
+        "title": "方案设计",
+        "type": "task",
+        "hours_range": [4, 6, 10],
+        "skills": {"architecture": 3, "requirements": 3},
+        "depends_on": ["requirements"],
+        "acceptance": ["技术方案评审通过"],
+        "optional": false,
+        "risk_flags": ["single_point_of_failure"]
+      },
+      {
+        "key": "frontend_dev",
+        "title": "前端开发",
+        "type": "task",
+        "hours_range": [8, 16, 24],
+        "skills": {"frontend": 4},
+        "depends_on": ["solution_design"],
+        "parallel_group": "build",
+        "acceptance": ["页面与交互完成并通过自测"],
+        "optional": false,
+        "risk_flags": []
+      },
+      {
+        "key": "backend_dev",
+        "title": "后端开发",
+        "type": "task",
+        "hours_range": [8, 16, 24],
+        "skills": {"backend": 4},
+        "depends_on": ["solution_design"],
+        "parallel_group": "build",
+        "acceptance": ["接口与数据模型完成并通过自测"],
+        "optional": false,
+        "risk_flags": []
+      },
+      {
+        "key": "content_copy",
+        "title": "文案内容",
+        "type": "task",
+        "hours_range": [2, 4, 8],
+        "skills": {"writing": 3},
+        "depends_on": ["requirements"],
+        "acceptance": ["文案经客户确认"],
+        "optional": true,
+        "include_if": "requirements.content == true",
+        "risk_flags": []
+      },
+      {
+        "key": "accessibility_review",
+        "title": "无障碍评审",
+        "type": "review",
+        "hours_range": [2, 4, 6],
+        "skills": {"ux": 3},
+        "depends_on": ["frontend_dev"],
+        "acceptance": ["无障碍问题闭环"],
+        "optional": true,
+        "include_if": "quality_tier == 'high'",
+        "review_of": "frontend_dev",
+        "risk_flags": []
+      },
+      {
+        "key": "security_review",
+        "title": "安全评审",
+        "type": "review",
+        "hours_range": [4, 8, 12],
+        "skills": {"security": 3},
+        "depends_on": ["backend_dev"],
+        "acceptance": ["安全扫描与修复完成"],
+        "optional": true,
+        "include_if": "requirements.security == true",
+        "review_of": "backend_dev",
+        "risk_flags": ["compliance"]
+      },
+      {
+        "key": "integration",
+        "title": "前后端联调",
+        "type": "task",
+        "hours_range": [4, 6, 10],
+        "skills": {"frontend": 3, "backend": 3},
+        "depends_on": ["frontend_dev", "backend_dev", "content_copy"],
+        "acceptance": ["核心流程联调通过"],
+        "optional": false,
+        "risk_flags": ["coordination"]
+      },
+      {
+        "key": "testing",
+        "title": "测试",
+        "type": "review",
+        "hours_range": [6, 8, 12],
+        "skills": {"qa": 3},
+        "depends_on": ["integration"],
+        "acceptance": ["测试报告与缺陷修复完成"],
+        "optional": false,
+        "review_of": "integration",
+        "risk_flags": []
+      },
+      {
+        "key": "rework",
+        "title": "缺陷修复",
+        "type": "task",
+        "hours_range": [2, 4, 8],
+        "skills": {"frontend": 3, "backend": 3},
+        "depends_on": ["testing"],
+        "acceptance": ["测试缺陷全部修复"],
+        "optional": true,
+        "rework_of": "testing",
+        "max_rework_rounds": 2,
+        "risk_flags": ["schedule"]
+      },
+      {
+        "key": "deployment",
+        "title": "上线部署",
+        "type": "delivery",
+        "hours_range": [2, 3, 4],
+        "skills": {"devops": 3},
+        "depends_on": ["testing", "rework"],
+        "acceptance": ["生产环境可用，回滚方案就绪"],
+        "optional": false,
+        "risk_flags": ["rollback_required"]
+      }
+    ],
+    "handoffs": [
+      {"from": "requirements", "to": "solution_design", "artifact": "需求文档", "format": "markdown"},
+      {"from": "solution_design", "to": "frontend_dev", "artifact": "设计/接口方案", "format": "markdown"},
+      {"from": "solution_design", "to": "backend_dev", "artifact": "接口方案", "format": "markdown"},
+      {"from": "frontend_dev", "to": "integration", "artifact": "前端代码与构建产物", "format": "repo"},
+      {"from": "backend_dev", "to": "integration", "artifact": "API 文档与后端服务", "format": "repo"},
+      {"from": "content_copy", "to": "integration", "artifact": "文案", "format": "markdown"},
+      {"from": "integration", "to": "testing", "artifact": "联调版本", "format": "repo"},
+      {"from": "testing", "to": "rework", "artifact": "缺陷清单", "format": "issue_tracker"},
+      {"from": "rework", "to": "deployment", "artifact": "修复版本", "format": "repo"},
+      {"from": "testing", "to": "deployment", "artifact": "测试报告", "format": "pdf"}
+    ],
+    "quality_rules": {
+      "coverage_min": 1.0,
+      "granularity_min": 0.9,
+      "max_nodes": 12,
+      "feasibility_required": true,
+      "quality_threshold": 0.75
+    },
+    "changelog": [
+      {"version": "1.0.0", "date": "2026-11-13", "changes": "初版 7 节点模板"},
+      {"version": "1.1.0", "date": "2026-11-13", "changes": "新增 variants、optional、parallel_group、hours_range、review/rework、handoffs、quality_rules"}
+    ]
+  }
+}

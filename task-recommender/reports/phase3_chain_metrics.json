@@ -1,0 +1,23 @@
+{
+  "greedy": {
+    "plan_coverage": 1.0,
+    "blocked_rate": 0.0,
+    "mean_node_score": 0.7678174176228937,
+    "handoff_count": 3.566666666666667,
+    "acyclic_rate": 1.0
+  },
+  "beam": {
+    "plan_coverage": 1.0,
+    "blocked_rate": 0.0,
+    "mean_node_score": 0.7660849762305848,
+    "handoff_count": 2.8666666666666667,
+    "acyclic_rate": 1.0
+  },
+  "milp": {
+    "plan_coverage": 1.0,
+    "blocked_rate": 0.0,
+    "mean_node_score": 0.7685305773009883,
+    "handoff_count": 3.6333333333333333,
+    "acyclic_rate": 1.0
+  }
+}

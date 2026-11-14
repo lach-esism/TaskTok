@@ -1,0 +1,1109 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-12 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\features.py
+CHANGED app\main.py
+CHANGED app\preference\customer.py
+CHANGED app\service.py
+CHANGED tests\test_features_v2.py
+CHANGED tests\test_preference_profiles.py
+CHANGED tests\test_recommend.py
+
+## Diff
+
+--- a/app\features.py
++++ b/app\features.py
+@@ -1,18 +1,22 @@
+ """Phase 1 feature scoring for the seven-dimension fusion model."""
+ 
+ from __future__ import annotations
+ 
++import math
+ from datetime import datetime, timezone
+ 
+ from app.domain import Customer, Task, Worker
+-from app.preference.customer import CustomerPreferenceProfile
++from app.preference.customer import (
++    DEFAULT_ATTRIBUTE_WEIGHTS,
++    CustomerPreferenceProfile,
++)
+ from app.preference.worker import WorkerPreferenceProfile
+ from app.reputation import (
+     category_reputation,
+     compute_reputation,
+     recent_breach_count as _recent_breach_count,
+ )
+ 
+ 
+ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+     return max(low, min(high, value))
+@@ -165,90 +169,170 @@
+         declared = _clamp(0.6 * category_preference + 0.4 * difficulty_fit)
+     acceptance = declared if p_accept is None else float(p_accept)
+     return _clamp(
+         0.4 * acceptance
+         + 0.3 * declared
+         + 0.15 * pay_fit_score(worker, task)
+         + 0.15 * time_fit_score(worker, task, now=now)
+     )
+ 
+ 
+-def load_score(worker: Worker, task: Task) -> float:
++def load_score(
++    worker: Worker,
++    task: Task,
++    now: datetime | None = None,
++    recent_impressions: int = 0,
++) -> float:
++    """Blend capacity, deadline feasibility, and exposure fairness.
++
++    ``exposure_fairness = exp(-recent_impressions / 20)`` counteracts the
++    rich-get-richer feedback loop by down-weighting workers who already
++    received many recent impressions. With no impressions it is ``1.0``.
++    """
+     if worker.capacity_hours <= 0:
+-        return 0.0
+-    remaining = worker.capacity_hours - (
+-        worker.current_load_hours + task.estimated_hours
+-    )
+-    return _clamp(remaining / worker.capacity_hours)
++        capacity_score = 0.0
++    else:
++        remaining = worker.capacity_hours - (
++            worker.current_load_hours + task.estimated_hours
++        )
++        capacity_score = _clamp(remaining / worker.capacity_hours)
++    deadline_feasibility = time_fit_score(worker, task, now=now)
++    exposure_fairness = math.exp(
++        -max(0, recent_impressions) / 20.0
++    )
++    return _clamp(
++        0.6 * capacity_score
++        + 0.25 * deadline_feasibility
++        + 0.15 * exposure_fairness
++    )
+ 
+ 
+ def customer_preference_score(
+     customer: Customer,
+     worker: Worker,
+     task: Task,
+     reputation: float,
+     expertise: float,
+     profile: CustomerPreferenceProfile | None = None,
+-) -> float:
++    *,
++    pay_fit: float = 0.5,
++    deadline_feasibility: float = 0.5,
++    collaboration: float = 0.0,
++    communication: float = 0.5,
++    now: datetime | None = None,
++) -> float:
++    """Weighted customer satisfaction estimate on a ``[0, 1]`` scale.
++
++    A confident profile (``confidence >= 0.2``) contributes its attribute
++    weights on top of :data:`DEFAULT_ATTRIBUTE_WEIGHTS`; the merged weights
++    are normalized by their own sum. Without a confident profile the score
++    falls back to the legacy reputation/expertise/load/pay blend.
++    """
+     if profile is not None and profile.confidence >= 0.2:
+-        weights = profile.attribute_weights
++        weights = dict(DEFAULT_ATTRIBUTE_WEIGHTS)
++        for key, value in profile.attribute_weights.items():
++            if key in weights:
++                weights[key] = value
+         speed = (
+             worker.on_time / worker.completed if worker.completed > 0 else 0.5
+         )
+         values = {
+-            "reputation": reputation,
+-            "expertise": expertise,
+-            "speed": speed,
+-            "communication": 0.7,
+-            "price": 0.5,
++            "reputation": _clamp(reputation),
++            "expertise": _clamp(expertise),
++            "speed": _clamp(speed),
++            "communication": _clamp(communication),
++            "price": _clamp(pay_fit),
++            "collaboration": _clamp(min(1.0, collaboration / 3.0)),
++            "deadline_fit": _clamp(deadline_feasibility),
+         }
+         total = sum(weights.values())
+         if total > 0:
+             return _clamp(
+                 sum(
+                     weights.get(key, 0.0) * value
+                     for key, value in values.items()
+                 )
+                 / total
+             )
+-    load = load_score(worker, task)
+-    return _clamp(0.5 * reputation + 0.3 * expertise + 0.2 * load)
++    load = load_score(worker, task, now=now)
++    return _clamp(
++        0.4 * reputation
++        + 0.3 * expertise
++        + 0.15 * load
++        + 0.15 * pay_fit
++    )
++
++
++def _communication_score(worker: Worker) -> float:
++    ratings = worker.communication_ratings
++    if not ratings:
++        return 0.5
++    return _clamp((sum(ratings) / len(ratings)) / 5.0)
+ 
+ 
+ def candidate_features(
+     worker: Worker,
+     task: Task,
+     customer: Customer,
+     cf_score: float = 0.0,
+     now: datetime | None = None,
+     worker_profile: WorkerPreferenceProfile | None = None,
+     customer_profile: CustomerPreferenceProfile | None = None,
+     semantic_similarity: float = 0.5,
++    p_accept: float | None = None,
++    recent_impressions: int = 0,
++    *,
++    pay_fit: float | None = None,
++    communication: float | None = None,
++    collaboration: float = 0.0,
+ ) -> dict[str, float]:
++    """Build the seven fusion features, all bounded to ``[0, 1]``.
++
++    ``p_accept`` and ``recent_impressions`` are supplied by the service when
++    an acceptance model and impression log are available. ``pay_fit``,
++    ``communication``, and ``collaboration`` may also be supplied to avoid
++    recomputing store-derived context; omitted values fall back to sensible
++    defaults.
++    """
+     reputation = reputation_score(worker, task.category, now=now)
+     expertise = expertise_score(worker, task, semantic_similarity)
++    if pay_fit is None:
++        pay_fit = pay_fit_score(worker, task)
++    if communication is None:
++        communication = _communication_score(worker)
++    deadline_feasibility = time_fit_score(worker, task, now=now)
+     return {
+         "reputation": reputation,
+         "skill": skill_score(worker, task),
+         "expertise": expertise,
+         "collaborative": _clamp(cf_score),
+         "preference": preference_score(
+-            worker, task, worker_profile, now=now
++            worker, task, worker_profile, p_accept=p_accept, now=now
+         ),
+-        "load": load_score(worker, task),
++        "load": load_score(
++            worker,
++            task,
++            now=now,
++            recent_impressions=recent_impressions,
++        ),
+         "customer_preference": customer_preference_score(
+             customer,
+             worker,
+             task,
+             reputation,
+             expertise,
+             customer_profile,
++            pay_fit=pay_fit,
++            deadline_feasibility=deadline_feasibility,
++            collaboration=collaboration,
++            communication=communication,
++            now=now,
+         ),
+     }
+ 
+ 
+ def fuse_scores(features: dict[str, float], weights: dict[str, float]) -> float:
+     total_weight = sum(weights.values())
+     if abs(total_weight - 1.0) > 1e-6:
+         raise ValueError(f"weights must sum to 1.0, got {total_weight}")
+     score = sum(features.get(key, 0.0) * weight for key, weight in weights.items())
+     return _clamp(score)
+
+--- a/app\main.py
++++ b/app\main.py
+@@ -14,27 +14,34 @@
+ from app.benchmark.db import BenchmarkRepository, build_benchmark_db
+ from app.benchmark.runner import BenchmarkRoundRunner
+ from app.chains.compose import compose_templates
+ from app.chains.decompose import decompose, quality_score
+ from app.chains.plan_store import ChainPlanStore
+ from app.chains.planner import plan_chain, propagate_breach, replan_chain
+ from app.config import APP_VERSION, DEFAULT_WEIGHTS
+ from app.data.store import Store
+ from app.data.synthetic import generate_dataset
+ from app.data.templates import load_templates
+-from app.domain import Task, TaskChain
++from app.domain import Task, TaskChain, Worker
+ from app.evaluation_phase2 import evaluate_two_runs
+ from app.feedback import FeedbackService
+-from app.features import candidate_features
++from app.features import candidate_features, pay_fit_score, skill_score
++from app.learning.acceptance import AcceptanceModel, accept_features
+ from app.learning.exploration import ExplorationPolicy
+ from app.learning.online import OnlineWeightLearner
+ from app.learning.weights import AHP_PRIOR
++from app.semantic import (
++    SemanticMatcher,
++    build_matcher,
++    build_task_text,
++    build_worker_text,
++)
+ from app.nlp.classifier import get_default_classifier
+ from app.personalization.segments import Segmenter
+ from app.resume import build_resume
+ from app.personalization.user_weights import PersonalizationService
+ from app.preference.customer import (
+     CustomerPreferenceProfile,
+     update_customer_preferences,
+ )
+ from app.preference.worker import (
+     WorkerPreferenceProfile,
+@@ -85,26 +92,106 @@
+         "customer_id": chain.customer_id,
+         "status": chain.status,
+         "deadline": chain.deadline,
+         "budget": chain.budget,
+         "critical_path": chain.critical_path,
+         "nodes": [asdict(node) for node in chain.nodes],
+         "edges": [asdict(edge) for edge in chain.edges],
+     }
+ 
+ 
++def _region_match(worker: Worker, task: Task) -> float:
++    if worker.region == task.region:
++        return 1.0
++    if worker.remote_ok and task.remote_ok:
++        return 0.8
++    return 0.3
++
++
++def _build_semantic_matcher(store: Store) -> SemanticMatcher | None:
++    """Fit one matcher over the store's worker/task corpus."""
++    try:
++        matcher = build_matcher()
++        matcher.fit(
++            [
++                build_worker_text(worker)
++                for worker in store.workers.values()
++            ],
++            [
++                build_task_text(task)
++                for task in store.tasks.values()
++            ],
++        )
++    except Exception:  # noqa: BLE001 - a missing matcher degrades to neutral
++        return None
++    return matcher if matcher.is_fitted else None
++
++
++def _build_acceptance_model(store: Store) -> AcceptanceModel | None:
++    """Fit the global ``P(accept)`` model from logged accept/reject events."""
++    counts: dict[str, tuple[int, int]] = {}
++    for event in store.events:
++        if event.candidate_type != "worker":
++            continue
++        if event.action not in {"accept", "reject"}:
++            continue
++        accepted, rejected = counts.get(event.candidate_id, (0, 0))
++        if event.action == "accept":
++            accepted += 1
++        else:
++            rejected += 1
++        counts[event.candidate_id] = (accepted, rejected)
++
++    samples: list[tuple[dict[str, float], int]] = []
++    for event in store.events:
++        if event.candidate_type != "worker":
++            continue
++        if event.action not in {"accept", "reject"}:
++            continue
++        worker = store.workers.get(event.candidate_id)
++        task = store.tasks.get(event.task_id)
++        if worker is None or task is None:
++            continue
++        accepted, rejected = counts.get(worker.worker_id, (0, 0))
++        historical = (
++            (accepted + 1) / (accepted + rejected + 2)
++            if accepted + rejected > 0
++            else 0.5
++        )
++        samples.append(
++            (
++                accept_features(
++                    worker,
++                    task,
++                    skill=skill_score(worker, task),
++                    pay_fit=pay_fit_score(worker, task),
++                    region_match=_region_match(worker, task),
++                    historical_accept_rate=historical,
++                ),
++                1 if event.action == "accept" else 0,
++            )
++        )
++    try:
++        model = AcceptanceModel().fit(samples)
++    except Exception:  # noqa: BLE001 - an unfitted model degrades to prior
++        return None
++    return model if model.is_fitted else None
++
++
+ def _node_candidates(
+     chain: TaskChain,
+     node_id: str,
+     current: Store,
+     top_n: int,
+     weights: dict[str, float] | None = None,
++    semantic_matcher: SemanticMatcher | None = None,
++    acceptance_model: AcceptanceModel | None = None,
+ ) -> RecommendResponse:
+     node = next(
+         (
+             candidate
+             for candidate in chain.nodes
+             if candidate.key == node_id or candidate.subtask_id == node_id
+         ),
+         None,
+     )
+     if node is None:
+@@ -120,21 +207,26 @@
+         required_level=1,
+         difficulty=3,
+         priority=3,
+         estimated_hours=node.estimated_hours,
+         deadline=chain.deadline,
+         region=root_task.region if root_task else "CN",
+         remote_ok=root_task.remote_ok if root_task else True,
+         description="",
+         status="open",
+     )
+-    service = RecommendationService(current, weights=weights)
++    service = RecommendationService(
++        current,
++        weights=weights,
++        semantic_matcher=semantic_matcher,
++        acceptance_model=acceptance_model,
++    )
+     pool_size = min(100, max(top_n * 3, top_n + 1))
+     candidates = service.recommend_workers_for_task(
+         temporary_task, top_n=pool_size
+     )
+     candidates = ExplorationPolicy(epsilon=0.10, seed=42).rerank(
+         candidates, k=top_n
+     )
+     return RecommendResponse(
+         query_id=node.subtask_id,
+         candidates=[
+@@ -160,25 +252,29 @@
+     """Create the Phase 2 application."""
+     app = FastAPI(title="Task Assignment Recommender", version=APP_VERSION)
+     test_assignments = []
+     if store is None:
+         dataset = generate_dataset()
+         store = Store(
+             workers=dataset.workers,
+             customers=dataset.customers,
+             tasks=dataset.tasks,
+             assignments=dataset.train,
+-            feedback=dataset.feedback,
++            feedback=dataset.train_feedback,
++            events=dataset.train_events,
++            impressions=dataset.train_impressions,
+         )
+         test_assignments = dataset.test
+     app.state.store = store
+     app.state.test_assignments = test_assignments
++    app.state.semantic_matcher = _build_semantic_matcher(store)
++    app.state.acceptance_model = _build_acceptance_model(store)
+     app.state.chains = {}
+     app.state.drafts = {}
+     app.state.plan_store = ChainPlanStore()
+     resolved_weights_dir = weights_dir or (
+         Path(__file__).resolve().parent.parent / "data" / "weights"
+     )
+     app.state.weight_store = WeightStore(
+         resolved_weights_dir, prior=DEFAULT_WEIGHTS
+     )
+     app.state.personalizer = PersonalizationService(
+@@ -686,21 +782,24 @@
+                 )
+             try:
+                 version_a = app.state.weight_store.get(run_a)
+                 version_b = app.state.weight_store.get(run_b)
+             except KeyError:
+                 raise HTTPException(
+                     status_code=404, detail="unknown weight version"
+                 )
+             current = require_store()
+             service = RecommendationService(
+-                current, weights=version_a.weights
++                current,
++                weights=version_a.weights,
++                semantic_matcher=app.state.semantic_matcher,
++                acceptance_model=app.state.acceptance_model,
+             )
+             held_out = getattr(app.state, "test_assignments", [])
+             if not held_out:
+                 return {
+                     "available": False,
+                     "reason": "no held-out test assignments",
+                 }
+             evaluation_store = Store(
+                 workers=list(current.workers.values()),
+                 customers=list(current.customers.values()),
+@@ -736,21 +835,24 @@
+     def metrics_learning_rounds() -> dict:
+         path = REPORTS_DIR / "learning_rounds.json"
+         if not path.exists():
+             return {"available": False}
+         return json.loads(path.read_text(encoding="utf-8"))
+ 
+     @app.post("/recommend/workers", response_model=RecommendResponse)
+     def recommend_workers(request: RecommendWorkersRequest) -> RecommendResponse:
+         current = require_store()
+         service = RecommendationService(
+-            current, weights=app.state.weight_store.active().weights
++            current,
++            weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
+         )
+         pool_size = min(100, max(request.top_n * 3, request.top_n + 1))
+         try:
+             candidates = service.recommend_workers(
+                 request.task_id,
+                 top_n=pool_size,
+                 user_id=request.user_id,
+             )
+         except KeyError:
+             raise HTTPException(status_code=404, detail="task not found")
+@@ -770,21 +872,24 @@
+                 )
+                 for candidate in candidates
+             ],
+             reason=None if candidates else "no eligible candidates",
+         )
+ 
+     @app.post("/recommend/tasks", response_model=RecommendResponse)
+     def recommend_tasks(request: RecommendTasksRequest) -> RecommendResponse:
+         current = require_store()
+         service = RecommendationService(
+-            current, weights=app.state.weight_store.active().weights
++            current,
++            weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
+         )
+         pool_size = min(100, max(request.top_n * 3, request.top_n + 1))
+         try:
+             candidates = service.recommend_tasks(
+                 request.worker_id,
+                 top_n=pool_size,
+                 user_id=request.user_id,
+             )
+         except KeyError:
+             raise HTTPException(status_code=404, detail="worker not found")
+@@ -851,21 +956,24 @@
+             raise HTTPException(status_code=404, detail="chain not found")
+         return _serialize_chain(chain)
+ 
+     @app.post("/chains/{chain_id}/plan")
+     def plan(chain_id: str) -> dict:
+         current = require_store()
+         chain = app.state.chains.get(chain_id)
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+         service = RecommendationService(
+-            current, weights=app.state.weight_store.active().weights
++            current,
++            weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
+         )
+         result = plan_chain(chain, service)
+         version = app.state.plan_store.save(result)
+         return {
+             "plan_id": result.plan_id,
+             "chain_id": result.chain_id,
+             "score": result.score,
+             "blocked": result.blocked,
+             "version": version,
+             "planner": result.planner,
+@@ -900,21 +1008,24 @@
+         chain = app.state.chains.get(chain_id)
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+         try:
+             active_plan = app.state.plan_store.active(chain_id)
+         except KeyError:
+             raise HTTPException(
+                 status_code=404, detail="no active plan"
+             )
+         service = RecommendationService(
+-            current, weights=app.state.weight_store.active().weights
++            current,
++            weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
+         )
+         locked_nodes = set(request.locked_nodes) | {
+             node.key
+             for node in chain.nodes
+             if node.status in {"completed", "in_progress"}
+         }
+         try:
+             result = replan_chain(
+                 chain,
+                 service,
+@@ -994,13 +1105,15 @@
+         current = require_store()
+         chain = app.state.chains.get(chain_id)
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+         return _node_candidates(
+             chain,
+             node_id,
+             current,
+             request.top_n,
+             weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
+         )
+ 
+     return app
+
+--- a/app\preference\customer.py
++++ b/app\preference\customer.py
+@@ -1,25 +1,27 @@
+ """Customer attribute preference updates."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ 
+ from app.domain import Task, Worker
+ 
+ DEFAULT_ATTRIBUTE_WEIGHTS = {
+-    "reputation": 0.40,
++    "reputation": 0.30,
+     "expertise": 0.20,
+-    "speed": 0.20,
++    "speed": 0.15,
+     "communication": 0.10,
+     "price": 0.10,
++    "collaboration": 0.10,
++    "deadline_fit": 0.05,
+ }
+ 
+ 
+ @dataclass
+ class CustomerPreferenceProfile:
+     customer_id: str
+     attribute_weights: dict[str, float] = field(
+         default_factory=lambda: dict(DEFAULT_ATTRIBUTE_WEIGHTS)
+     )
+     confidence: float = 0.0
+
+--- a/app\service.py
++++ b/app\service.py
+@@ -1,26 +1,37 @@
+ """Recommendation orchestration: hard constraints, scoring, and ranking."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ from app.config import (
+     BREACH_EXCLUDE_THRESHOLD,
+     DEFAULT_WEIGHTS,
+ )
+ from app.data.store import Store
+ from app.domain import Customer, Task, Worker
+-from app.features import candidate_features, fuse_scores
++from app.features import (
++    candidate_features,
++    fuse_scores,
++    pay_fit_score,
++    skill_score,
++)
++from app.learning.acceptance import AcceptanceModel, accept_features
+ from app.reputation import recent_breach_count as _recent_breach_count
+ from app.models.itemcf import ItemCF
++from app.semantic import (
++    SemanticMatcher,
++    build_task_text,
++    build_worker_text,
++)
+ 
+ 
+ @dataclass
+ class ScoredCandidate:
+     candidate_id: str
+     score: float
+     breakdown: dict[str, float]
+     reasons: list[str]
+     cold_start: bool
+     propensity: float = 1.0
+@@ -50,20 +61,28 @@
+         assignment.task_id == task.task_id
+         and assignment.worker_id == worker.worker_id
+         for assignment in store.assignments
+     ):
+         return False, "worker already assigned to this task"
+     if _recent_breach_count(worker, now or store.reference_time) >= BREACH_EXCLUDE_THRESHOLD:
+         return False, "worker has two or more recent breaches"
+     return True, "eligible"
+ 
+ 
++def _as_aware(value: datetime) -> datetime:
++    return (
++        value.replace(tzinfo=timezone.utc)
++        if value.tzinfo is None
++        else value
++    )
++
++
+ def _build_itemcf(store: Store) -> ItemCF:
+     assignment_ids = {
+         assignment.assignment_id for assignment in store.assignments
+     }
+     rated_pairs = {
+         (feedback.worker_id, feedback.task_id)
+         for feedback in store.feedback
+         if feedback.assignment_id in assignment_ids
+     }
+     interactions: list[tuple[str, str, float]] = []
+@@ -79,34 +98,163 @@
+             (assignment.worker_id, assignment.task_id, weight)
+         )
+     return ItemCF(interactions)
+ 
+ 
+ class RecommendationService:
+     def __init__(
+         self,
+         store: Store,
+         weights: dict[str, float] | None = None,
++        semantic_matcher: SemanticMatcher | None = None,
++        acceptance_model: AcceptanceModel | None = None,
+     ) -> None:
+         self.store = store
+         self.weights = dict(weights or DEFAULT_WEIGHTS)
+         self.reference_time = store.reference_time
+         self.itemcf = _build_itemcf(store)
++        self.semantic_matcher = semantic_matcher
++        self.acceptance_model = acceptance_model
+ 
+     def _weights_for(
+         self, user_id: str | None = None
+     ) -> dict[str, float]:
+         if user_id:
+             profile = self.store.user_weight_profiles.get(user_id)
+             if profile is not None:
+                 return profile.weights
+         return self.weights
++
++    @staticmethod
++    def _communication(worker: Worker) -> float:
++        ratings = worker.communication_ratings
++        if not ratings:
++            return 0.5
++        return max(0.0, min(1.0, sum(ratings) / len(ratings) / 5.0))
++
++    @staticmethod
++    def _region_match(worker: Worker, task: Task) -> float:
++        if worker.region == task.region:
++            return 1.0
++        if worker.remote_ok and task.remote_ok:
++            return 0.8
++        return 0.3
++
++    def _acceptance_counts(self) -> dict[str, tuple[int, int]]:
++        if self.acceptance_model is None:
++            return {}
++        counts: dict[str, tuple[int, int]] = {}
++        for event in self.store.events:
++            if event.candidate_type != "worker":
++                continue
++            if event.action not in {"accept", "reject"}:
++                continue
++            accepted, rejected = counts.get(event.candidate_id, (0, 0))
++            if event.action == "accept":
++                accepted += 1
++            else:
++                rejected += 1
++            counts[event.candidate_id] = (accepted, rejected)
++        return counts
++
++    def _collaboration_counts(self) -> dict[tuple[str, str], int]:
++        """Prior completed pairs, indexed once per recommendation call."""
++        cutoff = _as_aware(self.reference_time)
++        counts: dict[tuple[str, str], int] = {}
++        for assignment in self.store.assignments:
++            if assignment.status != "completed":
++                continue
++            if _as_aware(assignment.created_at) >= cutoff:
++                continue
++            key = (assignment.customer_id, assignment.worker_id)
++            counts[key] = counts.get(key, 0) + 1
++        return counts
++
++    @staticmethod
++    def _historical_accept_rate(
++        counts: dict[str, tuple[int, int]], worker_id: str
++    ) -> float:
++        accepted, rejected = counts.get(worker_id, (0, 0))
++        if accepted + rejected == 0:
++            return 0.5
++        return (accepted + 1) / (accepted + rejected + 2)
++
++    def _semantic(
++        self, worker: Worker, task: Task
++    ) -> float:
++        if self.semantic_matcher is None:
++            return 0.5
++        return self.semantic_matcher.similarity(
++            build_task_text(task), build_worker_text(worker)
++        )
++
++    def _p_accept(
++        self,
++        worker: Worker,
++        task: Task,
++        task_skill: float,
++        pay_fit: float,
++        accept_counts: dict[str, tuple[int, int]],
++    ) -> float | None:
++        model = self.acceptance_model
++        if model is None or not model.is_fitted:
++            return None
++        features = accept_features(
++            worker,
++            task,
++            skill=task_skill,
++            pay_fit=pay_fit,
++            region_match=self._region_match(worker, task),
++            historical_accept_rate=self._historical_accept_rate(
++                accept_counts, worker.worker_id
++            ),
++        )
++        return model.predict(features)
++
++    def _build_features(
++        self,
++        worker: Worker,
++        task: Task,
++        customer: Customer,
++        cf_score: float,
++        recent_impressions: int,
++        accept_counts: dict[str, tuple[int, int]],
++        collaboration_counts: dict[tuple[str, str], int],
++    ) -> dict[str, float]:
++        pay_fit = pay_fit_score(worker, task)
++        return candidate_features(
++            worker,
++            task,
++            customer,
++            cf_score=cf_score,
++            now=self.reference_time,
++            worker_profile=self.store.worker_preferences.get(
++                worker.worker_id
++            ),
++            customer_profile=self.store.customer_preferences.get(
++                customer.customer_id
++            ),
++            semantic_similarity=self._semantic(worker, task),
++            p_accept=self._p_accept(
++                worker,
++                task,
++                skill_score(worker, task),
++                pay_fit,
++                accept_counts,
++            ),
++            recent_impressions=recent_impressions,
++            pay_fit=pay_fit,
++            communication=self._communication(worker),
++            collaboration=collaboration_counts.get(
++                (customer.customer_id, worker.worker_id), 0
++            ),
++        )
+ 
+     def recommend_workers(
+         self, task_id: str, top_n: int = 10, user_id: str | None = None
+     ) -> list[ScoredCandidate]:
+         task = self.store.tasks.get(task_id)
+         if task is None:
+             raise KeyError(task_id)
+         return self.recommend_workers_for_task(
+             task, top_n=top_n, user_id=user_id
+         )
+@@ -134,38 +282,39 @@
+             if ok:
+                 eligible.append(worker)
+ 
+         raw_cf = {
+             (worker.worker_id, task.task_id): self.itemcf.score(
+                 worker.worker_id, task.task_id
+             )
+             for worker in eligible
+         }
+         normalized_cf = self.itemcf.normalize(raw_cf)
++        recent_impressions = self.store.recent_impression_counts(
++            self.reference_time
++        )
++        accept_counts = self._acceptance_counts()
++        collaboration_counts = self._collaboration_counts()
+ 
+         candidates: list[ScoredCandidate] = []
+         for worker in eligible:
+             cf_score = normalized_cf.get(
+                 (worker.worker_id, task.task_id), 0.0
+             )
+-            features = candidate_features(
++            features = self._build_features(
+                 worker,
+                 task,
+                 customer,
+-                cf_score=cf_score,
+-                now=self.reference_time,
+-                worker_profile=self.store.worker_preferences.get(
+-                    worker.worker_id
+-                ),
+-                customer_profile=self.store.customer_preferences.get(
+-                    customer.customer_id
+-                ),
++                cf_score,
++                recent_impressions.get(worker.worker_id, 0),
++                accept_counts,
++                collaboration_counts,
+             )
+             score = fuse_scores(features, weights)
+             cold_start = not self.store.worker_assignments(worker.worker_id)
+             reasons = [
+                 f"skill={features['skill']:.2f}",
+                 f"reputation={features['reputation']:.2f}",
+                 f"expertise={features['expertise']:.2f}",
+             ]
+             if cold_start:
+                 reasons.append("cold start: no assignment history")
+@@ -204,46 +353,47 @@
+             if ok:
+                 eligible.append(task)
+ 
+         raw_cf = {
+             (worker.worker_id, task.task_id): self.itemcf.score(
+                 worker.worker_id, task.task_id
+             )
+             for task in eligible
+         }
+         normalized_cf = self.itemcf.normalize(raw_cf)
++        recent_impressions = self.store.recent_impression_counts(
++            self.reference_time
++        )
++        accept_counts = self._acceptance_counts()
++        collaboration_counts = self._collaboration_counts()
+ 
+         candidates: list[ScoredCandidate] = []
+         cold_start = not self.store.worker_assignments(worker_id)
+         for task in eligible:
+             customer = self.store.customers.get(task.customer_id)
+             if customer is None:
+                 customer = Customer(
+                     customer_id=task.customer_id,
+                     name="Unknown",
+                     region=task.region,
+                 )
+             cf_score = normalized_cf.get(
+                 (worker.worker_id, task.task_id), 0.0
+             )
+-            features = candidate_features(
++            features = self._build_features(
+                 worker,
+                 task,
+                 customer,
+-                cf_score=cf_score,
+-                now=self.reference_time,
+-                worker_profile=self.store.worker_preferences.get(
+-                    worker.worker_id
+-                ),
+-                customer_profile=self.store.customer_preferences.get(
+-                    customer.customer_id
+-                ),
++                cf_score,
++                recent_impressions.get(worker.worker_id, 0),
++                accept_counts,
++                collaboration_counts,
+             )
+             score = fuse_scores(features, weights)
+             reasons = [
+                 f"skill={features['skill']:.2f}",
+                 f"preference={features['preference']:.2f}",
+                 f"load={features['load']:.2f}",
+             ]
+             if cold_start:
+                 reasons.append("cold start: no assignment history")
+             candidates.append(
+
+--- a/tests\test_features_v2.py
++++ b/tests\test_features_v2.py
+@@ -122,10 +122,76 @@
+     assert preference_score(worker, task, now=now) == pytest.approx(expected)
+     assert preference_score(
+         worker, task, p_accept=declared, now=now
+     ) == pytest.approx(expected)
+ 
+ 
+ def test_pay_fit_zero_budget_with_positive_expected_pay():
+     # max(..., 1) guard: no ZeroDivisionError and the score bottoms out at 0.
+     worker = make_worker(expected_pay=500)
+     assert pay_fit_score(worker, make_task(budget=0)) == pytest.approx(0.0)
++
++
++from app.features import load_score
++from app.preference.customer import DEFAULT_ATTRIBUTE_WEIGHTS
++
++
++def test_load_formula_with_exposure():
++    import math
++    from datetime import datetime, timedelta, timezone
++
++    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
++    worker = make_worker(capacity_hours=40, current_load_hours=10)
++    task = make_task(estimated_hours=10, deadline=now + timedelta(hours=20))
++    value = load_score(worker, task, now=now, recent_impressions=100)
++    capacity_score = (40 - 10 - 10) / 40
++    deadline_feasibility = time_fit_score(worker, task, now=now)
++    exposure_fairness = math.exp(-100 / 20)
++    expected = 0.6 * capacity_score + 0.25 * deadline_feasibility + 0.15 * exposure_fairness
++    assert value == pytest.approx(expected, abs=1e-9)
++
++
++def test_customer_attribute_weights_sum_to_one_and_include_new_keys():
++    assert set(DEFAULT_ATTRIBUTE_WEIGHTS) == {
++        "reputation", "expertise", "speed", "communication",
++        "price", "collaboration", "deadline_fit",
++    }
++    assert sum(DEFAULT_ATTRIBUTE_WEIGHTS.values()) == pytest.approx(1.0)
++
++
++def test_customer_preference_fallback_uses_supplied_now():
++    from datetime import datetime, timezone
++
++    from app.domain import Customer
++    from app.features import customer_preference_score
++    from app.preference.customer import CustomerPreferenceProfile
++
++    now = datetime(2020, 1, 1, tzinfo=timezone.utc)
++    worker = make_worker(capacity_hours=40, current_load_hours=0)
++    task = make_task(estimated_hours=5, deadline=now + timedelta(hours=10))
++    profile = CustomerPreferenceProfile(customer_id="c1", confidence=0.1)
++    customer = Customer(customer_id="c1", name="C", region="CN")
++
++    value = customer_preference_score(
++        customer,
++        worker,
++        task,
++        0.8,
++        0.6,
++        profile,
++        pay_fit=0.7,
++        now=now,
++    )
++    load_with_now = load_score(worker, task, now=now)
++    expected = (
++        0.4 * 0.8 + 0.3 * 0.6 + 0.15 * load_with_now + 0.15 * 0.7
++    )
++    assert value == pytest.approx(expected)
++
++    # The 2020 deadline is long past for the wall clock, so ignoring the
++    # supplied now would produce a different load term.
++    wall_clock_load = load_score(worker, task)
++    wall_clock_expected = (
++        0.4 * 0.8 + 0.3 * 0.6 + 0.15 * wall_clock_load + 0.15 * 0.7
++    )
++    assert load_with_now != pytest.approx(wall_clock_load)
++    assert value != pytest.approx(wall_clock_expected)
+
+--- a/tests\test_preference_profiles.py
++++ b/tests\test_preference_profiles.py
+@@ -23,20 +23,34 @@
+         profile,
+         software_task,
+         accepted=True,
+         rating=5,
+         now=small_store.reference_time,
+     )
+     assert updated.category_preferences["software_dev"] > 0.5
+     assert 0.0 <= updated.confidence <= 1.0
+ 
+ 
++def test_default_attribute_weights_cover_all_attributes_and_sum_to_one():
++    from app.preference.customer import DEFAULT_ATTRIBUTE_WEIGHTS
++
++    assert DEFAULT_ATTRIBUTE_WEIGHTS == {
++        "reputation": 0.30,
++        "expertise": 0.20,
++        "speed": 0.15,
++        "communication": 0.10,
++        "price": 0.10,
++        "collaboration": 0.10,
++        "deadline_fit": 0.05,
++    }
++
++
+ def test_customer_preference_boosts_reputation_after_high_rating(small_store):
+     profile = CustomerPreferenceProfile(customer_id="c1")
+     before = profile.attribute_weights["reputation"]
+     updated = update_customer_preferences(
+         profile,
+         small_store.workers["w_good"],
+         small_store.tasks["t1"],
+         5,
+     )
+     assert updated.attribute_weights["reputation"] > before
+
+--- a/tests\test_recommend.py
++++ b/tests\test_recommend.py
+@@ -127,20 +127,32 @@
+             worker_id="w_good",
+             task_id="t1",
+             overall_rating=5,
+             created_at=small_store.assignments[0].created_at,
+         )
+     )
+     itemcf = _build_itemcf(small_store)
+     assert itemcf.user_items["w_good"]["t1"] == 0.5
+ 
+ 
++def test_service_wires_new_feature_inputs(small_store):
++    from app.service import RecommendationService
++
++    service = RecommendationService(small_store)
++    candidates = service.recommend_workers("t1", top_n=3)
++    assert candidates
++    assert set(candidates[0].breakdown) == {
++        "reputation", "skill", "expertise", "collaborative",
++        "preference", "load", "customer_preference",
++    }
++
++
+ def test_recent_breach_uses_data_reference_time():
+     from datetime import timedelta
+ 
+     from app.data.store import Store
+     from app.data.synthetic import generate_dataset
+     from app.domain import Task
+     from app.service import is_eligible
+ 
+     dataset = generate_dataset()
+     store = Store(
+

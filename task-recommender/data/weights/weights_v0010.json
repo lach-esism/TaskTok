@@ -1,0 +1,25 @@
+{
+  "version": "v0010",
+  "weights": {
+    "reputation": 0.367546640685,
+    "skill": 0.168177944478,
+    "expertise": 0.278458009725,
+    "collaborative": 0.058836502473,
+    "preference": 0.051591527311,
+    "load": 0.040208653929,
+    "customer_preference": 0.0351807214
+  },
+  "prior": {
+    "reputation": 0.32,
+    "skill": 0.2,
+    "expertise": 0.15,
+    "collaborative": 0.13,
+    "preference": 0.1,
+    "load": 0.06,
+    "customer_preference": 0.04
+  },
+  "sample_count": 34771,
+  "source": "batch+pairwise",
+  "metrics": {},
+  "updated_at": "2026-11-14T05:43:48.388521+00:00"
+}

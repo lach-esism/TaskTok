@@ -1,0 +1,694 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-0 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\data\store.py
+CHANGED app\domain.py
+ADDED   tests\test_events.py
+
+## Diff
+
+--- a/app\data\store.py
++++ b/app\data\store.py
+@@ -1,73 +1,137 @@
+ """In-memory data store for Phase 1."""
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ 
+ from app.domain import (
+     Assignment,
+     Customer,
+     Feedback,
++    Impression,
+     LearningSnapshot,
++    RecommendationEvent,
+     Task,
+     TaskChain,
+     UserProfile,
+     UserWeightProfile,
+     Worker,
+ )
+ from app.preference.customer import CustomerPreferenceProfile
+ from app.preference.worker import WorkerPreferenceProfile
++
++
++def _aware(value: datetime) -> datetime:
++    return (
++        value.replace(tzinfo=timezone.utc)
++        if value.tzinfo is None
++        else value
++    )
+ 
+ 
+ class Store:
+     """Indexes domain entities by ID and keeps interaction history."""
+ 
+     def __init__(
+         self,
+         workers: list[Worker],
+         customers: list[Customer],
+         tasks: list[Task],
+         assignments: list[Assignment],
+         feedback: list[Feedback],
+         templates: dict[str, dict] | None = None,
+         chains: dict[str, TaskChain] | None = None,
+         profiles: dict[str, UserProfile] | None = None,
+         user_weight_profiles: dict[str, UserWeightProfile] | None = None,
+         learning_snapshots: list[LearningSnapshot] | None = None,
+         worker_preferences: dict[str, WorkerPreferenceProfile] | None = None,
+         customer_preferences: dict[str, CustomerPreferenceProfile] | None = None,
++        events: list[RecommendationEvent] | None = None,
++        impressions: list[Impression] | None = None,
+     ) -> None:
+         self.workers = {worker.worker_id: worker for worker in workers}
+         self.customers = {customer.customer_id: customer for customer in customers}
+         self.tasks = {task.task_id: task for task in tasks}
+         self.assignments = list(assignments)
+         self.feedback = list(feedback)
+         self.templates = dict(templates or {})
+         self.chains = dict(chains or {})
+         self.profiles = dict(profiles or {})
+         self.user_weight_profiles = dict(user_weight_profiles or {})
+         self.learning_snapshots = list(learning_snapshots or [])
+         self.worker_preferences = dict(worker_preferences or {})
+         self.customer_preferences = dict(customer_preferences or {})
++        self.events = list(events or [])
++        self.impressions = list(impressions or [])
+ 
+     @property
+     def reference_time(self) -> datetime:
+         """Data-relative 'now' so recency checks do not drift with wall clock."""
+-        if not self.assignments:
++        timestamps = [
++            _aware(assignment.created_at) for assignment in self.assignments
++        ]
++        timestamps.extend(_aware(event.created_at) for event in self.events)
++        timestamps.extend(
++            _aware(impression.created_at) for impression in self.impressions
++        )
++        if not timestamps:
+             return datetime.now(timezone.utc)
++        return max(timestamps)
+ 
+-        def aware(value: datetime) -> datetime:
+-            return (
+-                value.replace(tzinfo=timezone.utc)
+-                if value.tzinfo is None
+-                else value
+-            )
++    def events_for(self, request_id: str) -> list[RecommendationEvent]:
++        return sorted(
++            (
++                event
++                for event in self.events
++                if event.request_id == request_id
++            ),
++            key=lambda event: _aware(event.created_at),
++        )
+ 
+-        return max(aware(assignment.created_at) for assignment in self.assignments)
++    def events_for_user(self, user_id: str) -> list[RecommendationEvent]:
++        return sorted(
++            (
++                event
++                for event in self.events
++                if event.user_id == user_id
++            ),
++            key=lambda event: _aware(event.created_at),
++        )
++
++    def recent_impression_counts(
++        self,
++        now: datetime,
++        days: int = 30,
++    ) -> dict[str, int]:
++        cutoff = _aware(now) - timedelta(days=days)
++        end = _aware(now)
++        counts: dict[str, int] = {}
++        for impression in self.impressions:
++            if cutoff <= _aware(impression.created_at) <= end:
++                for candidate_id in impression.candidate_ids:
++                    counts[candidate_id] = counts.get(candidate_id, 0) + 1
++        return counts
++
++    def prior_collaboration_count(
++        self,
++        customer_id: str,
++        worker_id: str,
++        before: datetime | None = None,
++    ) -> int:
++        reference = before if before is not None else self.reference_time
++        cutoff = _aware(reference)
++        return sum(
++            1
++            for assignment in self.assignments
++            if assignment.status == "completed"
++            and assignment.customer_id == customer_id
++            and assignment.worker_id == worker_id
++            and _aware(assignment.created_at) < cutoff
++        )
+ 
+     def worker_ratings(self, worker_id: str) -> list[float]:
+         worker = self.workers.get(worker_id)
+         return list(worker.ratings) if worker else []
+ 
+     def worker_assignments(self, worker_id: str) -> list[Assignment]:
+         return [a for a in self.assignments if a.worker_id == worker_id]
+
+--- a/app\domain.py
++++ b/app\domain.py
+@@ -1,20 +1,66 @@
+ """Domain entities for the Phase 1 task assignment recommender."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
++from typing import TypeVar
++
++RecordT = TypeVar("RecordT")
+ 
+ 
+ def _utcnow() -> datetime:
+     return datetime.now(timezone.utc)
++
++
++def _as_utc(value: datetime) -> datetime:
++    """Normalize naive datetimes to UTC for safe comparisons."""
++    return (
++        value.replace(tzinfo=timezone.utc)
++        if value.tzinfo is None
++        else value
++    )
++
++
++def _split_by_assignment(
++    records: list[RecordT],
++    train_ids: set[str],
++    test_ids: set[str],
++    split_time: datetime,
++) -> tuple[list[RecordT], list[RecordT]]:
++    """Split event/impression records, preferring assignment metadata.
++
++    Records carrying ``metadata["assignment_id"]`` are classified by the
++    assignment's split, which stays correct when a train and a test assignment
++    share the boundary timestamp. Records without assignment metadata fall
++    back to timestamps; ties at ``split_time`` are conservatively placed in
++    test so a test record can never leak into train.
++    """
++    train: list[RecordT] = []
++    test: list[RecordT] = []
++    for record in records:
++        metadata = getattr(record, "metadata", None)
++        assignment_id = (
++            metadata.get("assignment_id")
++            if isinstance(metadata, dict)
++            else None
++        )
++        if assignment_id in train_ids:
++            train.append(record)
++        elif assignment_id in test_ids:
++            test.append(record)
++        elif _as_utc(record.created_at) < split_time:
++            train.append(record)
++        else:
++            test.append(record)
++    return train, test
+ 
+ 
+ @dataclass
+ class Worker:
+     worker_id: str
+     name: str
+     skills: dict[str, int]
+     specialties: dict[str, int]
+     level: int
+     capacity_hours: float
+@@ -23,20 +69,23 @@
+     preferred_difficulty: tuple[int, int]
+     region: str
+     remote_ok: bool
+     status: str = "active"
+     ratings: list[float] = field(default_factory=list)
+     completed: int = 0
+     on_time: int = 0
+     rework_count: int = 0
+     breach_dates: list[datetime] = field(default_factory=list)
+     category_ratings: dict[str, list[float]] = field(default_factory=dict)
++    expected_pay: float = 0.0
++    certifications: dict[str, float] = field(default_factory=dict)
++    communication_ratings: list[float] = field(default_factory=list)
+ 
+ 
+ @dataclass
+ class Customer:
+     customer_id: str
+     name: str
+     region: str
+     preference_weights: dict[str, float] = field(default_factory=dict)
+     created_at: datetime = field(default_factory=_utcnow)
+ 
+@@ -105,20 +154,21 @@
+     deadline: datetime
+     region: str
+     remote_ok: bool
+     description: str = ""
+     status: str = "open"
+     budget: float = 0.0
+     requirements: list[str] = field(default_factory=list)
+     budget_min: float = 0.0
+     budget_max: float = 0.0
+     created_at: datetime = field(default_factory=_utcnow)
++    required_skill_weights: dict[str, float] = field(default_factory=dict)
+ 
+ 
+ @dataclass
+ class Assignment:
+     assignment_id: str
+     task_id: str
+     worker_id: str
+     customer_id: str
+     status: str = "completed"
+     on_time: bool = True
+@@ -138,20 +188,49 @@
+     assignment_id: str
+     worker_id: str
+     task_id: str
+     overall_rating: int
+     created_at: datetime = field(default_factory=_utcnow)
+     quality_rating: int | None = None
+     timeliness_rating: int | None = None
+     communication_rating: int | None = None
+     comment: str = ""
+     propensity: float = 1.0
++
++
++@dataclass
++class Impression:
++    request_id: str
++    query_id: str
++    candidate_ids: list[str]
++    propensities: dict[str, float]
++    policy: str
++    created_at: datetime = field(default_factory=_utcnow)
++    metadata: dict = field(default_factory=dict)
++
++
++@dataclass
++class RecommendationEvent:
++    event_id: str
++    request_id: str
++    user_id: str | None
++    role: str
++    task_id: str
++    candidate_id: str
++    candidate_type: str
++    rank: int
++    score: float
++    propensity: float
++    weights_version: str
++    action: str
++    created_at: datetime = field(default_factory=_utcnow)
++    metadata: dict = field(default_factory=dict)
+ 
+ 
+ @dataclass
+ class AcceptanceCriterion:
+     key: str
+     label: str
+     dimension: str
+     layer: str = "machine"
+     required: bool = False
+     weight: float = 0.0
+@@ -225,20 +304,81 @@
+ class Dataset:
+     workers: list[Worker]
+     customers: list[Customer]
+     tasks: list[Task]
+     assignments: list[Assignment]
+     feedback: list[Feedback]
+     train: list[Assignment]
+     test: list[Assignment]
+     true_weights: dict[str, dict[str, float]] = field(default_factory=dict)
+     new_users: list[Worker] = field(default_factory=list)
++    events: list[RecommendationEvent] = field(default_factory=list)
++    impressions: list[Impression] = field(default_factory=list)
++
++    @property
++    def split_time(self) -> datetime:
++        """End of the training window, derived from the latest train assignment."""
++        if not self.train:
++            return datetime.now(timezone.utc)
++        return max(_as_utc(assignment.created_at) for assignment in self.train)
++
++    @property
++    def train_feedback(self) -> list[Feedback]:
++        train_ids = {assignment.assignment_id for assignment in self.train}
++        return [
++            item
++            for item in self.feedback
++            if item.assignment_id in train_ids
++        ]
++
++    @property
++    def test_feedback(self) -> list[Feedback]:
++        test_ids = {assignment.assignment_id for assignment in self.test}
++        return [
++            item
++            for item in self.feedback
++            if item.assignment_id in test_ids
++        ]
++
++    def _event_split(
++        self,
++    ) -> tuple[list[RecommendationEvent], list[RecommendationEvent]]:
++        return _split_by_assignment(
++            self.events,
++            {assignment.assignment_id for assignment in self.train},
++            {assignment.assignment_id for assignment in self.test},
++            _as_utc(self.split_time),
++        )
++
++    def _impression_split(self) -> tuple[list[Impression], list[Impression]]:
++        return _split_by_assignment(
++            self.impressions,
++            {assignment.assignment_id for assignment in self.train},
++            {assignment.assignment_id for assignment in self.test},
++            _as_utc(self.split_time),
++        )
++
++    @property
++    def train_events(self) -> list[RecommendationEvent]:
++        return self._event_split()[0]
++
++    @property
++    def test_events(self) -> list[RecommendationEvent]:
++        return self._event_split()[1]
++
++    @property
++    def train_impressions(self) -> list[Impression]:
++        return self._impression_split()[0]
++
++    @property
++    def test_impressions(self) -> list[Impression]:
++        return self._impression_split()[1]
+ 
+ 
+ @dataclass
+ class SubTask:
+     subtask_id: str
+     chain_id: str
+     key: str
+     title: str
+     node_type: str
+     estimated_hours: float
+
+--- a/tests\test_events.py
++++ b/tests\test_events.py
+@@ -0,0 +1,283 @@
++from datetime import datetime, timedelta, timezone
++
++from app.data.store import Store
++from app.domain import (
++    Assignment, Customer, Dataset, Feedback, Impression, RecommendationEvent,
++    Task, Worker,
++)
++
++NOW = datetime(2026, 1, 10, tzinfo=timezone.utc)
++
++
++def test_impression_fields():
++    impression = Impression(
++        request_id="r1", query_id="t1", candidate_ids=["w1"],
++        propensities={"w1": 1.0}, policy="test",
++    )
++    assert impression.request_id == "r1"
++    assert impression.candidate_ids == ["w1"]
++
++
++def _worker(worker_id: str = "w1") -> Worker:
++    return Worker(
++        worker_id=worker_id,
++        name=worker_id,
++        skills={"python": 4},
++        specialties={"software_dev": 3},
++        level=3,
++        capacity_hours=40,
++        current_load_hours=0,
++        preferred_categories={"software_dev": 0.8},
++        preferred_difficulty=(2, 4),
++        region="CN",
++        remote_ok=True,
++    )
++
++
++def test_new_worker_and_task_fields_have_defaults():
++    worker = _worker()
++    assert worker.expected_pay == 0.0
++    assert worker.certifications == {}
++    assert worker.communication_ratings == []
++    task = Task(
++        task_id="t1", customer_id="c1", title="T", category="software_dev",
++        required_skills={}, required_level=1, difficulty=3, priority=3,
++        estimated_hours=2, deadline=NOW, region="CN", remote_ok=True,
++    )
++    assert task.required_skill_weights == {}
++
++
++def test_store_reference_time_includes_events_and_impressions():
++    worker = _worker()
++    event = RecommendationEvent(
++        event_id="e1", request_id="r1", user_id="c1", role="customer",
++        task_id="t1", candidate_id="w1", candidate_type="worker",
++        rank=1, score=0.9, propensity=0.5, weights_version="v0000",
++        action="click", created_at=NOW + timedelta(days=2),
++    )
++    impression = Impression(
++        request_id="r1", query_id="t1", candidate_ids=["w1"],
++        propensities={"w1": 1.0}, policy="test",
++        created_at=NOW + timedelta(days=1),
++    )
++    store = Store(
++        workers=[worker], customers=[], tasks=[], assignments=[], feedback=[],
++        events=[event], impressions=[impression],
++    )
++    assert store.reference_time == event.created_at
++    assert store.events_for("r1") == [event]
++    assert store.events_for_user("c1") == [event]
++
++    later_impression = Impression(
++        request_id="r2", query_id="t2", candidate_ids=["w1"],
++        propensities={"w1": 1.0}, policy="test",
++        created_at=NOW + timedelta(days=3),
++    )
++    store.impressions.append(later_impression)
++    assert store.reference_time == later_impression.created_at
++
++
++def test_recent_impression_counts_window():
++    from app.domain import Impression
++
++    worker = _worker()
++    old = Impression(
++        request_id="r_old", query_id="t1", candidate_ids=["w1"],
++        propensities={"w1": 1.0}, policy="test",
++        created_at=NOW - timedelta(days=60),
++    )
++    new = Impression(
++        request_id="r_new", query_id="t2", candidate_ids=["w1"],
++        propensities={"w1": 1.0}, policy="test",
++        created_at=NOW - timedelta(days=5),
++    )
++    store = Store(
++        workers=[worker], customers=[], tasks=[], assignments=[], feedback=[],
++        impressions=[old, new],
++    )
++    assert store.recent_impression_counts(NOW, days=30)["w1"] == 1
++
++
++def test_prior_collaboration_counts_only_completed_before():
++    worker = _worker()
++    customer = Customer(customer_id="c1", name="C", region="CN")
++    old = Assignment(
++        assignment_id="a1", task_id="t1", worker_id="w1", customer_id="c1",
++        status="completed", created_at=NOW - timedelta(days=10),
++    )
++    new = Assignment(
++        assignment_id="a2", task_id="t2", worker_id="w1", customer_id="c1",
++        status="completed", created_at=NOW + timedelta(days=10),
++    )
++    cancelled = Assignment(
++        assignment_id="a3", task_id="t3", worker_id="w1", customer_id="c1",
++        status="cancelled", created_at=NOW - timedelta(days=5),
++    )
++    store = Store(
++        workers=[worker], customers=[customer], tasks=[],
++        assignments=[old, new, cancelled], feedback=[],
++    )
++    assert store.prior_collaboration_count("c1", "w1", before=NOW) == 1
++
++
++def _split_dataset() -> Dataset:
++    """Train and test assignments share the boundary timestamp on purpose."""
++    worker = _worker()
++    train_assignment = Assignment(
++        assignment_id="a_train", task_id="t1", worker_id="w1",
++        customer_id="c1", status="completed", created_at=NOW,
++    )
++    test_assignment = Assignment(
++        assignment_id="a_test", task_id="t2", worker_id="w1",
++        customer_id="c1", status="completed", created_at=NOW,
++    )
++    feedback = [
++        Feedback(
++            feedback_id="f_train", assignment_id="a_train", worker_id="w1",
++            task_id="t1", overall_rating=5, created_at=NOW,
++        ),
++        Feedback(
++            feedback_id="f_test", assignment_id="a_test", worker_id="w1",
++            task_id="t2", overall_rating=3, created_at=NOW,
++        ),
++    ]
++    impressions = [
++        Impression(
++            request_id="r_train", query_id="t1", candidate_ids=["w1"],
++            propensities={"w1": 1.0}, policy="test", created_at=NOW,
++            metadata={"assignment_id": "a_train"},
++        ),
++        Impression(
++            request_id="r_test", query_id="t2", candidate_ids=["w1"],
++            propensities={"w1": 1.0}, policy="test", created_at=NOW,
++            metadata={"assignment_id": "a_test"},
++        ),
++    ]
++    events = [
++        RecommendationEvent(
++            event_id="e_train", request_id="r_train", user_id="c1",
++            role="customer", task_id="t1", candidate_id="w1",
++            candidate_type="worker", rank=1, score=0.9, propensity=1.0,
++            weights_version="v0000", action="accept", created_at=NOW,
++            metadata={"assignment_id": "a_train"},
++        ),
++        RecommendationEvent(
++            event_id="e_test", request_id="r_test", user_id="c1",
++            role="customer", task_id="t2", candidate_id="w1",
++            candidate_type="worker", rank=1, score=0.8, propensity=1.0,
++            weights_version="v0000", action="accept", created_at=NOW,
++            metadata={"assignment_id": "a_test"},
++        ),
++    ]
++    return Dataset(
++        workers=[worker],
++        customers=[Customer(customer_id="c1", name="C", region="CN")],
++        tasks=[],
++        assignments=[train_assignment, test_assignment],
++        feedback=feedback,
++        train=[train_assignment],
++        test=[test_assignment],
++        events=events,
++        impressions=impressions,
++    )
++
++
++def test_dataset_split_prefers_assignment_metadata_on_timestamp_ties():
++    dataset = _split_dataset()
++    assert dataset.split_time == NOW
++    assert [event.event_id for event in dataset.train_events] == ["e_train"]
++    assert [event.event_id for event in dataset.test_events] == ["e_test"]
++    assert [
++        impression.request_id for impression in dataset.train_impressions
++    ] == ["r_train"]
++    assert [
++        impression.request_id for impression in dataset.test_impressions
++    ] == ["r_test"]
++
++
++def test_dataset_event_impression_and_feedback_splits_are_disjoint():
++    dataset = _split_dataset()
++
++    train_event_ids = {event.event_id for event in dataset.train_events}
++    test_event_ids = {event.event_id for event in dataset.test_events}
++    assert train_event_ids.isdisjoint(test_event_ids)
++    assert len(train_event_ids) + len(test_event_ids) == len(dataset.events)
++
++    train_impression_ids = {
++        impression.request_id for impression in dataset.train_impressions
++    }
++    test_impression_ids = {
++        impression.request_id for impression in dataset.test_impressions
++    }
++    assert train_impression_ids.isdisjoint(test_impression_ids)
++    assert (
++        len(train_impression_ids) + len(test_impression_ids)
++        == len(dataset.impressions)
++    )
++
++    train_feedback_ids = {
++        item.feedback_id for item in dataset.train_feedback
++    }
++    test_feedback_ids = {
++        item.feedback_id for item in dataset.test_feedback
++    }
++    assert train_feedback_ids.isdisjoint(test_feedback_ids)
++    assert (
++        len(train_feedback_ids) + len(test_feedback_ids) == len(dataset.feedback)
++    )
++
++
++def test_dataset_split_without_metadata_falls_back_to_timestamps():
++    worker = _worker()
++    train_assignment = Assignment(
++        assignment_id="a_train", task_id="t1", worker_id="w1",
++        customer_id="c1", status="completed",
++        created_at=NOW - timedelta(days=1),
++    )
++    test_assignment = Assignment(
++        assignment_id="a_test", task_id="t2", worker_id="w1",
++        customer_id="c1", status="completed",
++        created_at=NOW + timedelta(days=1),
++    )
++    early_event = RecommendationEvent(
++        event_id="e_early", request_id="r1", user_id="c1", role="customer",
++        task_id="t1", candidate_id="w1", candidate_type="worker",
++        rank=1, score=0.9, propensity=1.0, weights_version="v0000",
++        action="accept", created_at=NOW - timedelta(days=2),
++    )
++    late_event = RecommendationEvent(
++        event_id="e_late", request_id="r2", user_id="c1", role="customer",
++        task_id="t2", candidate_id="w1", candidate_type="worker",
++        rank=1, score=0.9, propensity=1.0, weights_version="v0000",
++        action="accept", created_at=NOW + timedelta(hours=1),
++    )
++    dataset = Dataset(
++        workers=[worker], customers=[], tasks=[],
++        assignments=[train_assignment, test_assignment], feedback=[],
++        train=[train_assignment], test=[test_assignment],
++        events=[early_event, late_event],
++    )
++    assert [event.event_id for event in dataset.train_events] == ["e_early"]
++    assert [event.event_id for event in dataset.test_events] == ["e_late"]
++
++
++def test_dataset_split_time_is_timezone_aware_with_empty_train():
++    dataset = Dataset(
++        workers=[], customers=[], tasks=[], assignments=[], feedback=[],
++        train=[], test=[],
++    )
++    assert dataset.split_time.tzinfo is not None
++    assert dataset.train_events == []
++    assert dataset.test_events == []
++
++
++def test_dataset_split_time_normalizes_naive_train_timestamps():
++    assignment = Assignment(
++        assignment_id="a1", task_id="t1", worker_id="w1", customer_id="c1",
++        status="completed", created_at=datetime(2026, 1, 10),
++    )
++    dataset = Dataset(
++        workers=[], customers=[], tasks=[], assignments=[assignment],
++        feedback=[], train=[assignment], test=[],
++    )
++    assert dataset.split_time.tzinfo is not None
+

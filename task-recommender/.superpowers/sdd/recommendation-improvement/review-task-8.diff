@@ -1,0 +1,118 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-7 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\learning\weights.py
+ADDED   tests\test_weight_binding.py
+
+## Diff
+
+--- a/app\learning\weights.py
++++ b/app\learning\weights.py
+@@ -1,15 +1,16 @@
+ """AHP prior, entropy weights, and constrained projection."""
+ 
+ from __future__ import annotations
+ 
+ import math
++from dataclasses import dataclass, field
+ 
+ from app.config import DEFAULT_WEIGHTS
+ 
+ AHP_PRIOR: dict[str, float] = dict(DEFAULT_WEIGHTS)
+ KEYS: list[str] = list(AHP_PRIOR)
+ MIN_WEIGHT = 0.02
+ REPUTATION_MIN = 0.25
+ REPUTATION_MAX = 0.40
+ SKILL_EXPERTISE_MIN = 0.25
+ 
+@@ -153,22 +154,36 @@
+     ):
+         raise ValueError("skill + expertise must be >= 0.25")
+     if len(weights) >= 7 and "reputation" in weights:
+         others = [
+             value for key, value in weights.items() if key != "reputation"
+         ]
+         if others and weights["reputation"] < max(others) - 1e-9:
+             raise ValueError("reputation must be the largest weight")
+ 
+ 
+-def project_weights(weights: dict[str, float]) -> dict[str, float]:
++@dataclass(frozen=True)
++class WeightBindingReport:
++    """Counts of constraint bindings observed during projection."""
++
++    reputation_hit_low: int = 0
++    reputation_hit_high: int = 0
++    min_hits: dict[str, int] = field(default_factory=dict)
++    iterations: int = 1
++
++
++def project_weights_with_report(
++    weights: dict[str, float],
++) -> tuple[dict[str, float], WeightBindingReport]:
+     raw = {key: max(float(weights.get(key, 0.0)), 0.0) for key in KEYS}
++    reputation_hit_low = 1 if raw["reputation"] < REPUTATION_MIN else 0
++    reputation_hit_high = 1 if raw["reputation"] > REPUTATION_MAX else 0
+     reputation = min(
+         REPUTATION_MAX, max(REPUTATION_MIN, raw["reputation"])
+     )
+ 
+     skill_expertise_raw = {
+         "skill": raw["skill"],
+         "expertise": raw["expertise"],
+     }
+     skill_expertise_mass = max(
+         SKILL_EXPERTISE_MIN, sum(skill_expertise_raw.values())
+@@ -224,11 +239,27 @@
+             if difference > 0:
+                 room = reputation - result[key]
+                 addition = min(difference, max(0.0, room))
+             else:
+                 addition = max(difference, MIN_WEIGHT - result[key])
+             result[key] += addition
+             difference -= addition
+         if abs(difference) > 1e-12:
+             room = REPUTATION_MAX - result["reputation"]
+             result["reputation"] += max(-room, min(room, difference))
+-    return {key: round(result[key], 12) for key in KEYS}
++
++    projected = {key: round(result[key], 12) for key in KEYS}
++    min_hits = {
++        key: 1 if value <= MIN_WEIGHT + 1e-9 else 0
++        for key, value in projected.items()
++    }
++    report = WeightBindingReport(
++        reputation_hit_low=reputation_hit_low,
++        reputation_hit_high=reputation_hit_high,
++        min_hits=min_hits,
++        iterations=1,
++    )
++    return projected, report
++
++
++def project_weights(weights: dict[str, float]) -> dict[str, float]:
++    return project_weights_with_report(weights)[0]
+
+--- a/tests\test_weight_binding.py
++++ b/tests\test_weight_binding.py
+@@ -0,0 +1,19 @@
++from app.config import DEFAULT_WEIGHTS
++from app.learning.weights import project_weights_with_report
++
++
++def test_projection_reports_reputation_high_bound():
++    weights = dict(DEFAULT_WEIGHTS)
++    weights["reputation"] = 0.9
++    projected, report = project_weights_with_report(weights)
++    assert projected["reputation"] <= 0.40 + 1e-9
++    assert report.reputation_hit_high == 1
++    assert abs(sum(projected.values()) - 1.0) < 1e-9
++
++
++def test_projection_reports_min_weight_hits():
++    weights = dict(DEFAULT_WEIGHTS)
++    weights["customer_preference"] = 0.0
++    projected, report = project_weights_with_report(weights)
++    assert projected["customer_preference"] >= 0.02 - 1e-9
++    assert report.min_hits.get("customer_preference", 0) >= 1
+

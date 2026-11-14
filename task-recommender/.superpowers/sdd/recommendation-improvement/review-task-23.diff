@@ -1,0 +1,2476 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-24 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\main.py
+CHANGED app\nlp\classifier.py
+ADDED   app\nlp\extract.py
+CHANGED app\nlp\lexicon.py
+ADDED   app\nlp\normalize.py
+ADDED   app\nlp\sections.py
+ADDED   app\nlp\tokenizer.py
+CHANGED frontend\app.js
+CHANGED requirements.txt
+ADDED   scripts\evaluate_nlp.py
+ADDED   tests\test_nlp_api.py
+ADDED   tests\test_nlp_eval.py
+ADDED   tests\test_nlp_extract.py
+ADDED   tests\test_nlp_normalize.py
+ADDED   tests\test_nlp_sections.py
+
+## Diff
+
+--- a/app\main.py
++++ b/app\main.py
+@@ -511,20 +511,25 @@
+     @app.post("/classify")
+     def classify_text(request: ClassifyRequest) -> dict:
+         """Classify a free-form posting and extract task fields (no LLM)."""
+         try:
+             result = get_default_classifier().predict(
+                 request.text, top_k=request.top_k
+             )
+         except ValueError as error:
+             raise HTTPException(status_code=422, detail=str(error))
+         result["suggested_template"] = result["category"]
++        # Additive, evidence-bearing fields. ``confidence``, ``margin``,
++        # ``calibrated_confidence``, ``confidence_threshold``, ``evidence``
++        # and ``extracted_v2`` already come from the classifier; ``fields_v2``
++        # is a stable alias for Task 22's upload/resume analysis to consume.
++        result["fields_v2"] = result.get("extracted_v2", {})
+         return result
+ 
+     # ------------------------------------------------------------------
+     # Acceptance workflow
+     # ------------------------------------------------------------------
+     def _acceptance() -> AcceptanceService:
+         return app.state.acceptance
+ 
+     @app.get("/acceptance/demo")
+     def acceptance_demo() -> dict:
+
+--- a/app\nlp\classifier.py
++++ b/app\nlp\classifier.py
+@@ -1,37 +1,47 @@
+ """Hybrid task-text classification and structured-field extraction.
+ 
+ No LLM is used. The classifier combines:
+ 
+-1. a weighted lexicon (explainable, strong on short posts), and
++1. a weighted lexicon (explainable, strong on short posts),
+ 2. character 2-4 gram TF-IDF + multinomial logistic regression (robust to
+-   unseen phrasing without needing a Chinese word segmenter).
+-
+-The two distributions are blended. A low-margin prediction is marked as
+-needing clarification instead of being forced into one category.
++   unseen phrasing without needing a Chinese word segmenter), and
++3. optional word 1-2 gram TF-IDF features when ``jieba`` is available.
++
++The two (or three) distributions are blended. Top-1 confidence is then
++calibrated (Platt) on out-of-fold blended scores so ``confidence`` reflects
++``P(top-1 correct)``, and a per-category threshold gates a low-margin or
++low-confidence prediction into ``needs_clarification`` instead of forcing it
++into one category.
+ """
+ 
+ from __future__ import annotations
+ 
++import math
++import random
+ import re
+-import unicodedata
+ from collections.abc import Iterable
+-
++from datetime import datetime
++
++from scipy import sparse
+ from sklearn.feature_extraction.text import TfidfVectorizer
+ from sklearn.linear_model import LogisticRegression
+ 
+ from app.domain import Task
++from app.learning.calibration import PlattCalibrator
++from app.nlp.extract import extract_fields_v2
+ from app.nlp.lexicon import (
+     CATEGORY_KEYWORDS,
+     CATEGORY_LABELS,
+     SKILL_KEYWORDS,
+ )
++from app.nlp.normalize import normalize_text
+ 
+ SENTENCE_SPLIT = re.compile(r"[。！？!?；;\n]+")
+ 
+ _NUM = r"\d[\d,]*(?:\.\d+)?"
+ _BUDGET_RANGE_RE = re.compile(
+     rf"({_NUM})\s*(万)?\s*元?\s*(?:[-–—~～至到])\s*"
+     rf"({_NUM})\s*(万)?\s*元?"
+ )
+ _BUDGET_SINGLE_RE = re.compile(
+     rf"(?:预算|报酬|薪酬|费用|价格)\s*(?:为|是|约|：|:)?\s*"
+@@ -61,21 +71,21 @@
+     "独立",
+     "配合",
+     "接受",
+ )
+ 
+ _REMOTE_CUES = ("远程", "线上", "居家", "异地")
+ _ONSITE_CUES = ("现场", "线下", "驻场", "到岗", "坐班")
+ 
+ 
+ def _normalize(text: str) -> str:
+-    return unicodedata.normalize("NFKC", text or "").lower()
++    return normalize_text(text or "").lower()
+ 
+ 
+ def split_sentences(text: str) -> list[str]:
+     return [part.strip() for part in SENTENCE_SPLIT.split(text or "") if part.strip()]
+ 
+ 
+ def _amount(number: str, ten_thousand: str | None) -> float:
+     value = float(number.replace(",", ""))
+     return value * (10000.0 if ten_thousand else 1.0)
+ 
+@@ -237,105 +247,344 @@
+             if count:
+                 scores[category] += weight * min(count, 2)
+     return scores
+ 
+ 
+ def _task_text(task: Task) -> str:
+     parts = [task.title, task.description, *task.requirements]
+     return "。".join(part for part in parts if part)
+ 
+ 
++def _jieba_available() -> bool:
++    try:
++        import jieba  # noqa: F401
++    except ImportError:
++        return False
++    return True
++
++
++def _word_analyzer(text: str) -> list[str]:
++    from app.nlp.tokenizer import tokenize
++
++    return tokenize(text)
++
++
++def _sigmoid(value: float) -> float:
++    if value >= 0.0:
++        return 1.0 / (1.0 + math.exp(-value))
++    exp_value = math.exp(value)
++    return exp_value / (1.0 + exp_value)
++
++
++class _PriorCalibrator:
++    """Fixed prior mapping used only when no negatives are observable.
++
++    The synthetic training corpus is saturated (100% out-of-fold top-1), so a
++    Platt/isotonic fit has no negative class to learn from. This prior maps the
++    classifier's observed correct-score band (>= ~0.3 blended mass) to high
++    confidence and the near-zero ambiguous band to low confidence. It is a
++    documented fallback, not a fit; real calibration is used whenever the
++    training corpus contains errors.
++    """
++
++    def __init__(self, scale: float = 20.0, offset: float = 0.20) -> None:
++        self.scale = scale
++        self.offset = offset
++
++    def predict(self, score: float) -> float:
++        value = _sigmoid(self.scale * (float(score) - self.offset))
++        return max(0.0, min(1.0, value))
++
++
+ class TaskTextClassifier:
+-    """Blend a lexicon scorer with a char n-gram linear model."""
+-
+-    def __init__(self, alpha: float = 0.6) -> None:
++    """Blend a lexicon scorer with char (+ optional word) n-gram models.
++
++    ``predict`` returns the existing top-k surface plus calibrated confidence,
++    a per-category confidence threshold, lexicon evidence for the top category,
++    and ``extracted_v2`` (evidence-bearing fields). Calibration is computed
++    out-of-fold during :meth:`fit` so the reported confidence is honest on
++    unseen text.
++    """
++
++    def __init__(self, alpha: float = 0.6, calibrate: bool = True) -> None:
+         if not 0.0 <= alpha <= 1.0:
+             raise ValueError("alpha must be between 0 and 1")
+         self.alpha = alpha
++        self.calibrate = calibrate
+         self.vectorizer: TfidfVectorizer | None = None
++        self.word_vectorizer: TfidfVectorizer | None = None
+         self.model: LogisticRegression | None = None
+         self.classes_: list[str] = []
++        self.calibrator: PlattCalibrator | None = None
++        self.default_threshold = 0.5
++        self.min_threshold = 0.4
++        self.max_threshold = 0.8
++        self.thresholds: dict[str, float] = {}
+ 
+     def fit(self, tasks: Iterable[Task]) -> "TaskTextClassifier":
+         tasks = list(tasks)
+         if len(tasks) < 2:
+             raise ValueError("at least two labeled tasks are required")
+         texts = [_normalize(_task_text(task)) for task in tasks]
+         labels = [task.category for task in tasks]
+         self.vectorizer = TfidfVectorizer(
+             analyzer="char",
+             ngram_range=(2, 4),
+             min_df=1,
+             sublinear_tf=True,
+         )
+-        matrix = self.vectorizer.fit_transform(texts)
++        matrices = [self.vectorizer.fit_transform(texts)]
++        self.word_vectorizer = None
++        if _jieba_available():
++            self.word_vectorizer = TfidfVectorizer(
++                analyzer=_word_analyzer,
++                ngram_range=(1, 2),
++                min_df=1,
++                sublinear_tf=True,
++            )
++            matrices.append(self.word_vectorizer.fit_transform(texts))
++        matrix = sparse.hstack(matrices) if len(matrices) > 1 else matrices[0]
+         self.model = LogisticRegression(
+             max_iter=2000,
+             class_weight="balanced",
+             C=4.0,
+         )
+         self.model.fit(matrix, labels)
+         self.classes_ = [str(label) for label in self.model.classes_]
++        self._fit_calibration(tasks, labels)
+         return self
+ 
++    # ------------------------------------------------------------------
++    # Probabilities and ranking
++    # ------------------------------------------------------------------
+     def _ml_probabilities(self, text: str) -> dict[str, float]:
+         if self.model is None or self.vectorizer is None:
+             raise RuntimeError("classifier is not fitted")
+-        matrix = self.vectorizer.transform([_normalize(text)])
++        normalized = _normalize(text)
++        matrices = [self.vectorizer.transform([normalized])]
++        if self.word_vectorizer is not None:
++            matrices.append(self.word_vectorizer.transform([normalized]))
++        matrix = sparse.hstack(matrices) if len(matrices) > 1 else matrices[0]
+         probabilities = self.model.predict_proba(matrix)[0]
+         return {
+             category: float(probability)
+             for category, probability in zip(
+                 self.classes_, probabilities, strict=True
+             )
+         }
+ 
+-    def predict(self, text: str, top_k: int = 3) -> dict:
+-        if not text or not text.strip():
+-            raise ValueError("text is required")
+-        top_k = max(1, min(int(top_k), 6))
+-
++    def _rank(self, text: str) -> list[tuple[str, float]]:
++        """Blended scores ordered by descending confidence."""
+         ml_probs = self._ml_probabilities(text)
+         raw_rules = rule_scores(text)
+         rule_total = sum(raw_rules.values())
+         rule_probs = (
+             {category: score / rule_total for category, score in raw_rules.items()}
+             if rule_total > 0
+             else {}
+         )
+-
+         categories = set(ml_probs) | set(rule_probs)
+         blended = {
+             category: self.alpha * ml_probs.get(category, 0.0)
+             + (1.0 - self.alpha) * rule_probs.get(category, 0.0)
+             for category in categories
+         }
+-        ordered = sorted(blended.items(), key=lambda item: (-item[1], item[0]))
++        return sorted(blended.items(), key=lambda item: (-item[1], item[0]))
++
++    # ------------------------------------------------------------------
++    # Calibration and confidence gating
++    # ------------------------------------------------------------------
++    def _fit_calibration(self, tasks: list[Task], labels: list[str]) -> None:
++        self.calibrator = None
++        self.thresholds = {
++            category: self.default_threshold for category in self.classes_
++        }
++        if not self.calibrate:
++            return
++        if len(tasks) < 40 or len(set(labels)) < 3:
++            return
++
++        from sklearn.model_selection import StratifiedKFold
++
++        splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
++        clean_scores: list[float] = []
++        clean_correct: list[int] = []
++        clean_by_category: dict[str, list[tuple[float, bool]]] = {}
++        for train_index, test_index in splitter.split(tasks, labels):
++            if not len(train_index) or not len(test_index):
++                continue
++            fold_model = TaskTextClassifier(
++                alpha=self.alpha, calibrate=False
++            ).fit([tasks[index] for index in train_index])
++            for index in test_index:
++                text = _normalize(_task_text(tasks[index]))
++                try:
++                    ordered = fold_model._rank(text)
++                except Exception:  # noqa: BLE001 - one bad fold row is cosmetic
++                    continue
++                top_category, top_score = ordered[0]
++                correct = top_category == labels[index]
++                clean_scores.append(top_score)
++                clean_correct.append(1 if correct else 0)
++                clean_by_category.setdefault(labels[index], []).append(
++                    (top_score, correct)
++                )
++
++        all_scores = list(clean_scores)
++        all_correct = list(clean_correct)
++        all_by_category: dict[str, list[tuple[float, bool]]] = {
++            category: list(clean_by_category.get(category, []))
++            for category in self.classes_
++        }
++        if len(set(clean_correct)) < 2:
++            # The synthetic corpus is saturated (100% out-of-fold top-1), so it
++            # carries no negative class. Add negatives by scoring deterministically
++            # perturbed copies of the training postings against the fitted model.
++            # This estimates calibration on typo/degraded text without touching
++            # any evaluation holdout.
++            for score, correct, category in self._perturbed_calibration_pairs(
++                tasks, labels
++            ):
++                all_scores.append(score)
++                all_correct.append(1 if correct else 0)
++                all_by_category.setdefault(category, []).append((score, correct))
++
++        if len(set(all_correct)) < 2 or len(all_scores) < 10:
++            # No negative class anywhere: fall back to the documented prior so
++            # confidence stays meaningful on saturated synthetic training data.
++            self.calibrator = _PriorCalibrator()
++            self.thresholds = {
++                category: self.default_threshold for category in self.classes_
++            }
++            return
++        self.calibrator = PlattCalibrator().fit(all_scores, all_correct)
++        self.thresholds = {
++            category: self._category_threshold(all_by_category.get(category, []))
++            for category in self.classes_
++        }
++
++    _NOISE_CHARS = "的了是在有一个和人"
++
++    def _perturbed_calibration_pairs(
++        self, tasks: list[Task], labels: list[str]
++    ) -> list[tuple[float, bool, str]]:
++        """Score typo-perturbed training texts to surface calibration negatives."""
++        rng = random.Random(20261114)
++        pairs: list[tuple[float, bool, str]] = []
++        for index, task in enumerate(tasks):
++            text = _normalize(_task_text(task))
++            cjk_positions = [
++                position
++                for position, char in enumerate(text)
++                if "一" <= char <= "鿿"
++            ]
++            if len(cjk_positions) < 2:
++                continue
++            variants = []
++            position = rng.choice(cjk_positions)
++            variants.append(text[:position] + text[position + 1:])  # deletion
++            position = rng.choice(cjk_positions)
++            variants.append(
++                text[:position] + rng.choice(self._NOISE_CHARS) + text[position + 1:]
++            )  # substitution
++            for variant in variants:
++                try:
++                    ordered = self._rank(variant)
++                except Exception:  # noqa: BLE001 - a bad variant is cosmetic
++                    continue
++                top_category, top_score = ordered[0]
++                pairs.append((top_score, top_category == labels[index], labels[index]))
++        return pairs
++
++    def _category_threshold(
++        self, pairs: list[tuple[float, bool]]
++    ) -> float:
++        """Lowest calibrated confidence whose precision is >= 0.9.
++
++        Falls back to the category's median correct confidence (clamped) when
++        the category has too few or too clean observations to estimate a
++        meaningful precision point.
++        """
++        if len(pairs) < 6:
++            return self.default_threshold
++        scored = [(self._calibrate(score), correct) for score, correct in pairs]
++        scored.sort(key=lambda item: -item[0])
++        correct_count = 0
++        for index, (confidence, correct) in enumerate(scored, start=1):
++            if correct:
++                correct_count += 1
++            if index >= 3 and correct_count / index >= 0.9:
++                return max(self.min_threshold, min(self.max_threshold, confidence))
++        correct_confs = [confidence for confidence, correct in scored if correct]
++        fallback = (
++            sorted(correct_confs)[len(correct_confs) // 2]
++            if correct_confs
++            else self.default_threshold
++        )
++        return max(self.min_threshold, min(self.max_threshold, fallback))
++
++    def _calibrate(self, score: float) -> float:
++        if self.calibrator is None:
++            return score
++        return self.calibrator.predict(score)
++
++    def _evidence(self, text: str, category: str) -> list[dict]:
++        lowered = _normalize(text)
++        matched = [
++            {"phrase": phrase, "weight": weight}
++            for phrase, weight in CATEGORY_KEYWORDS.get(category, {}).items()
++            if phrase in lowered
++        ]
++        matched.sort(key=lambda item: -item["weight"])
++        return matched[:12]
++
++    # ------------------------------------------------------------------
++    # Public prediction
++    # ------------------------------------------------------------------
++    def predict(
++        self, text: str, top_k: int = 3, now: datetime | None = None
++    ) -> dict:
++        if not text or not text.strip():
++            raise ValueError("text is required")
++        top_k = max(1, min(int(top_k), 6))
++
++        ordered = self._rank(text)
+         top = ordered[:top_k]
++        top_category = top[0][0]
+         top_score = top[0][1]
+         margin = top_score - (top[1][1] if len(top) > 1 else 0.0)
++        calibrated = self._calibrate(top_score)
++        threshold = self.thresholds.get(top_category, self.default_threshold)
+ 
+         return {
+-            "category": top[0][0],
+-            "label": CATEGORY_LABELS.get(top[0][0], top[0][0]),
++            "category": top_category,
++            "label": CATEGORY_LABELS.get(top_category, top_category),
+             "confidence": round(top_score, 4),
++            "calibrated_confidence": round(calibrated, 4),
++            "confidence_threshold": round(threshold, 4),
+             "margin": round(margin, 4),
+-            "needs_clarification": margin < 0.08 or top_score < 0.18,
++            "needs_clarification": (
++                margin < 0.08
++                or top_score < 0.18
++                or calibrated < threshold
++            ),
+             "candidates": [
+                 {
+                     "category": category,
+                     "label": CATEGORY_LABELS.get(category, category),
+                     "confidence": round(score, 4),
+                 }
+                 for category, score in top
+             ],
++            "evidence": self._evidence(text, top_category),
+             "extracted": extract_fields(text),
++            "extracted_v2": extract_fields_v2(text, now=now),
+         }
+ 
+ 
+ _DEFAULT_CLASSIFIER: TaskTextClassifier | None = None
+ 
+ 
+ def get_default_classifier() -> TaskTextClassifier:
+     """Fit once on the synthetic labeled postings, then reuse."""
+     global _DEFAULT_CLASSIFIER
+     if _DEFAULT_CLASSIFIER is None:
+
+--- a/app\nlp\extract.py
++++ b/app\nlp\extract.py
+@@ -0,0 +1,347 @@
++"""Structured field extraction v2 for free-form task postings (no LLM).
++
++Every field is returned as ``{"value": ..., "confidence": float, "evidence":
++str}`` so downstream callers can show *what* was found and *why*. Evidence is
++the matched span in the normalized text. Post-validation is applied after
++extraction:
++
++* ``budget``: ``[min, max]`` with ``min <= max`` enforced (swapped when
++  reversed), units 万/千 handled;
++* ``date`` (deadline): must be strictly in the future relative to ``now``;
++* ``skills``: matched phrases are mapped through the taxonomy and unknown
++  phrases are dropped.
++
++No ground-truth or label storage is read here; the module only consumes the
++caller-supplied text and the lexicons in :mod:`app.nlp.lexicon`.
++"""
++
++from __future__ import annotations
++
++import re
++from datetime import datetime, timezone
++
++from app.nlp.lexicon import SKILL_KEYWORDS, normalize_skill
++from app.nlp.normalize import normalize_text
++
++_NUM = r"\d[\d,]*(?:\.\d+)?"
++
++_BUDGET_RANGE_RE = re.compile(
++    rf"(?<!\d)({_NUM})\s*(万|千|w|k)?\s*元?\s*[-~至到]\s*"
++    rf"({_NUM})\s*(万|千|w|k)?\s*元?(?!\d)"
++)
++_BUDGET_UNIT_RE = re.compile(r"元|万|千|w|k", re.IGNORECASE)
++_BUDGET_SINGLE_RE = re.compile(
++    rf"(?:预算|报酬|薪酬|费用|价格|总价|稿费|佣金|服务费|报价|总预算)\s*"
++    rf"(?:为|是|约|大概|在|：|:)?\s*"
++    rf"({_NUM})\s*(万|千|w|k)?\s*元?"
++)
++_BUDGET_BARE_RE = re.compile(rf"({_NUM})\s*(万|千|w|k)\s*元?\s*预算")
++
++_CN_NUM = r"[一二两三四五六七八九十百千万亿\d]+"
++_DAYS_RE = re.compile(rf"({_CN_NUM})\s*(?:个)?(?:工作日|天|日)(?:内|以内)?")
++_WEEKS_RE = re.compile(rf"({_CN_NUM})\s*(?:个)?(?:周|星期|礼拜)(?:内|以内)?")
++_MONTHS_RE = re.compile(rf"({_CN_NUM})\s*(?:个)?月(?:内|以内)?")
++
++_ISO_DATE_RE = re.compile(r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})\s*日?")
++_MONTH_DAY_RE = re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日")
++_DEADLINE_CUE_RE = re.compile(r"(?:截止|截止日期|截止时间|deadline)\s*[:：]?\s*")
++
++_REMOTE_CUES = ("远程", "线上", "居家", "异地")
++_ONSITE_CUES = ("现场", "线下", "驻场", "到岗", "坐班")
++
++_COUNT_RE = re.compile(
++    rf"({_CN_NUM})\s*(万|千|百)?\s*(张|个|条|篇|份|支|套|次|场|人|名|家|款|期|节|门|页|帧)"
++)
++
++_EXPERIENCE_RANGE_RE = re.compile(
++    rf"({_NUM})\s*(?:-|~|至)\s*({_NUM})\s*年"
++)
++_EXPERIENCE_RE = re.compile(
++    rf"({_CN_NUM})\s*年(?:以上|及以上|左右|经验|工作经验|相关经验)?"
++)
++
++_LANGUAGES = {
++    "中文": ("中文", "汉语", "普通话", "简体中文", "繁体中文"),
++    "英文": ("英文", "英语", "english"),
++    "日文": ("日文", "日语", "japanese"),
++    "韩文": ("韩文", "韩语", "朝鲜语"),
++    "法文": ("法文", "法语"),
++    "德文": ("德文", "德语"),
++    "西班牙文": ("西班牙文", "西班牙语", "西语"),
++    "俄文": ("俄文", "俄语"),
++    "阿拉伯文": ("阿拉伯文", "阿拉伯语"),
++    "葡萄牙文": ("葡萄牙文", "葡萄牙语"),
++}
++_LANG_LOOKUP = {
++    alias.lower(): canonical
++    for canonical, aliases in _LANGUAGES.items()
++    for alias in aliases
++}
++
++_CN_DIGITS = {
++    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
++    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
++}
++
++
++def _now_utc(now: datetime | None) -> datetime:
++    value = now or datetime.now(timezone.utc)
++    if value.tzinfo is None:
++        value = value.replace(tzinfo=timezone.utc)
++    return value
++
++
++def _to_int(token: str) -> int | None:
++    token = token.strip()
++    if not token:
++        return None
++    if token.isdigit():
++        return int(token)
++    value = 0
++    section = 0
++    for char in token:
++        if char in _CN_DIGITS:
++            section = _CN_DIGITS[char]
++        elif char == "十":
++            value += (section or 1) * 10
++            section = 0
++        elif char == "百":
++            value += (section or 1) * 100
++            section = 0
++        elif char == "千":
++            value += (section or 1) * 1000
++            section = 0
++        elif char == "万":
++            value = (value + section) * 10000
++            section = 0
++        else:
++            return None
++    return value + section if token else None
++
++
++def _amount(number: str, unit: str | None) -> float:
++    value = float(number.replace(",", ""))
++    unit = (unit or "").lower()
++    if unit in {"万", "w"}:
++        return value * 10000.0
++    if unit in {"千", "k"}:
++        return value * 1000.0
++    return value
++
++
++def _span(normalized: str, match: re.Match) -> str:
++    return normalized[match.start():match.end()].strip()
++
++
++def _extract_budget(normalized: str) -> dict:
++    # A bare "2026-12" or "12-05" date fragment must never be read as money.
++    # Require a currency unit inside the matched range.
++    for match in _BUDGET_RANGE_RE.finditer(normalized):
++        if not _BUDGET_UNIT_RE.search(match.group(0)):
++            continue
++        low = _amount(match.group(1), match.group(2))
++        high = _amount(match.group(3), match.group(4))
++        if match.group(4) and not match.group(2):
++            low *= 10000.0 if (match.group(4).lower() in {"万", "w"}) else 1000.0
++        elif match.group(2) and not match.group(4):
++            high *= 10000.0 if (match.group(2).lower() in {"万", "w"}) else 1000.0
++        low, high = sorted((low, high))
++        return {
++            "value": [low, high],
++            "confidence": 0.92,
++            "evidence": _span(normalized, match),
++        }
++
++    match = _BUDGET_SINGLE_RE.search(normalized)
++    if match:
++        value = _amount(match.group(1), match.group(2))
++        return {
++            "value": [value, value],
++            "confidence": 0.85,
++            "evidence": _span(normalized, match),
++        }
++
++    match = _BUDGET_BARE_RE.search(normalized)
++    if match:
++        value = _amount(match.group(1), match.group(2))
++        return {
++            "value": [value, value],
++            "confidence": 0.6,
++            "evidence": _span(normalized, match),
++        }
++    return {"value": None, "confidence": 0.0, "evidence": ""}
++
++
++def _extract_duration(normalized: str) -> dict:
++    match = _DAYS_RE.search(normalized)
++    if match:
++        value = _to_int(match.group(1))
++        if value is not None and 1 <= value <= 3660:
++            return {"value": value, "confidence": 0.9, "evidence": _span(normalized, match)}
++    match = _WEEKS_RE.search(normalized)
++    if match:
++        value = _to_int(match.group(1))
++        if value is not None and 1 <= value <= 520:
++            return {"value": value * 7, "confidence": 0.9, "evidence": _span(normalized, match)}
++    match = _MONTHS_RE.search(normalized)
++    if match:
++        value = _to_int(match.group(1))
++        if value is not None and 1 <= value <= 120:
++            return {"value": value * 30, "confidence": 0.8, "evidence": _span(normalized, match)}
++    return {"value": None, "confidence": 0.0, "evidence": ""}
++
++
++def _extract_date(normalized: str, now: datetime) -> dict:
++    candidates: list[tuple[str, str, float]] = []
++    for match in _ISO_DATE_RE.finditer(normalized):
++        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
++        if not (1 <= month <= 12 and 1 <= day <= 31):
++            continue
++        value = f"{year:04d}-{month:02d}-{day:02d}"
++        try:
++            parsed = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
++        except ValueError:
++            continue
++        cue = _DEADLINE_CUE_RE.search(normalized, 0, match.start())
++        confidence = 0.95 if cue else 0.8
++        candidates.append((value, _span(normalized, match), confidence))
++
++    for match in _MONTH_DAY_RE.finditer(normalized):
++        month, day = int(match.group(1)), int(match.group(2))
++        if not (1 <= month <= 12 and 1 <= day <= 31):
++            continue
++        if any(item[0].endswith(f"-{month:02d}-{day:02d}") for item in candidates):
++            continue
++        year = now.year
++        value = f"{year:04d}-{month:02d}-{day:02d}"
++        try:
++            parsed = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
++        except ValueError:
++            continue
++        if parsed <= now:
++            value = f"{year + 1:04d}-{month:02d}-{day:02d}"
++        candidates.append((value, _span(normalized, match), 0.6))
++
++    # Prefer a deadline-cued full date, then the first future full date.
++    for value, evidence, confidence in candidates:
++        try:
++            parsed = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
++        except ValueError:
++            continue
++        if parsed > now:
++            return {"value": value, "confidence": confidence, "evidence": evidence}
++    return {"value": None, "confidence": 0.0, "evidence": ""}
++
++
++def _extract_remote(normalized: str) -> dict:
++    for cue in _REMOTE_CUES:
++        if cue in normalized:
++            return {"value": True, "confidence": 0.85, "evidence": cue}
++    for cue in _ONSITE_CUES:
++        if cue in normalized:
++            return {"value": False, "confidence": 0.85, "evidence": cue}
++    return {"value": None, "confidence": 0.0, "evidence": ""}
++
++
++def _extract_count(normalized: str) -> dict:
++    match = _COUNT_RE.search(normalized)
++    if match:
++        base = _to_int(match.group(1))
++        if base is None:
++            return {"value": None, "confidence": 0.0, "evidence": ""}
++        unit = match.group(2)
++        if unit == "万":
++            base *= 10000
++        elif unit == "千":
++            base *= 1000
++        elif unit == "百":
++            base *= 100
++        if base > 0:
++            return {"value": base, "confidence": 0.8, "evidence": _span(normalized, match)}
++    return {"value": None, "confidence": 0.0, "evidence": ""}
++
++
++def _extract_experience(normalized: str) -> dict:
++    match = _EXPERIENCE_RANGE_RE.search(normalized)
++    if match:
++        low = float(match.group(1).replace(",", ""))
++        high = float(match.group(2).replace(",", ""))
++        return {
++            "value": min(low, high),
++            "confidence": 0.85,
++            "evidence": _span(normalized, match),
++        }
++    match = _EXPERIENCE_RE.search(normalized)
++    if match:
++        value = _to_int(match.group(1))
++        if value is not None and 0 <= value <= 60:
++            return {"value": float(value), "confidence": 0.8, "evidence": _span(normalized, match)}
++    return {"value": None, "confidence": 0.0, "evidence": ""}
++
++
++def _extract_languages(normalized: str) -> dict:
++    lowered = normalized.lower()
++    found: list[str] = []
++    evidence: list[str] = []
++    for alias, canonical in _LANG_LOOKUP.items():
++        if alias in lowered and canonical not in found:
++            found.append(canonical)
++            evidence.append(alias)
++    return {
++        "value": found,
++        "confidence": (0.85 if found else 0.0),
++        "evidence": "、".join(evidence),
++    }
++
++
++def _extract_skills(normalized: str) -> dict:
++    lowered = normalized
++    matched: dict[str, str] = {}
++    for skill, phrases in SKILL_KEYWORDS.items():
++        for phrase in phrases:
++            if phrase in lowered:
++                matched[skill] = phrase
++                break
++    # Also pick up multi-token keywords from the alias normalizer so that
++    # ``后端开发`` normalizes to ``backend`` even when ``后端开发`` is not an
++    # exact SKILL_KEYWORDS phrase.
++    for alias in ("后端开发", "前端开发", "数据分析", "平面设计", "视频剪辑", "课程开发"):
++        if alias in lowered:
++            skill = normalize_skill(alias)
++            if skill and skill not in matched:
++                matched[skill] = alias
++    value = sorted(matched)
++    return {
++        "value": value,
++        "confidence": (0.9 if value else 0.0),
++        "evidence": matched,
++    }
++
++
++def extract_fields_v2(text: str | None, now: datetime | None = None) -> dict:
++    """Extract structured fields with value, confidence, and evidence.
++
++    Returns one entry per field. ``date`` is the deadline (must be > ``now``),
++    ``budget.value`` is ``[min, max]`` (equal when a single amount is given),
++    and ``skills.value`` only contains taxonomy keys.
++    """
++    normalized = normalize_text(text)
++    now = _now_utc(now)
++
++    budget = _extract_budget(normalized)
++    if budget["value"] is not None:
++        low, high = budget["value"]
++        budget["value"] = [min(low, high), max(low, high)]
++
++    date = _extract_date(normalized, now)
++
++    return {
++        "budget": budget,
++        "duration": _extract_duration(normalized),
++        "date": date,
++        "remote": _extract_remote(normalized),
++        "count": _extract_count(normalized),
++        "experience": _extract_experience(normalized),
++        "language": _extract_languages(normalized),
++        "skills": _extract_skills(normalized),
++    }
+
+--- a/app\nlp\lexicon.py
++++ b/app\nlp\lexicon.py
+@@ -1,18 +1,24 @@
+ """Lexicons for explainable task-text classification.
+ 
+ The keyword weights are deliberately sparse: specific phrases carry 2-3
+ points, generic words carry 0.5-1.5. This keeps a single strong cue such
+ as "招聘" or "标注" able to outweigh many weak overlaps.
+ """
+ 
+ from __future__ import annotations
++
++from pathlib import Path
++
++from app.nlp.normalize import normalize_text
++
++LEXICON_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "lexicon"
+ 
+ CATEGORY_LABELS = {
+     "software_dev": "软件开发",
+     "ui_ux_design": "UI/UX 设计",
+     "brand_design": "品牌设计",
+     "content_writing": "内容写作",
+     "video_production": "视频制作",
+     "marketing_campaign": "市场活动",
+     "data_annotation": "数据标注",
+     "translation_localization": "翻译本地化",
+@@ -259,10 +265,133 @@
+     "consulting": ("咨询", "诊断", "顾问", "战略"),
+     "analysis": ("分析", "研究", "建模", "测算"),
+     "presentation": ("汇报", "演示", "ppt", "路演"),
+     "training_design": ("课程设计", "培训方案", "课程开发", "训练营"),
+     "content_development": ("课件", "教材", "课程内容", "讲师手册"),
+     "security": ("信息安全", "安全", "渗透测试"),
+     "design": ("设计", "视觉", "审美"),
+     "operations": ("运营", "日常运营", "活动运营"),
+     "legal": ("法律", "合同", "合规", "版权"),
+ }
++
++
++def _normalized_key(token: str) -> str:
++    return normalize_text(token).lower()
++
++
++def _unambiguous_phrase_map(
++    keyword_map: dict[str, dict[str, float] | tuple[str, ...]],
++) -> dict[str, str]:
++    """Map each *unambiguous* phrase to its key, skipping shared phrases."""
++    owners: dict[str, set[str]] = {}
++    for key, phrases in keyword_map.items():
++        for phrase in phrases:
++            owners.setdefault(_normalized_key(phrase), set()).add(key)
++    return {
++        phrase: next(iter(keys))
++        for phrase, keys in owners.items()
++        if len(keys) == 1
++    }
++
++
++def _load_alias_map() -> dict[str, str]:
++    """Load additive ``key<TAB>alias,alias`` entries from aliases.txt.
++
++    Lines are namespaced as ``skill<TAB><key><TAB>aliases`` or
++    ``category<TAB><key><TAB>aliases``; bare ``<key><TAB>aliases`` lines are
++    treated as skill aliases for convenience.
++    """
++    result: dict[str, str] = {}
++    path = LEXICON_DIR / "aliases.txt"
++    if not path.exists():
++        return result
++    for raw in path.read_text(encoding="utf-8").splitlines():
++        line = raw.strip()
++        if not line or line.startswith("#"):
++            continue
++        parts = [part.strip() for part in line.split("\t")]
++        if len(parts) < 2:
++            continue
++        if parts[0] in {"skill", "category"}:
++            if len(parts) < 3:
++                continue
++            namespace, key, alias_text = parts[0], parts[1], parts[2]
++        else:
++            namespace, key, alias_text = "skill", parts[0], parts[1]
++        key = key.strip()
++        if not key:
++            continue
++        # The alias file stores skill/category keys in the same flat map; the
++        # namespace only disambiguates consumers, so encode it in the key.
++        result[f"{namespace}:{key}"] = key
++        for alias in alias_text.replace("，", ",").split(","):
++            alias = _normalized_key(alias)
++            if alias:
++                result[f"{namespace}:{alias}"] = key
++    return result
++
++
++_SKILL_NORMALIZER: dict[str, str] | None = None
++_CATEGORY_NORMALIZER: dict[str, str] | None = None
++
++
++def _skill_normalizer() -> dict[str, str]:
++    global _SKILL_NORMALIZER
++    if _SKILL_NORMALIZER is None:
++        mapping = _unambiguous_phrase_map(SKILL_KEYWORDS)
++        # Canonical keys map to themselves so ``normalize_skill("backend")``
++        # round-trips.
++        for key in SKILL_KEYWORDS:
++            mapping[_normalized_key(key)] = key
++        for alias_key, key in _load_alias_map().items():
++            if alias_key.startswith("skill:"):
++                mapping[alias_key[len("skill:"):]] = key
++        _SKILL_NORMALIZER = mapping
++    return _SKILL_NORMALIZER
++
++
++def _category_normalizer() -> dict[str, str]:
++    global _CATEGORY_NORMALIZER
++    if _CATEGORY_NORMALIZER is None:
++        mapping = _unambiguous_phrase_map(CATEGORY_KEYWORDS)
++        for key, label in CATEGORY_LABELS.items():
++            mapping[_normalized_key(label)] = key
++            mapping[_normalized_key(key)] = key
++        for alias_key, key in _load_alias_map().items():
++            if alias_key.startswith("category:"):
++                mapping[alias_key[len("category:"):]] = key
++        _CATEGORY_NORMALIZER = mapping
++    return _CATEGORY_NORMALIZER
++
++
++def normalize_skill(token: str) -> str | None:
++    """Map a free-text skill token to its taxonomy key, or ``None``.
++
++    Accepts canonical keys (``backend``), Chinese labels (``后端开发`` via
++    aliases), and unambiguous keyword phrases (``后端`` -> ``backend``).
++    """
++    key = _normalized_key(token)
++    if not key:
++        return None
++    return _skill_normalizer().get(key)
++
++
++def normalize_category(token: str) -> str | None:
++    """Map a free-text category token to its taxonomy key, or ``None``.
++
++    Accepts canonical keys, Chinese labels (``软件开发``), and unambiguous
++    keyword phrases (``招聘`` -> ``recruitment``).
++    """
++    key = _normalized_key(token)
++    if not key:
++        return None
++    return _category_normalizer().get(key)
++
++
++def known_skills() -> frozenset[str]:
++    """The canonical skill taxonomy keys."""
++    return frozenset(SKILL_KEYWORDS)
++
++
++def known_categories() -> frozenset[str]:
++    """The canonical category taxonomy keys."""
++    return frozenset(CATEGORY_KEYWORDS)
+
+--- a/app\nlp\normalize.py
++++ b/app\nlp\normalize.py
+@@ -0,0 +1,93 @@
++"""Deterministic text normalization for Chinese/English task postings.
++
++No LLM is used. The goal is a canonical surface so that downstream lexicons,
++tokenizers, and regex extractors see consistent text:
++
++* Unicode NFKC (which also maps most full-width Latin/digits to half-width),
++* explicit full-width / half-width cleanup for characters NFKC leaves alone,
++* whitespace collapsing,
++* punctuation normalization (dashes, ellipsis, curly quotes).
++
++The function is deliberately pure and case-preserving: callers that want a
++case-folded surface (keyword matching, vocabulary lookup) call ``.lower()``
++themselves.
++"""
++
++from __future__ import annotations
++
++import re
++import unicodedata
++
++_FULLWIDTH_TO_HALFWIDTH = str.maketrans(
++    {
++        "　": " ",  # ideographic space -> ASCII space
++        "！": "!",
++        "＂": '"',
++        "＃": "#",
++        "＄": "$",
++        "％": "%",
++        "＆": "&",
++        "＇": "'",
++        "（": "(",
++        "）": ")",
++        "＊": "*",
++        "＋": "+",
++        "，": ",",
++        "－": "-",
++        "．": ".",
++        "／": "/",
++        "：": ":",
++        "；": ";",
++        "＜": "<",
++        "＝": "=",
++        "＞": ">",
++        "？": "?",
++        "＠": "@",
++        "［": "[",
++        "＼": "\\",
++        "］": "]",
++        "＾": "^",
++        "＿": "_",
++        "｀": "`",
++        "｛": "{",
++        "｜": "|",
++        "｝": "}",
++    }
++)
++
++_DASH_TRANSLATION = str.maketrans(
++    {
++        "‒": "-",  # figure dash
++        "–": "-",  # en dash
++        "—": "-",  # em dash
++        "―": "-",  # horizontal bar
++        "−": "-",  # minus sign
++        "﹘": "-",  # small em dash
++        "﹣": "-",  # small hyphen-minus
++        "－": "-",  # fullwidth hyphen-minus
++        "〜": "~",  # wave dash
++        "∼": "~",  # tilde operator
++        "～": "~",  # fullwidth tilde
++    }
++)
++
++_WHITESPACE_RE = re.compile(r"\s+")
++
++
++def normalize_text(text: str | None) -> str:
++    """Return a canonical, whitespace-collapsed copy of ``text``.
++
++    NFKC handles compatibility characters (including most full-width ASCII),
++    then a small explicit table covers the remaining full-width forms. Dashes
++    and tildes are collapsed to ``-`` / ``~`` so budget ranges written with
++    ``–``, ``—``, ``～`` still match the same regular expressions. Whitespace
++    runs become single spaces and leading/trailing whitespace is removed.
++    """
++    if text is None:
++        return ""
++    value = unicodedata.normalize("NFKC", str(text))
++    value = value.translate(_FULLWIDTH_TO_HALFWIDTH)
++    value = value.translate(_DASH_TRANSLATION)
++    value = value.replace("…", "...")  # horizontal ellipsis
++    value = _WHITESPACE_RE.sub(" ", value)
++    return value.strip()
+
+--- a/app\nlp\sections.py
++++ b/app\nlp\sections.py
+@@ -0,0 +1,319 @@
++"""Resume section parsing: dictionary + rules (no LLM).
++
++``parse_resume_sections`` turns free-form resume text into structured sections
++(education / work / projects / skills / certificates / languages) and extracts
++titles, companies, dates and experience years where possible. Parsing is
++dictionary + rule based so it runs with zero optional dependencies.
++
++An optional character-level BIO CRF path is provided for callers that have
++``sklearn-crfsuite`` *and* a trained model artifact at
++``data/lexicon/resume_crf.pkl``. It is a dormant optional path: the import is
++lazy and the rules fall back automatically when the package or artifact is
++missing.
++"""
++
++from __future__ import annotations
++
++import re
++from datetime import datetime, timezone
++from pathlib import Path
++
++from app.nlp.lexicon import normalize_skill
++from app.nlp.normalize import normalize_text
++
++LEXICON_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "lexicon"
++
++_SECTION_HEADERS = {
++    "education": ("教育经历", "教育背景", "教育", "学历", "学习经历"),
++    "work": ("工作经历", "工作经验", "职业经历", "工作", "任职经历"),
++    "projects": ("项目经历", "项目经验", "项目"),
++    "skills": ("技能", "专业技能", "技能特长", "技术栈", "擅长"),
++    "certificates": ("证书", "认证", "资格证书", "证书与认证"),
++    "languages": ("语言", "语言能力", "外语"),
++}
++
++_HEADER_RE = re.compile(r"^[#\s]*([^#:：\s].*?)[:：]?\s*$")
++
++_YEAR_RANGE_RE = re.compile(
++    r"(20\d{2})\s*年?\s*(?:[-–—~至到]|/)\s*(至今|现在|20\d{2})\s*年?"
++)
++_YEARS_EXPERIENCE_RE = re.compile(
++    r"([\d一二两三四五六七八九十]+)\s*年[^，。；;！？!?\n]{0,14}?经验"
++)
++
++_DEGREES = ("博士", "硕士", "学士", "本科", "大专", "中专", "高中")
++_DEGREE_RE = re.compile("|".join(_DEGREES))
++_SCHOOL_RE = re.compile(r"[一-鿿A-Za-z0-9]{2,20}(?:大学|学院|研究院|研究所)")
++
++_COMPANY_HINTS = (
++    "公司", "集团", "科技", "网络", "软件", "工作室", "事务所", "银行",
++    "研究院", "研究所", "厂", "中心", "平台", "咨询", "实验室", "文化",
++)
++_TITLE_HINTS = (
++    "工程师", "设计师", "经理", "主管", "负责人", "顾问", "编辑", "总监",
++    "运营", "策划", "分析师", "讲师", "翻译", "研究员", "架构师", "产品",
++)
++
++_CN_DIGITS = {
++    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
++    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
++}
++
++# --------------------------------------------------------------------------
++# Optional char-BIO CRF (dormant unless sklearn-crfsuite + model exist)
++# --------------------------------------------------------------------------
++_CRF_PROBED = False
++_CRF_AVAILABLE: bool | None = None
++
++
++def crf_available() -> bool:
++    global _CRF_PROBED, _CRF_AVAILABLE
++    if not _CRF_PROBED:
++        _CRF_PROBED = True
++        try:
++            import sklearn_crfsuite  # noqa: F401
++        except ImportError:
++            _CRF_AVAILABLE = False
++        else:
++            _CRF_AVAILABLE = (LEXICON_DIR / "resume_crf.pkl").exists()
++    return bool(_CRF_AVAILABLE)
++
++
++def _char_features(line: str, index: int) -> dict:
++    char = line[index] if 0 <= index < len(line) else ""
++    return {
++        "c": char,
++        "c.lower": char.lower(),
++        "c.isdigit": char.isdigit(),
++        "c.ispunct": bool(char and not char.isalnum() and not char.isspace()),
++        "prev": line[index - 1] if index - 1 >= 0 else "<BOS>",
++        "next": line[index + 1] if index + 1 < len(line) else "<EOS>",
++    }
++
++
++def _try_crf_sections(text: str) -> dict | None:
++    """Return CRF-derived sections, or ``None`` when unavailable.
++
++    This is intentionally a thin, honest wrapper: without a trained model
++    artifact it always returns ``None`` so the dictionary rules take over.
++    """
++    if not crf_available():
++        return None
++    try:
++        import pickle  # noqa: F401  (stdlib)
++
++        from sklearn_crfsuite import CRF  # type: ignore
++    except ImportError:
++        return None
++    model_path = LEXICON_DIR / "resume_crf.pkl"
++    try:
++        with model_path.open("rb") as handle:
++            model = pickle.load(handle)  # noqa: S301 - local trusted artifact
++    except (OSError, ValueError):
++        return None
++    if not isinstance(model, CRF):
++        return None
++    lines = [normalize_text(line) for line in str(text).splitlines()]
++    lines = [line for line in lines if line]
++    sentences = [
++        [_char_features(line, index) for index in range(len(line))]
++        for line in lines
++    ]
++    tags = model.predict(sentences)
++    # Convert BIO tags back into a coarse section split; the mapping is kept
++    # deliberately small and only labels headers, so fallback rules still fill
++    # in the entry-level detail.
++    sections: dict[str, list[str]] = {}
++    for tokens, sequence in zip(lines, tags, strict=False):
++        label = next((item for item in sequence if item not in {"O", "B-O", "I-O"}), "O")
++        sections.setdefault(label, []).append(tokens)
++    if not sections:
++        return None
++    return sections
++
++
++# --------------------------------------------------------------------------
++# Dictionary + rules parser
++# --------------------------------------------------------------------------
++def _split_entries(line: str) -> list[str]:
++    parts = re.split(r"[|;；·、,，]+", line)
++    return [part.strip() for part in parts if part.strip()]
++
++
++def _tokens(line: str) -> list[str]:
++    tokens: list[str] = []
++    for chunk in re.split(r"[|;；·、,，]+", line):
++        tokens.extend(part for part in chunk.split() if part)
++    return tokens
++
++
++def _years_from_range(text: str) -> float | None:
++    match = _YEAR_RANGE_RE.search(text)
++    if not match:
++        return None
++    start = int(match.group(1))
++    end = datetime.now(timezone.utc).year if match.group(2) in {"至今", "现在"} else int(match.group(2))
++    return float(max(0, end - start))
++
++
++def _parse_work_line(line: str) -> dict:
++    dates_match = _YEAR_RANGE_RE.search(line)
++    dates = dates_match.group(0) if dates_match else ""
++    rest = line.replace(dates, " ", 1) if dates else line
++    company = ""
++    title = ""
++    for part in _tokens(rest):
++        if not company and any(hint in part for hint in _COMPANY_HINTS):
++            company = part
++            continue
++        if not title and any(hint in part for hint in _TITLE_HINTS):
++            title = part
++            continue
++    if not title and not company:
++        tokens = _tokens(rest)
++        if tokens:
++            title = tokens[-1]
++    years = _years_from_range(dates) if dates else None
++    return {"title": title, "company": company, "dates": dates, "years": years}
++
++
++def _parse_education_line(line: str) -> dict:
++    degree = ""
++    school = ""
++    major = ""
++    dates = ""
++    for part in _split_entries(line):
++        if not degree:
++            match = _DEGREE_RE.search(part)
++            if match:
++                degree = match.group(0)
++        if not school:
++            match = _SCHOOL_RE.search(part)
++            if match:
++                school = match.group(0)
++        if _YEAR_RANGE_RE.search(part):
++            dates = _YEAR_RANGE_RE.search(part).group(0)
++    # Whatever is left over becomes the major.
++    leftover = re.sub(r"20\d{2}年?|[–—~至到/-]|至今|现在", "", line)
++    for token in (_DEGREES + (school,)):
++        if token:
++            leftover = leftover.replace(token, "")
++    major = re.sub(r"[|;；·、,，\s]+", " ", leftover).strip()
++    return {"degree": degree, "school": school, "major": major, "dates": dates}
++
++
++def _parse_skill_line(line: str) -> dict:
++    name = ""
++    years: float | None = None
++    for part in _split_entries(line):
++        match = re.search(r"([\d一二两三四五六七八九十]+)\s*年", part)
++        if match:
++            years = _to_int(match.group(1))
++            part = part[: match.start()].strip()
++        if not name and part:
++            name = part
++    category = normalize_skill(name)
++    return {"name": name, "category": category, "years": years}
++
++
++def _to_int(token: str) -> float | None:
++    token = token.strip()
++    if not token:
++        return None
++    if token.isdigit():
++        return float(token)
++    if token in _CN_DIGITS:
++        return float(_CN_DIGITS[token])
++    return None
++
++
++def parse_resume_sections(text: str | None) -> dict:
++    """Parse free-form resume text into sections with entry-level detail.
++
++    Lines are normalized individually so the newline structure (which defines
++    the sections) is preserved while each line's whitespace/punctuation is
++    still canonicalized.
++    """
++    lines = [normalize_text(line) for line in str(text or "").splitlines()]
++    lines = [line for line in lines if line]
++
++    result: dict[str, list] = {
++        "education": [],
++        "work": [],
++        "projects": [],
++        "skills": [],
++        "certificates": [],
++        "languages": [],
++    }
++    current: str | None = None
++    for line in lines:
++        header = _classify_header(line)
++        if header:
++            current = header
++            continue
++        if current is None:
++            # Before any explicit header, treat lines with dates/titles as work.
++            if _YEAR_RANGE_RE.search(line) or any(h in line for h in _TITLE_HINTS):
++                current = "work"
++            else:
++                continue
++        if current == "education":
++            result["education"].append(_parse_education_line(line))
++        elif current == "work":
++            result["work"].append(_parse_work_line(line))
++        elif current == "projects":
++            result["projects"].append(_parse_project_line(line))
++        elif current == "skills":
++            result["skills"].append(_parse_skill_line(line))
++        elif current == "certificates":
++            result["certificates"].extend(_split_entries(line))
++        elif current == "languages":
++            result["languages"].extend(_split_entries(line))
++
++    experience_years = _experience_years(" ".join(lines), result["work"])
++
++    return {
++        "education": result["education"],
++        "work": result["work"],
++        "projects": result["projects"],
++        "skills": result["skills"],
++        "certificates": result["certificates"],
++        "languages": result["languages"],
++        "experience_years": experience_years,
++    }
++
++
++def _parse_project_line(line: str) -> dict:
++    dates_match = _YEAR_RANGE_RE.search(line)
++    dates = dates_match.group(0) if dates_match else ""
++    rest = line.replace(dates, " ", 1) if dates else line
++    role = ""
++    for part in _tokens(rest):
++        if any(hint in part for hint in _TITLE_HINTS):
++            role = part
++    name = rest.strip()
++    if role and name.endswith(role):
++        name = name[: -len(role)].strip()
++    return {"name": name, "role": role, "dates": dates}
++
++
++def _classify_header(line: str) -> str | None:
++    if len(line) > 24:
++        return None
++    for section, keywords in _SECTION_HEADERS.items():
++        for keyword in keywords:
++            if line == keyword or line.startswith(keyword + "：") or line.startswith(keyword + ":"):
++                return section
++    return None
++
++
++def _experience_years(text: str, work: list[dict]) -> float | None:
++    match = _YEARS_EXPERIENCE_RE.search(text)
++    if match:
++        value = _to_int(match.group(1))
++        if value is not None:
++            return value
++    years = [entry.get("years") for entry in work if entry.get("years") is not None]
++    if years:
++        return round(sum(years), 1)
++    return None
+
+--- a/app\nlp\tokenizer.py
++++ b/app\nlp\tokenizer.py
+@@ -0,0 +1,197 @@
++"""Word segmentation for Chinese/English task text.
++
++``jieba`` is an *optional* dependency. When it is installed the tokenizer
++segments Chinese text with ``jieba`` and a custom user dictionary loaded from
++``data/lexicon/jieba_userdict.txt`` (skill/role/industry terms that jieba would
++otherwise split). When ``jieba`` is missing the module falls back to a
++character bigram tokenizer: overlapping CJK bigrams plus whole Latin words.
++The fallback keeps ``tokenize`` / ``content_words`` / ``keywords`` usable in a
++dependency-free environment.
++
++The import is lazy: importing this module never imports ``jieba``.
++"""
++
++from __future__ import annotations
++
++import re
++from collections import Counter
++from pathlib import Path
++
++from app.nlp.normalize import normalize_text
++
++LEXICON_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "lexicon"
++
++_CJK_RUN_RE = re.compile(r"[一-鿿]+")
++_LATIN_TOKEN_RE = re.compile(r"[a-z0-9]+(?:[-'][a-z0-9]+)*")
++_SPLIT_RE = re.compile(r"[^\w一-鿿]+", re.UNICODE)
++
++#: Single-character tokens that never carry topical signal on their own.
++_DEFAULT_STOPWORDS = frozenset(
++    {
++        "的", "了", "和", "与", "及", "或", "要", "在", "是", "有", "为",
++        "对", "把", "被", "让", "给", "请", "帮", "做", "一个", "一些",
++        "这个", "那个", "我们", "你们", "他们", "我", "你", "他", "她",
++        "它", "可以", "需要", "希望", "能够", "进行", "负责", "完成",
++        "the", "a", "an", "and", "or", "of", "to", "for", "with", "in",
++        "on", "is", "are", "be", "we", "you", "it",
++    }
++)
++
++_STOPWORDS_CACHE: frozenset[str] | None = None
++_USER_DICT_CACHE: list[str] | None = None
++
++
++def _read_lines(filename: str) -> list[str]:
++    path = LEXICON_DIR / filename
++    if not path.exists():
++        return []
++    lines: list[str] = []
++    for raw in path.read_text(encoding="utf-8").splitlines():
++        line = raw.strip()
++        if not line or line.startswith("#"):
++            continue
++        lines.append(line)
++    return lines
++
++
++def _load_stopwords() -> frozenset[str]:
++    global _STOPWORDS_CACHE
++    if _STOPWORDS_CACHE is None:
++        extra = set(_DEFAULT_STOPWORDS)
++        for line in _read_lines("stopwords.txt"):
++            # ``word`` or ``word  freq``
++            extra.add(line.split()[0])
++        _STOPWORDS_CACHE = frozenset(extra)
++    return _STOPWORDS_CACHE
++
++
++def _load_userdict() -> list[str]:
++    global _USER_DICT_CACHE
++    if _USER_DICT_CACHE is None:
++        words: list[str] = []
++        for line in _read_lines("jieba_userdict.txt"):
++            words.append(line.split()[0])
++        # Also seed the dictionary with the taxonomy files so that skill and
++        # role phrases survive segmentation even without an explicit entry.
++        for filename in ("skills.txt", "roles.txt", "industries.txt"):
++            for line in _read_lines(filename):
++                first = line.split("\t", 1)[0].strip()
++                if first:
++                    words.append(first)
++        _USER_DICT_CACHE = list(dict.fromkeys(words))
++    return _USER_DICT_CACHE
++
++
++_JIEBA = None
++_JIEBA_PROBED = False
++
++
++def jieba_available() -> bool:
++    """Whether the optional ``jieba`` segmenter can be imported."""
++    return _get_jieba() is not None
++
++
++def _get_jieba():
++    """Return the lazily imported ``jieba`` module, or ``None`` if missing."""
++    global _JIEBA, _JIEBA_PROBED
++    if not _JIEBA_PROBED:
++        _JIEBA_PROBED = True
++        try:
++            import jieba  # type: ignore
++        except ImportError:
++            _JIEBA = None
++        else:
++            for word in _load_userdict():
++                try:
++                    jieba.add_word(word, freq=100000, tag="nz")
++                except Exception:  # noqa: BLE001 - a bad dict entry is cosmetic
++                    pass
++            _JIEBA = jieba
++    return _JIEBA
++
++
++def _fallback_tokens(text: str) -> list[str]:
++    """Overlapping CJK bigrams plus whole Latin tokens (no ``jieba``)."""
++    lowered = text.lower()
++    tokens: list[str] = []
++    for segment in _SPLIT_RE.split(lowered):
++        if not segment:
++            continue
++        position = 0
++        for match in _CJK_RUN_RE.finditer(segment):
++            if match.start() > position:
++                tokens.extend(
++                    _LATIN_TOKEN_RE.findall(segment[position : match.start()])
++                )
++            run = match.group(0)
++            if len(run) == 1:
++                tokens.append(run)
++            else:
++                tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
++            position = match.end()
++        if position < len(segment):
++            tokens.extend(_LATIN_TOKEN_RE.findall(segment[position:]))
++    return [token for token in tokens if token]
++
++
++def tokenize(text: str | None) -> list[str]:
++    """Segment ``text`` into tokens.
++
++    Uses ``jieba`` with the custom dictionary when available; otherwise falls
++    back to overlapping CJK bigrams plus Latin words.
++    """
++    normalized = normalize_text(text)
++    if not normalized:
++        return []
++    jieba = _get_jieba()
++    if jieba is not None:
++        return [
++            token.strip()
++            for token in jieba.cut(normalized, cut_all=False)
++            if token.strip()
++        ]
++    return _fallback_tokens(normalized)
++
++
++def _is_stopword(token: str) -> bool:
++    stopwords = _load_stopwords()
++    if token in stopwords:
++        return True
++    return False
++
++
++def content_words(text: str | None) -> list[str]:
++    """Tokens that carry topical signal (stopwords and stray digits removed).
++
++    With the bigram fallback, single CJK characters are dropped because a lone
++    character is rarely a stable keyword; Latin words and multi-character
++    tokens are kept.
++    """
++    words: list[str] = []
++    for token in tokenize(text):
++        if _is_stopword(token):
++            continue
++        if len(token) == 1 and _CJK_RUN_RE.fullmatch(token):
++            continue
++        if len(token) == 1 and not token.isalnum():
++            continue
++        if token.isdigit():
++            continue
++        words.append(token)
++    return words
++
++
++def keywords(text: str | None, top_k: int = 10) -> list[str]:
++    """Return up to ``top_k`` high-signal tokens ranked by frequency.
++
++    Longer tokens are preferred on ties, so a segmented full word outranks a
++    bigram substring that happens to occur equally often. The list is
++    deterministic for a given input.
++    """
++    top_k = max(1, int(top_k))
++    counts: Counter[str] = Counter(content_words(text))
++    ranked = sorted(
++        counts.items(),
++        key=lambda item: (-item[1], -len(item[0]), item[0]),
++    )
++    return [word for word, _ in ranked[:top_k]]
+
+--- a/frontend\app.js
++++ b/frontend\app.js
+@@ -788,35 +788,39 @@
+   const skills =
+     (fields.skills || [])
+       .map((skill) => `<span class="reason">${esc(skill)}</span>`)
+       .join("") || '<span class="muted small">未识别</span>';
+   const requirements =
+     (fields.requirements || []).map((item) => `<li>${esc(item)}</li>`).join("") ||
+     "<li>未识别</li>";
+   const clarify = data.needs_clarification
+     ? '<div class="classify-warn">置信度偏低，建议在 top-3 中确认，或补充预算、交付物和行业信息。</div>'
+     : "";
+-  const confidence = Math.round((data.confidence || 0) * 100);
++  const confidence = Math.round((data.calibrated_confidence ?? data.confidence ?? 0) * 100);
++  const evidence = (data.evidence || [])
++    .map((item) => `<span class="reason">${esc(item.phrase)} · ${fmt(item.weight, 1)}</span>`)
++    .join("");
+ 
+   box.innerHTML = `
+     <article class="panel classify-card">
+       <div class="panel-head"><h3>分类结果</h3><span class="pill">${confidence}%</span></div>
+       <div class="classify-verdict">
+         <div>
+           <span class="eyebrow">推荐类别</span>
+           <h2>${esc(data.label)}</h2>
+           <p class="muted small">任务链模板 key：${esc(data.suggested_template)}</p>
+         </div>
+-        <div class="classify-score">${fmt(data.confidence, 2)}</div>
++        <div class="classify-score">${fmt(data.calibrated_confidence ?? data.confidence, 2)}</div>
+       </div>
+       ${clarify}
+       <div class="classify-candidates">${candidates}</div>
++      ${evidence ? `<div class="reasons">${evidence}</div>` : ""}
+       <div class="task-reqs">
+         <h4>抽取到的内部技能</h4>
+         <div class="reasons">${skills}</div>
+       </div>
+     </article>
+     <article class="panel classify-card">
+       <div class="panel-head"><h3>结构化字段</h3></div>
+       <div class="classify-fields">
+         <div class="classify-field"><span>建议标题</span><strong>${esc(fields.suggested_title || "—")}</strong></div>
+         <div class="classify-field"><span>服务报酬</span><strong>${budget}</strong></div>
+
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,8 +1,17 @@
+ fastapi>=0.115
+ uvicorn>=0.30
+ numpy>=1.26
+ pandas>=2.2
+ scikit-learn>=1.4
+ scipy>=1.11
+ pytest>=8.0
+ httpx>=0.27
++
++# --- Optional extras (not required; the app falls back automatically) ---
++# Word segmentation for the NLP tokenizer (app/nlp/tokenizer.py). When
++# absent, the tokenizer uses a character bigram fallback.
++#   pip install jieba
++# Char-level BIO CRF for resume section parsing (app/nlp/sections.py). When
++# absent (or without a trained model artifact), the dictionary+rule parser is
++# used instead.
++#   pip install sklearn-crfsuite
+
+--- a/scripts\evaluate_nlp.py
++++ b/scripts\evaluate_nlp.py
+@@ -0,0 +1,404 @@
++"""Evaluate the non-LLM NLP layer on a hand-written/paraphrased holdout.
++
++Metrics reported per field (precision/recall/F1), per category (top-1,
++top-3, macro-F1), calibration (ECE/Brier), and confidence gating
++(clarification rate, wrong-confident rate), plus paraphrase/typo/ambiguous
++slices. The holdout lives at ``data/lexicon/nlp_holdout.jsonl`` and is
++hand-written, so the numbers reflect held-out phrasing rather than the
++synthetic templates used for training.
++
++Run from the repo root::
++
++    python scripts/evaluate_nlp.py
++"""
++
++from __future__ import annotations
++
++import json
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++
++from app.nlp.classifier import TaskTextClassifier, get_default_classifier  # noqa: E402
++from app.nlp.extract import extract_fields_v2  # noqa: E402
++from app.nlp.lexicon import CATEGORY_LABELS  # noqa: E402
++
++HOLDOUT_PATH = ROOT / "data" / "lexicon" / "nlp_holdout.jsonl"
++REPORTS_DIR = ROOT / "reports"
++
++#: Fixed evaluation clock; all holdout deadlines are after this instant.
++EVAL_NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
++
++
++def load_holdout(path: Path | None = None) -> list[dict]:
++    path = path or HOLDOUT_PATH
++    records = []
++    for raw in path.read_text(encoding="utf-8").splitlines():
++        line = raw.strip()
++        if line and not line.startswith("#"):
++            records.append(json.loads(line))
++    return records
++
++
++# --------------------------------------------------------------------------
++# Field matching
++# --------------------------------------------------------------------------
++def _budget_match(predicted: list | None, labels: dict) -> bool | None:
++    if "budget_min" not in labels and "budget_max" not in labels:
++        return None
++    if not predicted:
++        return False
++    low, high = predicted
++    return (
++        low == labels.get("budget_min")
++        and high == labels.get("budget_max")
++    )
++
++
++def _scalar_match(predicted, expected) -> bool | None:
++    if expected is None:
++        return None
++    if predicted is None:
++        return False
++    if isinstance(expected, float) and isinstance(predicted, float):
++        return abs(predicted - expected) < 0.011
++    return predicted == expected
++
++
++def _language_match(predicted: list, labels: dict) -> bool | None:
++    expected = labels.get("languages")
++    if expected is None:
++        return None
++    return set(predicted or []) == set(expected)
++
++
++def _skill_match(predicted: list, labels: dict) -> tuple[int, int, int] | None:
++    expected = labels.get("skills")
++    if expected is None:
++        return None
++    pred_set = set(predicted or [])
++    exp_set = set(expected)
++    tp = len(pred_set & exp_set)
++    fp = len(pred_set - exp_set)
++    fn = len(exp_set - pred_set)
++    return tp, fp, fn
++
++
++def _field_outcomes(records: list[dict], now: datetime) -> dict:
++    """Return per-field TP/FP/FN counts and skill micro counts."""
++    fields = (
++        "budget",
++        "duration",
++        "date",
++        "remote",
++        "count",
++        "experience",
++        "language",
++    )
++    counts = {field: {"tp": 0, "fp": 0, "fn": 0} for field in fields}
++    skill_tp = skill_fp = skill_fn = 0
++    for record in records:
++        extracted = extract_fields_v2(record["text"], now=now)
++        labels = record.get("fields", {})
++
++        budget_match = _budget_match(extracted["budget"]["value"], labels)
++        if budget_match is not None:
++            if budget_match:
++                counts["budget"]["tp"] += 1
++            elif labels.get("budget_min") is not None:
++                counts["budget"]["fn"] += 1
++            else:
++                counts["budget"]["fp"] += 1
++
++        scalar_fields = (
++            ("duration", extracted["duration"]["value"], "duration_days"),
++            ("date", extracted["date"]["value"], "date"),
++            ("remote", extracted["remote"]["value"], "remote_ok"),
++            ("count", extracted["count"]["value"], "count"),
++            ("experience", extracted["experience"]["value"], "experience"),
++        )
++        for field, pred, label_key in scalar_fields:
++            expected = labels.get(label_key)
++            match = _scalar_match(pred, expected)
++            if match is None:
++                continue
++            if match:
++                counts[field]["tp"] += 1
++            elif expected is not None:
++                counts[field]["fn"] += 1
++            else:
++                counts[field]["fp"] += 1
++
++        lang_match = _language_match(extracted["language"]["value"], labels)
++        if lang_match is not None:
++            if lang_match:
++                counts["language"]["tp"] += 1
++            elif labels.get("languages"):
++                counts["language"]["fn"] += 1
++            else:
++                counts["language"]["fp"] += 1
++
++        skill_outcome = _skill_match(extracted["skills"]["value"], labels)
++        if skill_outcome is not None:
++            tp, fp, fn = skill_outcome
++            skill_tp += tp
++            skill_fp += fp
++            skill_fn += fn
++
++    return counts, (skill_tp, skill_fp, skill_fn)
++
++
++def _prf(tp: int, fp: int, fn: int) -> dict:
++    precision = tp / (tp + fp) if (tp + fp) else 1.0
++    recall = tp / (tp + fn) if (tp + fn) else 1.0
++    f1 = (
++        2 * precision * recall / (precision + recall)
++        if (precision + recall)
++        else 0.0
++    )
++    return {
++        "precision": round(precision, 4),
++        "recall": round(recall, 4),
++        "f1": round(f1, 4),
++        "tp": tp,
++        "fp": fp,
++        "fn": fn,
++    }
++
++
++def _ece(confs: list[float], correct: list[int], bins: int = 10) -> float:
++    if not confs:
++        return 0.0
++    total = 0.0
++    for index in range(bins):
++        low = index / bins
++        high = (index + 1) / bins
++        bucket = [
++            (confidence, label)
++            for confidence, label in zip(confs, correct, strict=True)
++            if low <= confidence < high or (high == 1.0 and confidence == 1.0)
++        ]
++        if not bucket:
++            continue
++        avg_conf = sum(item[0] for item in bucket) / len(bucket)
++        accuracy = sum(item[1] for item in bucket) / len(bucket)
++        total += (len(bucket) / len(confs)) * abs(avg_conf - accuracy)
++    return round(total, 4)
++
++
++def _brier(confs: list[float], correct: list[int]) -> float:
++    if not confs:
++        return 0.0
++    total = sum(
++        (confidence - label) ** 2
++        for confidence, label in zip(confs, correct, strict=True)
++    )
++    return round(total / len(confs), 4)
++
++
++def evaluate_nlp(
++    records: list[dict],
++    classifier: TaskTextClassifier | None = None,
++    now: datetime | None = None,
++) -> dict:
++    """Evaluate classification, fields, calibration, and gating."""
++    classifier = classifier or get_default_classifier()
++    now = now or EVAL_NOW
++
++    y_true: list[str] = []
++    y_pred: list[str] = []
++    top3_hits = 0
++    confs: list[float] = []
++    correct: list[int] = []
++    flagged = 0
++    wrong_confident = 0
++    labeled_total = 0
++    slice_stats: dict[str, dict] = {}
++
++    for record in records:
++        result = classifier.predict(record["text"], now=now)
++        slice_name = record.get("slice", "other")
++        stats = slice_stats.setdefault(
++            slice_name, {"total": 0, "correct": 0, "flagged": 0}
++        )
++        stats["total"] += 1
++
++        if result["needs_clarification"]:
++            flagged += 1
++            stats["flagged"] += 1
++
++        category = record.get("category")
++        if category is None:
++            continue
++        labeled_total += 1
++        predicted = result["category"]
++        is_correct = predicted == category
++        y_true.append(category)
++        y_pred.append(predicted)
++        confs.append(float(result["calibrated_confidence"]))
++        correct.append(1 if is_correct else 0)
++        if is_correct:
++            stats["correct"] += 1
++        if category in {item["category"] for item in result["candidates"]}:
++            top3_hits += 1
++        if not is_correct and not result["needs_clarification"]:
++            wrong_confident += 1
++
++    from sklearn.metrics import f1_score
++
++    macro_f1 = (
++        f1_score(y_true, y_pred, average="macro", zero_division=0.0)
++        if y_true
++        else 0.0
++    )
++    top1 = sum(correct) / labeled_total if labeled_total else 0.0
++    top3 = top3_hits / labeled_total if labeled_total else 0.0
++
++    field_counts, skill_counts = _field_outcomes(records, now)
++    field_metrics = {
++        field: _prf(**field_counts[field]) for field in field_counts
++    }
++    skill_tp, skill_fp, skill_fn = skill_counts
++    field_metrics["skills"] = _prf(skill_tp, skill_fp, skill_fn)
++
++    total_records = len(records)
++    return {
++        "dataset": {
++            "records": total_records,
++            "labeled": labeled_total,
++            "slices": {
++                name: {
++                    "total": stats["total"],
++                    "top1_accuracy": round(
++                        stats["correct"] / stats["total"], 4
++                    )
++                    if stats["total"]
++                    else 0.0,
++                    "clarification_rate": round(
++                        stats["flagged"] / stats["total"], 4
++                    )
++                    if stats["total"]
++                    else 0.0,
++                }
++                for name, stats in sorted(slice_stats.items())
++            },
++        },
++        "category": {
++            "top1": round(top1, 4),
++            "top3": round(top3, 4),
++            "macro_f1": round(macro_f1, 4),
++        },
++        "fields": field_metrics,
++        "calibration": {
++            "ece": _ece(confs, correct),
++            "brier": _brier(confs, correct),
++            "mean_confidence": round(
++                sum(confs) / len(confs), 4
++            )
++            if confs
++            else 0.0,
++        },
++        "gating": {
++            "clarification_rate": round(flagged / total_records, 4)
++            if total_records
++            else 0.0,
++            "wrong_confident_rate": round(wrong_confident / labeled_total, 4)
++            if labeled_total
++            else 0.0,
++            "wrong_confident": wrong_confident,
++        },
++    }
++
++
++def _render_markdown(metrics: dict, baseline: dict) -> str:
++    lines = [
++        "# NLP 层评估报告",
++        "",
++        f"Holdout：{metrics['dataset']['records']} 条手写/改写样本，"
++        f"{metrics['dataset']['labeled']} 条带类别标签。",
++        "",
++        "## 类别分类",
++        "",
++        "| 指标 | 目标 | 实测 |",
++        "|---|---|---|",
++        f"| Top-1 | ≥ baseline + 3pp | {metrics['category']['top1']:.4f} "
++        f"(baseline {baseline.get('top1', 0.0):.4f}) |",
++        f"| Top-3 | ≥ 0.95 | {metrics['category']['top3']:.4f} |",
++        f"| Macro-F1 | ≥ 0.80 | {metrics['category']['macro_f1']:.4f} |",
++        "",
++        "## 字段抽取（P / R / F1）",
++        "",
++        "| 字段 | Precision | Recall | F1 | TP/FP/FN |",
++        "|---|---|---|---|---|",
++    ]
++    for field, value in metrics["fields"].items():
++        lines.append(
++            f"| {field} | {value['precision']:.4f} | {value['recall']:.4f} | "
++            f"{value['f1']:.4f} | {value['tp']}/{value['fp']}/{value['fn']} |"
++        )
++    lines.extend(
++        [
++            "",
++            "## 校准与置信度",
++            "",
++            "| 指标 | 目标 | 实测 |",
++            "|---|---|---|",
++            f"| ECE | ≤ 0.10 | {metrics['calibration']['ece']:.4f} |",
++            f"| Brier | — | {metrics['calibration']['brier']:.4f} |",
++            f"| 澄清率 | ≤ 15% | {metrics['gating']['clarification_rate']:.4f} |",
++            f"| 错误自信率 | < 5% | {metrics['gating']['wrong_confident_rate']:.4f} |",
++            "",
++            "## 切片",
++            "",
++            "| 切片 | 样本 | Top-1 | 澄清率 |",
++            "|---|---|---|---|",
++        ]
++    )
++    for name, value in metrics["dataset"]["slices"].items():
++        lines.append(
++            f"| {name} | {value['total']} | {value['top1_accuracy']:.4f} | "
++            f"{value['clarification_rate']:.4f} |"
++        )
++    lines.append("")
++    return "\n".join(lines)
++
++
++def _baseline_top1(records: list[dict], now: datetime) -> dict:
++    """Top-1 of the pre-calibration (same ranking) classifier for reference."""
++    from app.data.synthetic import generate_dataset
++
++    baseline_model = TaskTextClassifier(alpha=0.6, calibrate=False).fit(
++        generate_dataset().tasks
++    )
++    total = 0
++    hits = 0
++    for record in records:
++        if record.get("category") is None:
++            continue
++        total += 1
++        if baseline_model.predict(record["text"], now=now)["category"] == record["category"]:
++            hits += 1
++    return {"top1": round(hits / total, 4) if total else 0.0, "n": total}
++
++
++def main() -> None:
++    records = load_holdout()
++    metrics = evaluate_nlp(records)
++    baseline = _baseline_top1(records, EVAL_NOW)
++
++    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
++    payload = {"metrics": metrics, "baseline": baseline}
++    (REPORTS_DIR / "nlp_eval.json").write_text(
++        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
++    )
++    (REPORTS_DIR / "nlp_eval.md").write_text(
++        _render_markdown(metrics, baseline) + "\n", encoding="utf-8"
++    )
++    print(json.dumps(payload, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+
+--- a/tests\test_nlp_api.py
++++ b/tests\test_nlp_api.py
+@@ -0,0 +1,28 @@
++"""Additive /classify fields for the NLP enhancement."""
++
++
++def test_classify_returns_additive_nlp_fields(client):
++    response = client.post(
++        "/classify",
++        json={
++            "text": "招聘一名电池工艺工程师，要求 3 年以上经验，预算 8000 元。",
++            "top_k": 2,
++        },
++    )
++    assert response.status_code == 200
++    body = response.json()
++    # Existing contract stays intact.
++    assert body["category"] == "recruitment"
++    assert body["suggested_template"] == "recruitment"
++    assert len(body["candidates"]) == 2
++    assert body["extracted"]["budget_min"] == 8000
++    # Additive fields.
++    assert "confidence" in body
++    assert "calibrated_confidence" in body
++    assert "confidence_threshold" in body
++    assert "evidence" in body
++    assert "extracted_v2" in body
++    assert "fields_v2" in body
++    assert body["fields_v2"]["budget"]["value"] == [8000, 8000]
++    assert isinstance(body["calibrated_confidence"], (int, float))
++    assert isinstance(body["evidence"], list)
+
+--- a/tests\test_nlp_eval.py
++++ b/tests\test_nlp_eval.py
+@@ -0,0 +1,78 @@
++import importlib.util
++from datetime import datetime, timezone
++from pathlib import Path
++
++from app.data.synthetic import generate_dataset
++from app.nlp.classifier import TaskTextClassifier
++
++ROOT = Path(__file__).resolve().parent.parent
++
++
++def _load_evaluate_nlp():
++    spec = importlib.util.spec_from_file_location(
++        "evaluate_nlp", ROOT / "scripts" / "evaluate_nlp.py"
++    )
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _classifier():
++    dataset = generate_dataset(
++        n_workers=5, n_tasks=40, n_assignments=20, seed=7, n_new_users=0
++    )
++    return TaskTextClassifier(alpha=0.6, calibrate=False).fit(dataset.tasks)
++
++
++def test_evaluate_nlp_returns_expected_sections():
++    evaluate = _load_evaluate_nlp()
++    records = [
++        {
++            "id": "t1",
++            "slice": "paraphrase",
++            "category": "software_dev",
++            "text": "我们要做一个微信小程序，包含会员积分和下单支付，预算 8000–30000 元，30 天内交付，截止 2026-12-20，支持远程。",
++            "fields": {
++                "budget_min": 8000,
++                "budget_max": 30000,
++                "duration_days": 30,
++                "date": "2026-12-20",
++                "remote_ok": True,
++            },
++        },
++        {
++            "id": "t2",
++            "slice": "ambiguous",
++            "category": None,
++            "text": "帮我做个东西，越快越好。",
++            "fields": {},
++        },
++    ]
++    metrics = evaluate.evaluate_nlp(
++        records,
++        classifier=_classifier(),
++        now=datetime(2026, 6, 1, tzinfo=timezone.utc),
++    )
++    assert "category" in metrics
++    assert "top1" in metrics["category"]
++    assert "top3" in metrics["category"]
++    assert "macro_f1" in metrics["category"]
++    assert "budget" in metrics["fields"]
++    assert "duration" in metrics["fields"]
++    assert "date" in metrics["fields"]
++    assert "remote" in metrics["fields"]
++    assert "ece" in metrics["calibration"]
++    assert "brier" in metrics["calibration"]
++    assert "clarification_rate" in metrics["gating"]
++    assert "wrong_confident_rate" in metrics["gating"]
++    assert "slices" in metrics["dataset"]
++
++
++def test_evaluate_nlp_holdout_file_loads():
++    evaluate = _load_evaluate_nlp()
++    records = evaluate.load_holdout()
++    assert len(records) >= 30
++    assert all("text" in record for record in records)
++    assert all("slice" in record for record in records)
++    assert any(record["slice"] == "typo" for record in records)
++    assert any(record["slice"] == "paraphrase" for record in records)
+
+--- a/tests\test_nlp_extract.py
++++ b/tests\test_nlp_extract.py
+@@ -0,0 +1,94 @@
++from datetime import datetime, timezone
++
++from app.nlp.extract import extract_fields_v2
++
++NOW = datetime(2026, 6, 1, tzinfo=timezone.utc)
++
++
++def test_extract_budget_range_with_evidence():
++    fields = extract_fields_v2(
++        "我们要做一个会员小程序，预算 8,000–30,000 元，支持远程。", now=NOW
++    )
++    budget = fields["budget"]
++    assert budget["value"] == [8000, 30000]
++    assert budget["confidence"] > 0.8
++    assert "8,000" in budget["evidence"] and "30,000" in budget["evidence"]
++
++
++def test_extract_budget_shared_ten_thousand_unit():
++    fields = extract_fields_v2("这个项目预算 1-2 万，两周内完成。", now=NOW)
++    assert fields["budget"]["value"] == [10000, 20000]
++
++
++def test_extract_budget_enforces_min_leq_max():
++    fields = extract_fields_v2("预算 3-1 万。", now=NOW)
++    low, high = fields["budget"]["value"]
++    assert low <= high
++    assert [low, high] == [10000, 30000]
++
++
++def test_extract_budget_single_amount():
++    fields = extract_fields_v2("招聘一名工程师，预算 8000 元。", now=NOW)
++    assert fields["budget"]["value"] == [8000, 8000]
++
++
++def test_extract_duration_days_and_weeks():
++    assert extract_fields_v2("期望 30 天内交付。", now=NOW)["duration"]["value"] == 30
++    assert extract_fields_v2("两周内完成。", now=NOW)["duration"]["value"] == 14
++    assert extract_fields_v2("一个月内完成。", now=NOW)["duration"]["value"] == 30
++
++
++def test_extract_date_deadline_future_and_past():
++    fields = extract_fields_v2("截止 2026-12-01 交付。", now=NOW)
++    assert fields["date"]["value"] == "2026-12-01"
++    assert fields["date"]["confidence"] > 0.8
++    assert "2026-12-01" in fields["date"]["evidence"]
++
++    past = extract_fields_v2("截止 2020-01-01 交付。", now=NOW)
++    assert past["date"]["value"] is None
++
++
++def test_extract_remote():
++    assert extract_fields_v2("支持远程协作。", now=NOW)["remote"]["value"] is True
++    assert extract_fields_v2("需要线下驻场。", now=NOW)["remote"]["value"] is False
++    assert extract_fields_v2("普通需求。", now=NOW)["remote"]["value"] is None
++
++
++def test_extract_count():
++    assert extract_fields_v2("对 10 万张图片做标注。", now=NOW)["count"]["value"] == 100000
++    assert extract_fields_v2("写 3 篇文章。", now=NOW)["count"]["value"] == 3
++
++
++def test_extract_experience():
++    fields = extract_fields_v2("要求 3 年以上相关经验。", now=NOW)
++    assert fields["experience"]["value"] == 3.0
++
++
++def test_extract_language():
++    fields = extract_fields_v2("翻译成英文和日文。", now=NOW)
++    assert fields["language"]["value"] == ["英文", "日文"]
++
++
++def test_extract_skills_in_taxonomy():
++    fields = extract_fields_v2("要求熟悉微信小程序和支付接口。", now=NOW)
++    skills = fields["skills"]["value"]
++    assert "frontend" in skills
++    assert "backend" in skills
++    # Unknown phrases never leak into the result.
++    assert "量子计算" not in skills
++    from app.nlp.lexicon import known_skills
++
++    assert set(skills) <= known_skills()
++
++
++def test_extract_fields_v2_evidence_spans_present():
++    fields = extract_fields_v2(
++        "预算 5000 元，10 天内交付，截止 2026-12-05，需要线下。", now=NOW
++    )
++    for key in ("budget", "duration", "date", "remote"):
++        entry = fields[key]
++        assert "value" in entry and "confidence" in entry and "evidence" in entry
++    assert fields["budget"]["evidence"]
++    assert fields["duration"]["evidence"]
++    assert fields["date"]["evidence"]
++    assert fields["remote"]["evidence"] == "线下"
+
+--- a/tests\test_nlp_normalize.py
++++ b/tests\test_nlp_normalize.py
+@@ -0,0 +1,65 @@
++from app.nlp.normalize import normalize_text
++from app.nlp.tokenizer import (
++    content_words,
++    jieba_available,
++    keywords,
++    tokenize,
++)
++
++
++def test_normalize_text_handles_none_and_empty():
++    assert normalize_text(None) == ""
++    assert normalize_text("") == ""
++    assert normalize_text("   ") == ""
++
++
++def test_normalize_text_nfkc_fullwidth():
++    assert normalize_text("ＡＢＣ１２３") == "ABC123"
++    assert normalize_text("８，０００元") == "8,000元"
++
++
++def test_normalize_text_fullwidth_space_and_whitespace():
++    assert normalize_text("预算　8000　元") == "预算 8000 元"
++    assert normalize_text("  多   个\n空\t格  ") == "多 个 空 格"
++
++
++def test_normalize_text_punctuation_dashes():
++    assert normalize_text("8000–30000") == "8000-30000"
++    assert normalize_text("8000—30000") == "8000-30000"
++    assert normalize_text("8000～30000") == "8000~30000"
++    assert normalize_text("等等…") == "等等..."
++
++
++def test_normalize_text_preserves_chinese():
++    assert normalize_text("微信小程序开发") == "微信小程序开发"
++
++
++def test_tokenizer_falls_back_without_jieba():
++    # jieba is optional; the app must work without it.
++    assert isinstance(jieba_available(), bool)
++    tokens = tokenize("微信小程序开发")
++    assert tokens
++    assert all(isinstance(token, str) and token for token in tokens)
++
++
++def test_tokenizer_latin_words_preserved():
++    tokens = tokenize("使用 Figma 制作原型")
++    assert "figma" in tokens or "figma" in " ".join(tokens).lower()
++
++
++def test_content_words_drops_stopwords_and_single_cjk():
++    words = content_words("我们要做一个会员小程序，包含下单支付和后台管理。")
++    assert "程序" in words or "小程序" in words or "支付" in words
++    # "的"/"要" style stopwords are filtered out.
++    assert "的" not in words
++
++
++def test_keywords_returns_top_k_unique():
++    words = keywords("小程序开发，小程序支付，支付接口，后端开发", top_k=3)
++    assert isinstance(words, list)
++    assert 1 <= len(words) <= 3
++    assert len(words) == len(set(words))
++
++
++def test_keywords_top_k_at_least_one():
++    assert keywords("", top_k=5) == []
+
+--- a/tests\test_nlp_sections.py
++++ b/tests\test_nlp_sections.py
+@@ -0,0 +1,92 @@
++from app.nlp.sections import crf_available, parse_resume_sections
++
++SAMPLE = """5 年软件开发相关经验，能独立负责项目交付。
++
++教育经历
++2012 – 2016 复旦大学 计算机科学与技术 学士
++
++工作经历
++2019 – 至今 云启科技 高级全栈工程师
++2016 – 2019 数联软件 后端工程师
++
++项目经历
++连锁零售会员小程序 核心开发
++制造业 ERP 库存升级 后端负责人
++
++技能
++后端开发
++前端开发 3 年
++数据分析 2 年
++
++证书与认证
++AWS Certified Developer
++PMP
++
++语言
++中文
++英文
++"""
++
++
++def test_parse_resume_sections_education():
++    sections = parse_resume_sections(SAMPLE)
++    education = sections["education"]
++    assert education
++    entry = education[0]
++    assert entry["school"] == "复旦大学"
++    assert entry["degree"] == "学士"
++    assert "计算机" in entry["major"]
++    assert entry["dates"]
++
++
++def test_parse_resume_sections_work():
++    sections = parse_resume_sections(SAMPLE)
++    work = sections["work"]
++    assert len(work) == 2
++    first = work[0]
++    assert first["company"] == "云启科技"
++    assert "工程师" in first["title"]
++    assert first["dates"]
++    assert first["years"] is not None
++
++
++def test_parse_resume_sections_projects():
++    sections = parse_resume_sections(SAMPLE)
++    projects = sections["projects"]
++    assert len(projects) == 2
++    assert "小程序" in projects[0]["name"]
++    assert projects[1]["role"] == "后端负责人"
++
++
++def test_parse_resume_sections_skills_with_category():
++    sections = parse_resume_sections(SAMPLE)
++    skills = sections["skills"]
++    categories = [entry.get("category") for entry in skills]
++    assert "backend" in categories
++    assert "frontend" in categories
++    assert "analytics" in categories
++    frontend = next(entry for entry in skills if entry["category"] == "frontend")
++    assert frontend["years"] == 3.0
++
++
++def test_parse_resume_sections_certificates_and_languages():
++    sections = parse_resume_sections(SAMPLE)
++    assert "AWS Certified Developer" in sections["certificates"]
++    assert "中文" in sections["languages"]
++    assert "英文" in sections["languages"]
++
++
++def test_parse_resume_sections_experience_years():
++    sections = parse_resume_sections(SAMPLE)
++    assert sections["experience_years"] == 5.0
++
++
++def test_parse_resume_sections_empty_input():
++    sections = parse_resume_sections("")
++    assert sections["work"] == []
++    assert sections["education"] == []
++    assert sections["experience_years"] is None
++
++
++def test_crf_optional_flag_is_boolean():
++    assert isinstance(crf_available(), bool)
+

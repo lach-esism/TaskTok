@@ -1,0 +1,810 @@
+{
+  "schema_version": "1.0.0",
+  "description": "常见任务链模板库：客户发布一个任务后，按模板拆解为带依赖的子任务 DAG，再分配给不同 worker。",
+  "templates": [
+    {
+      "template_id": "software_dev_v1",
+      "category": "software_dev",
+      "name": "软件开发/网站",
+      "version": "1.0.0",
+      "target_hours": [3, 16],
+      "max_nodes": 10,
+      "nodes": [
+        {
+          "key": "requirements",
+          "title": "需求澄清",
+          "type": "task",
+          "hours": 4,
+          "skills": {"requirements": 3},
+          "depends_on": [],
+          "acceptance": ["需求文档经客户确认"]
+        },
+        {
+          "key": "solution_design",
+          "title": "方案设计",
+          "type": "task",
+          "hours": 6,
+          "skills": {"architecture": 3, "requirements": 3},
+          "depends_on": ["requirements"],
+          "acceptance": ["技术方案评审通过"]
+        },
+        {
+          "key": "backend_dev",
+          "title": "后端开发",
+          "type": "task",
+          "hours": 16,
+          "skills": {"backend": 4},
+          "depends_on": ["solution_design"],
+          "acceptance": ["接口与数据模型完成并通过自测"]
+        },
+        {
+          "key": "frontend_dev",
+          "title": "前端开发",
+          "type": "task",
+          "hours": 16,
+          "skills": {"frontend": 4},
+          "depends_on": ["solution_design"],
+          "acceptance": ["页面与交互完成并通过自测"]
+        },
+        {
+          "key": "integration",
+          "title": "前后端联调",
+          "type": "task",
+          "hours": 6,
+          "skills": {"frontend": 3, "backend": 3},
+          "depends_on": ["backend_dev", "frontend_dev"],
+          "acceptance": ["核心流程联调通过"]
+        },
+        {
+          "key": "testing",
+          "title": "测试",
+          "type": "review",
+          "hours": 8,
+          "skills": {"qa": 3},
+          "depends_on": ["integration"],
+          "acceptance": ["测试报告与缺陷修复完成"]
+        },
+        {
+          "key": "deployment",
+          "title": "上线部署",
+          "type": "delivery",
+          "hours": 3,
+          "skills": {"devops": 3},
+          "depends_on": ["testing"],
+          "acceptance": ["生产环境可用，回滚方案就绪"]
+        }
+      ]
+    },
+    {
+      "template_id": "ui_ux_design_v1",
+      "category": "ui_ux_design",
+      "name": "UI/UX 设计",
+      "version": "1.0.0",
+      "target_hours": [3, 12],
+      "max_nodes": 8,
+      "nodes": [
+        {
+          "key": "research",
+          "title": "用户与竞品研究",
+          "type": "task",
+          "hours": 6,
+          "skills": {"ux": 3, "research": 2},
+          "depends_on": [],
+          "acceptance": ["研究结论与设计目标确认"]
+        },
+        {
+          "key": "wireframe",
+          "title": "信息架构与线框图",
+          "type": "task",
+          "hours": 8,
+          "skills": {"ux": 3},
+          "depends_on": ["research"],
+          "acceptance": ["关键流程线框图评审通过"]
+        },
+        {
+          "key": "visual_design",
+          "title": "视觉设计",
+          "type": "task",
+          "hours": 12,
+          "skills": {"ui": 4},
+          "depends_on": ["wireframe"],
+          "acceptance": ["高保真视觉稿完成"]
+        },
+        {
+          "key": "prototype",
+          "title": "交互原型",
+          "type": "task",
+          "hours": 6,
+          "skills": {"ui": 3, "ux": 3},
+          "depends_on": ["visual_design"],
+          "acceptance": ["可点击原型完成"]
+        },
+        {
+          "key": "usability_review",
+          "title": "可用性评审",
+          "type": "review",
+          "hours": 4,
+          "skills": {"ux": 3},
+          "depends_on": ["prototype"],
+          "acceptance": ["主要可用性问题闭环"]
+        },
+        {
+          "key": "handoff",
+          "title": "设计交付",
+          "type": "delivery",
+          "hours": 3,
+          "skills": {"ui": 3},
+          "depends_on": ["usability_review"],
+          "acceptance": ["设计规范与切图交付"]
+        }
+      ]
+    },
+    {
+      "template_id": "brand_design_v1",
+      "category": "brand_design",
+      "name": "品牌/平面设计",
+      "version": "1.0.0",
+      "target_hours": [3, 12],
+      "max_nodes": 8,
+      "nodes": [
+        {
+          "key": "brief",
+          "title": "品牌需求梳理",
+          "type": "task",
+          "hours": 3,
+          "skills": {"brand": 3},
+          "depends_on": [],
+          "acceptance": ["品牌定位与调性确认"]
+        },
+        {
+          "key": "moodboard",
+          "title": "情绪板与方向探索",
+          "type": "task",
+          "hours": 4,
+          "skills": {"brand": 3},
+          "depends_on": ["brief"],
+          "acceptance": ["视觉方向确认"]
+        },
+        {
+          "key": "concept",
+          "title": "核心概念设计",
+          "type": "task",
+          "hours": 8,
+          "skills": {"brand": 4},
+          "depends_on": ["moodboard"],
+          "acceptance": ["2-3 个概念方案提交"]
+        },
+        {
+          "key": "draft",
+          "title": "设计初稿",
+          "type": "task",
+          "hours": 10,
+          "skills": {"graphic_design": 4},
+          "depends_on": ["concept"],
+          "acceptance": ["主视觉初稿完成"]
+        },
+        {
+          "key": "review",
+          "title": "客户评审",
+          "type": "review",
+          "hours": 4,
+          "skills": {"brand": 3},
+          "depends_on": ["draft"],
+          "acceptance": ["修改意见收敛"]
+        },
+        {
+          "key": "final_assets",
+          "title": "最终交付",
+          "type": "delivery",
+          "hours": 4,
+          "skills": {"graphic_design": 3},
+          "depends_on": ["review"],
+          "acceptance": ["源文件与多尺寸资产交付"]
+        }
+      ]
+    },
+    {
+      "template_id": "content_writing_v1",
+      "category": "content_writing",
+      "name": "内容写作",
+      "version": "1.0.0",
+      "target_hours": [2, 8],
+      "max_nodes": 7,
+      "nodes": [
+        {
+          "key": "topic",
+          "title": "选题",
+          "type": "task",
+          "hours": 2,
+          "skills": {"research": 2},
+          "depends_on": [],
+          "acceptance": ["选题与角度确认"]
+        },
+        {
+          "key": "research",
+          "title": "资料收集",
+          "type": "task",
+          "hours": 4,
+          "skills": {"research": 3},
+          "depends_on": ["topic"],
+          "acceptance": ["资料清单与引用来源"]
+        },
+        {
+          "key": "outline",
+          "title": "大纲",
+          "type": "task",
+          "hours": 3,
+          "skills": {"writing": 3},
+          "depends_on": ["research"],
+          "acceptance": ["大纲评审通过"]
+        },
+        {
+          "key": "draft",
+          "title": "初稿",
+          "type": "task",
+          "hours": 8,
+          "skills": {"writing": 4},
+          "depends_on": ["outline"],
+          "acceptance": ["初稿完成"]
+        },
+        {
+          "key": "edit",
+          "title": "编辑润色",
+          "type": "review",
+          "hours": 4,
+          "skills": {"editing": 3},
+          "depends_on": ["draft"],
+          "acceptance": ["事实与文字校对完成"]
+        },
+        {
+          "key": "publish",
+          "title": "发布",
+          "type": "delivery",
+          "hours": 2,
+          "skills": {"publishing": 2},
+          "depends_on": ["edit"],
+          "acceptance": ["按规范发布上线"]
+        }
+      ]
+    },
+    {
+      "template_id": "video_production_v1",
+      "category": "video_production",
+      "name": "短视频/视频制作",
+      "version": "1.0.0",
+      "target_hours": [3, 12],
+      "max_nodes": 9,
+      "nodes": [
+        {
+          "key": "script",
+          "title": "脚本",
+          "type": "task",
+          "hours": 4,
+          "skills": {"writing": 3},
+          "depends_on": [],
+          "acceptance": ["脚本与分镜需求确认"]
+        },
+        {
+          "key": "storyboard",
+          "title": "分镜",
+          "type": "task",
+          "hours": 4,
+          "skills": {"video": 3},
+          "depends_on": ["script"],
+          "acceptance": ["分镜表完成"]
+        },
+        {
+          "key": "shoot",
+          "title": "拍摄",
+          "type": "task",
+          "hours": 8,
+          "skills": {"shooting": 3},
+          "depends_on": ["storyboard"],
+          "acceptance": ["素材拍摄完成"]
+        },
+        {
+          "key": "edit",
+          "title": "剪辑",
+          "type": "task",
+          "hours": 12,
+          "skills": {"video_editing": 4},
+          "depends_on": ["shoot"],
+          "acceptance": ["粗剪与精剪完成"]
+        },
+        {
+          "key": "audio_subtitles",
+          "title": "配音与字幕",
+          "type": "task",
+          "hours": 4,
+          "skills": {"audio": 3},
+          "depends_on": ["edit"],
+          "acceptance": ["音画同步，字幕准确"]
+        },
+        {
+          "key": "review",
+          "title": "审核",
+          "type": "review",
+          "hours": 3,
+          "skills": {"video": 3},
+          "depends_on": ["audio_subtitles"],
+          "acceptance": ["客户审核通过"]
+        },
+        {
+          "key": "publish",
+          "title": "发布",
+          "type": "delivery",
+          "hours": 2,
+          "skills": {"publishing": 2},
+          "depends_on": ["review"],
+          "acceptance": ["按平台规范发布"]
+        }
+      ]
+    },
+    {
+      "template_id": "marketing_campaign_v1",
+      "category": "marketing_campaign",
+      "name": "市场活动",
+      "version": "1.0.0",
+      "target_hours": [3, 12],
+      "max_nodes": 9,
+      "nodes": [
+        {
+          "key": "goal",
+          "title": "目标与预算",
+          "type": "task",
+          "hours": 3,
+          "skills": {"marketing": 3},
+          "depends_on": [],
+          "acceptance": ["目标、预算与成功指标确认"]
+        },
+        {
+          "key": "strategy",
+          "title": "活动策略",
+          "type": "task",
+          "hours": 6,
+          "skills": {"marketing": 4},
+          "depends_on": ["goal"],
+          "acceptance": ["策略方案评审通过"]
+        },
+        {
+          "key": "creative",
+          "title": "创意与物料",
+          "type": "task",
+          "hours": 8,
+          "skills": {"creative": 3},
+          "depends_on": ["strategy"],
+          "acceptance": ["主视觉与物料完成"]
+        },
+        {
+          "key": "channel_plan",
+          "title": "渠道计划",
+          "type": "task",
+          "hours": 4,
+          "skills": {"marketing": 3},
+          "depends_on": ["strategy"],
+          "acceptance": ["渠道排期与预算分配确认"]
+        },
+        {
+          "key": "execution",
+          "title": "活动执行",
+          "type": "task",
+          "hours": 12,
+          "skills": {"marketing": 3},
+          "depends_on": ["creative", "channel_plan"],
+          "acceptance": ["活动按计划上线"]
+        },
+        {
+          "key": "monitoring",
+          "title": "数据监控",
+          "type": "review",
+          "hours": 6,
+          "skills": {"analytics": 3},
+          "depends_on": ["execution"],
+          "acceptance": ["核心指标日报"]
+        },
+        {
+          "key": "report",
+          "title": "复盘报告",
+          "type": "delivery",
+          "hours": 4,
+          "skills": {"analytics": 3},
+          "depends_on": ["monitoring"],
+          "acceptance": ["复盘报告与改进建议"]
+        }
+      ]
+    },
+    {
+      "template_id": "data_annotation_v1",
+      "category": "data_annotation",
+      "name": "数据标注",
+      "version": "1.0.0",
+      "target_hours": [3, 16],
+      "max_nodes": 8,
+      "nodes": [
+        {
+          "key": "guideline",
+          "title": "标注规范",
+          "type": "task",
+          "hours": 6,
+          "skills": {"data_labeling": 3},
+          "depends_on": [],
+          "acceptance": ["标注规范与示例确认"]
+        },
+        {
+          "key": "pilot",
+          "title": "试标",
+          "type": "task",
+          "hours": 4,
+          "skills": {"data_labeling": 3},
+          "depends_on": ["guideline"],
+          "acceptance": ["试标一致率达标"]
+        },
+        {
+          "key": "batch_annotation",
+          "title": "批量标注",
+          "type": "task",
+          "hours": 16,
+          "skills": {"data_labeling": 3},
+          "depends_on": ["pilot"],
+          "acceptance": ["批量标注完成"]
+        },
+        {
+          "key": "qa",
+          "title": "质检",
+          "type": "review",
+          "hours": 8,
+          "skills": {"qa_labeling": 3},
+          "depends_on": ["batch_annotation"],
+          "acceptance": ["抽检合格率达到阈值"]
+        },
+        {
+          "key": "rework",
+          "title": "返修",
+          "type": "task",
+          "hours": 6,
+          "skills": {"data_labeling": 2},
+          "depends_on": ["qa"],
+          "acceptance": ["质检问题全部修复"]
+        },
+        {
+          "key": "delivery",
+          "title": "交付",
+          "type": "delivery",
+          "hours": 3,
+          "skills": {"data_labeling": 2},
+          "depends_on": ["rework"],
+          "acceptance": ["数据格式与验收标准一致"]
+        }
+      ]
+    },
+    {
+      "template_id": "translation_localization_v1",
+      "category": "translation_localization",
+      "name": "翻译/本地化",
+      "version": "1.0.0",
+      "target_hours": [2, 12],
+      "max_nodes": 8,
+      "nodes": [
+        {
+          "key": "glossary",
+          "title": "术语表",
+          "type": "task",
+          "hours": 3,
+          "skills": {"translation": 3},
+          "depends_on": [],
+          "acceptance": ["术语表确认"]
+        },
+        {
+          "key": "translation",
+          "title": "翻译",
+          "type": "task",
+          "hours": 12,
+          "skills": {"translation": 4},
+          "depends_on": ["glossary"],
+          "acceptance": ["全文翻译完成"]
+        },
+        {
+          "key": "review",
+          "title": "审校",
+          "type": "review",
+          "hours": 6,
+          "skills": {"translation": 3},
+          "depends_on": ["translation"],
+          "acceptance": ["准确性审校完成"]
+        },
+        {
+          "key": "cultural_adaptation",
+          "title": "文化适配",
+          "type": "task",
+          "hours": 4,
+          "skills": {"localization": 3},
+          "depends_on": ["review"],
+          "acceptance": ["本地化表达与文化适配确认"]
+        },
+        {
+          "key": "qa",
+          "title": "质量检查",
+          "type": "review",
+          "hours": 3,
+          "skills": {"qa": 2},
+          "depends_on": ["cultural_adaptation"],
+          "acceptance": ["格式与术语一致性检查通过"]
+        },
+        {
+          "key": "delivery",
+          "title": "交付",
+          "type": "delivery",
+          "hours": 2,
+          "skills": {"localization": 2},
+          "depends_on": ["qa"],
+          "acceptance": ["按约定格式交付"]
+        }
+      ]
+    },
+    {
+      "template_id": "ecommerce_ops_v1",
+      "category": "ecommerce_ops",
+      "name": "电商运营",
+      "version": "1.0.0",
+      "target_hours": [3, 12],
+      "max_nodes": 8,
+      "nodes": [
+        {
+          "key": "market_research",
+          "title": "市场与竞品调研",
+          "type": "task",
+          "hours": 6,
+          "skills": {"ecommerce": 3, "research": 2},
+          "depends_on": [],
+          "acceptance": ["竞品与价格带分析完成"]
+        },
+        {
+          "key": "listing_optimization",
+          "title": "商品页优化",
+          "type": "task",
+          "hours": 8,
+          "skills": {"ecommerce": 3},
+          "depends_on": ["market_research"],
+          "acceptance": ["标题/卖点/关键词优化完成"]
+        },
+        {
+          "key": "visual_assets",
+          "title": "视觉素材",
+          "type": "task",
+          "hours": 8,
+          "skills": {"graphic_design": 3},
+          "depends_on": ["market_research"],
+          "acceptance": ["主图与详情页素材完成"]
+        },
+        {
+          "key": "campaign",
+          "title": "促销活动",
+          "type": "task",
+          "hours": 10,
+          "skills": {"marketing": 3},
+          "depends_on": ["listing_optimization", "visual_assets"],
+          "acceptance": ["活动页与优惠机制上线"]
+        },
+        {
+          "key": "customer_service",
+          "title": "客服支持",
+          "type": "task",
+          "hours": 4,
+          "skills": {"customer_service": 2},
+          "depends_on": ["campaign"],
+          "acceptance": ["咨询响应与售后处理达标"]
+        },
+        {
+          "key": "analytics",
+          "title": "数据复盘",
+          "type": "review",
+          "hours": 4,
+          "skills": {"analytics": 3},
+          "depends_on": ["campaign"],
+          "acceptance": ["转化与投放数据复盘"]
+        }
+      ]
+    },
+    {
+      "template_id": "recruitment_v1",
+      "category": "recruitment",
+      "name": "招聘",
+      "version": "1.0.0",
+      "target_hours": [2, 8],
+      "max_nodes": 7,
+      "nodes": [
+        {
+          "key": "jd",
+          "title": "职位描述",
+          "type": "task",
+          "hours": 3,
+          "skills": {"recruiting": 3},
+          "depends_on": [],
+          "acceptance": ["JD 与用人需求确认"]
+        },
+        {
+          "key": "sourcing",
+          "title": "候选人寻访",
+          "type": "task",
+          "hours": 8,
+          "skills": {"sourcing": 3},
+          "depends_on": ["jd"],
+          "acceptance": ["候选人池达到目标数量"]
+        },
+        {
+          "key": "screening",
+          "title": "简历筛选",
+          "type": "task",
+          "hours": 6,
+          "skills": {"recruiting": 3},
+          "depends_on": ["sourcing"],
+          "acceptance": ["进入面试的候选人确认"]
+        },
+        {
+          "key": "interview",
+          "title": "面试",
+          "type": "task",
+          "hours": 8,
+          "skills": {"interviewing": 3},
+          "depends_on": ["screening"],
+          "acceptance": ["面试评估表完成"]
+        },
+        {
+          "key": "offer",
+          "title": "Offer",
+          "type": "task",
+          "hours": 3,
+          "skills": {"recruiting": 3},
+          "depends_on": ["interview"],
+          "acceptance": ["Offer 发放并确认"]
+        },
+        {
+          "key": "onboarding",
+          "title": "入职",
+          "type": "delivery",
+          "hours": 4,
+          "skills": {"hr": 2},
+          "depends_on": ["offer"],
+          "acceptance": ["入职手续与首周安排完成"]
+        }
+      ]
+    },
+    {
+      "template_id": "consulting_research_v1",
+      "category": "consulting_research",
+      "name": "咨询/调研",
+      "version": "1.0.0",
+      "target_hours": [3, 12],
+      "max_nodes": 9,
+      "nodes": [
+        {
+          "key": "scope",
+          "title": "项目范围",
+          "type": "task",
+          "hours": 4,
+          "skills": {"consulting": 3},
+          "depends_on": [],
+          "acceptance": ["研究问题与范围确认"]
+        },
+        {
+          "key": "desk_research",
+          "title": "桌面研究",
+          "type": "task",
+          "hours": 8,
+          "skills": {"research": 3},
+          "depends_on": ["scope"],
+          "acceptance": ["二手资料与行业数据整理"]
+        },
+        {
+          "key": "interviews",
+          "title": "访谈",
+          "type": "task",
+          "hours": 8,
+          "skills": {"research": 3},
+          "depends_on": ["scope"],
+          "acceptance": ["访谈记录与关键洞察"]
+        },
+        {
+          "key": "analysis",
+          "title": "分析",
+          "type": "task",
+          "hours": 10,
+          "skills": {"analysis": 4},
+          "depends_on": ["desk_research", "interviews"],
+          "acceptance": ["分析框架与结论形成"]
+        },
+        {
+          "key": "report",
+          "title": "报告撰写",
+          "type": "task",
+          "hours": 8,
+          "skills": {"writing": 3},
+          "depends_on": ["analysis"],
+          "acceptance": ["报告初稿完成"]
+        },
+        {
+          "key": "review",
+          "title": "内部评审",
+          "type": "review",
+          "hours": 3,
+          "skills": {"consulting": 3},
+          "depends_on": ["report"],
+          "acceptance": ["逻辑与证据链评审通过"]
+        },
+        {
+          "key": "presentation",
+          "title": "汇报",
+          "type": "delivery",
+          "hours": 4,
+          "skills": {"presentation": 3},
+          "depends_on": ["review"],
+          "acceptance": ["客户汇报完成"]
+        }
+      ]
+    },
+    {
+      "template_id": "training_course_v1",
+      "category": "training_course",
+      "name": "培训课程开发",
+      "version": "1.0.0",
+      "target_hours": [3, 12],
+      "max_nodes": 8,
+      "nodes": [
+        {
+          "key": "needs_analysis",
+          "title": "需求分析",
+          "type": "task",
+          "hours": 4,
+          "skills": {"training_design": 3},
+          "depends_on": [],
+          "acceptance": ["培训目标与学员画像确认"]
+        },
+        {
+          "key": "curriculum",
+          "title": "课程大纲",
+          "type": "task",
+          "hours": 6,
+          "skills": {"training_design": 4},
+          "depends_on": ["needs_analysis"],
+          "acceptance": ["大纲与学习路径评审通过"]
+        },
+        {
+          "key": "content_development",
+          "title": "内容开发",
+          "type": "task",
+          "hours": 12,
+          "skills": {"content_development": 4},
+          "depends_on": ["curriculum"],
+          "acceptance": ["讲义与练习完成"]
+        },
+        {
+          "key": "slides",
+          "title": "课件制作",
+          "type": "task",
+          "hours": 8,
+          "skills": {"presentation": 3},
+          "depends_on": ["content_development"],
+          "acceptance": ["课件与视觉规范完成"]
+        },
+        {
+          "key": "pilot",
+          "title": "试讲",
+          "type": "review",
+          "hours": 4,
+          "skills": {"training_design": 3},
+          "depends_on": ["slides"],
+          "acceptance": ["试讲反馈闭环"]
+        },
+        {
+          "key": "delivery",
+          "title": "交付",
+          "type": "delivery",
+          "hours": 4,
+          "skills": {"training_design": 3},
+          "depends_on": ["pilot"],
+          "acceptance": ["课程包与讲师手册交付"]
+        }
+      ]
+    }
+  ]
+}

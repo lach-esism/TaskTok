@@ -1,0 +1,170 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-10 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\features.py
+CHANGED tests\test_features_v2.py
+
+## Diff
+
+--- a/app\features.py
++++ b/app\features.py
+@@ -1,15 +1,15 @@
+ """Phase 1 feature scoring for the seven-dimension fusion model."""
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ from app.domain import Customer, Task, Worker
+ from app.preference.customer import CustomerPreferenceProfile
+ from app.preference.worker import WorkerPreferenceProfile
+ from app.reputation import (
+     category_reputation,
+     compute_reputation,
+     recent_breach_count as _recent_breach_count,
+ )
+ 
+@@ -94,40 +94,92 @@
+ def reputation_score(
+     worker: Worker,
+     category: str | None = None,
+     now: datetime | None = None,
+ ) -> float:
+     if category:
+         return category_reputation(worker, category, now=now)
+     return compute_reputation(worker, now=now).total
+ 
+ 
++def _as_aware(value: datetime) -> datetime:
++    """Attach UTC to naive datetimes so deadline math never raises."""
++    if value.tzinfo is None:
++        return value.replace(tzinfo=timezone.utc)
++    return value
++
++
++def pay_fit_score(worker: Worker, task: Task) -> float:
++    """How closely a task's budget matches the worker's expected pay."""
++    expected_pay = worker.expected_pay
++    if expected_pay == 0:
++        return 0.5
++    budget = task.budget
++    denominator = max(budget, expected_pay, 1.0)
++    return _clamp(1.0 - abs(budget - expected_pay) / denominator)
++
++
++def time_fit_score(
++    worker: Worker,
++    task: Task,
++    now: datetime | None = None,
++) -> float:
++    """Whether the worker's remaining time before the deadline fits the task.
++
++    The implicit "now" is truncated to the minute so repeated calls within the
++    same minute yield identical scores; deadline fit does not need sub-minute
++    precision and this keeps feature values reproducible.
++    """
++    if now is None:
++        current = datetime.now(timezone.utc).replace(second=0, microsecond=0)
++    else:
++        current = _as_aware(now)
++    deadline = _as_aware(task.deadline)
++    hours_until = max(
++        0.0, (deadline - current).total_seconds() / 3600.0
++    )
++    available = max(0.0, hours_until - worker.current_load_hours)
++    utilization = _clamp(task.estimated_hours / max(available, 1.0))
++    return _clamp(1.0 - utilization)
++
++
+ def preference_score(
+     worker: Worker,
+     task: Task,
+     profile: WorkerPreferenceProfile | None = None,
++    p_accept: float | None = None,
+ ) -> float:
+     if profile is not None and profile.confidence >= 0.2:
+         category_preference = profile.category_preferences.get(
+             task.category, 0.5
+         )
+         low, high = profile.difficulty_preference
+         midpoint = (low + high) / 2.0
+         difficulty_fit = 1.0 - abs(task.difficulty - midpoint) / 4.0
+-        return _clamp(
++        declared = _clamp(
+             0.6 * category_preference + 0.4 * difficulty_fit
+         )
+-    category_preference = worker.preferred_categories.get(task.category, 0.0)
+-    low, high = worker.preferred_difficulty
+-    midpoint = (low + high) / 2.0
+-    difficulty_fit = 1.0 - abs(task.difficulty - midpoint) / 4.0
+-    return _clamp(0.6 * category_preference + 0.4 * difficulty_fit)
++    else:
++        category_preference = worker.preferred_categories.get(
++            task.category, 0.0
++        )
++        low, high = worker.preferred_difficulty
++        midpoint = (low + high) / 2.0
++        difficulty_fit = 1.0 - abs(task.difficulty - midpoint) / 4.0
++        declared = _clamp(0.6 * category_preference + 0.4 * difficulty_fit)
++    acceptance = declared if p_accept is None else float(p_accept)
++    return _clamp(
++        0.4 * acceptance
++        + 0.3 * declared
++        + 0.15 * pay_fit_score(worker, task)
++        + 0.15 * time_fit_score(worker, task)
++    )
+ 
+ 
+ def load_score(worker: Worker, task: Task) -> float:
+     if worker.capacity_hours <= 0:
+         return 0.0
+     remaining = worker.capacity_hours - (
+         worker.current_load_hours + task.estimated_hours
+     )
+     return _clamp(remaining / worker.capacity_hours)
+ 
+
+--- a/tests\test_features_v2.py
++++ b/tests\test_features_v2.py
+@@ -65,10 +65,39 @@
+     assert skill_score(worker, task) == pytest.approx(expected)
+     assert skill_score(worker, task) != 1.0
+ 
+ 
+ def test_expertise_uses_certification_and_semantic():
+     worker = make_worker(certifications={"software_dev": 1.0}, ratings=[], completed=0)
+     task = make_task()
+     value = expertise_score(worker, task, semantic_similarity=1.0)
+     expected = 0.35 * 0.6 + 0.15 * 1.0 + 0.25 * (4.2 / 5) + 0.25 * 1.0
+     assert value == pytest.approx(expected, abs=1e-6)
++
++
++from datetime import datetime, timedelta, timezone
++from app.features import pay_fit_score, preference_score, time_fit_score
++
++
++def test_pay_fit_exact_match_and_missing():
++    worker = make_worker(expected_pay=1000)
++    assert pay_fit_score(worker, make_task(budget=1000)) == pytest.approx(1.0)
++    assert pay_fit_score(worker, make_task(budget=2000)) == pytest.approx(1 - 1000 / 2000)
++    assert pay_fit_score(make_worker(expected_pay=0), make_task(budget=1000)) == pytest.approx(0.5)
++
++
++def test_time_fit_exact_value():
++    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
++    worker = make_worker(current_load_hours=0)
++    task = make_task(estimated_hours=5, deadline=now + timedelta(hours=10))
++    assert time_fit_score(worker, task, now=now) == pytest.approx(0.5)
++
++
++def test_preference_weighted_formula():
++    worker = make_worker()
++    task = make_task()
++    value = preference_score(worker, task, p_accept=0.8)
++    declared = 0.6 * 0.8 + 0.4 * 1.0  # category 0.8, difficulty midpoint 3 = task difficulty 3
++    pay = pay_fit_score(worker, task)
++    time_fit = time_fit_score(worker, task)
++    expected = 0.4 * 0.8 + 0.3 * declared + 0.15 * pay + 0.15 * time_fit
++    assert value == pytest.approx(expected)
+

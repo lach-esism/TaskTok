@@ -1,0 +1,134 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-15 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\learning\choice.py
+CHANGED tests\test_pairwise_learning.py
+
+## Diff
+
+--- a/app\learning\choice.py
++++ b/app\learning\choice.py
+@@ -141,20 +141,89 @@
+         for key in self.keys:
+             gradient = (
+                 error * differences[key] / norm
+                 - self.l2 * (weights[key] - self.prior.get(key, 0.0))
+             )
+             weights[key] += float(learning_rate) * gradient
+         self.weights = project_weights(weights)
+         return dict(self.weights)
+ 
+ 
++class ListwiseChoiceLearner:
++    """Learn the seven fusion weights from a chosen candidate set.
++
++    Uses the softmax (listwise) gradient from
++    :meth:`app.benchmark.recommender.BenchmarkRecommender.learn`: the
++    target is a one-hot vector on ``chosen_index``, so each candidate
++    competes against every other candidate in the impression. Every
++    update is projected back onto the AHP simplex with
++    :func:`project_weights`.
++    """
++
++    def __init__(
++        self,
++        prior: dict[str, float],
++        l2: float = 0.1,
++        learning_rate: float = 0.05,
++    ) -> None:
++        self.prior = {key: float(value) for key, value in prior.items()}
++        self.keys = list(self.prior)
++        self.l2 = max(float(l2), 0.0)
++        self.learning_rate = float(learning_rate)
++        self.weights = project_weights(self.prior)
++
++    def learn(
++        self,
++        candidate_features: list[dict[str, float]],
++        chosen_index: int,
++        sample_weight: float = 1.0,
++    ) -> dict[str, float]:
++        """Apply one listwise gradient step over a candidate set."""
++        if not candidate_features:
++            return dict(self.weights)
++        if not 0 <= chosen_index < len(candidate_features):
++            raise IndexError("chosen_index out of range")
++
++        weights = dict(self.weights)
++        scores = [
++            sum(
++                weights[key] * float(features.get(key, 0.0))
++                for key in self.keys
++            )
++            for features in candidate_features
++        ]
++        maximum = max(scores)
++        exponentials = [
++            math.exp(score - maximum) for score in scores
++        ]
++        total = sum(exponentials)
++        probabilities = [value / total for value in exponentials]
++        scale = float(sample_weight)
++
++        for key in self.keys:
++            gradient = 0.0
++            for index, features in enumerate(candidate_features):
++                target = 1.0 if index == chosen_index else 0.0
++                gradient += (
++                    (probabilities[index] - target)
++                    * float(features.get(key, 0.0))
++                    * scale
++                )
++            weights[key] = (
++                weights[key]
++                - self.learning_rate * gradient
++                - self.l2 * (weights[key] - self.prior.get(key, 0.0))
++            )
++        self.weights = project_weights(weights)
++        return dict(self.weights)
++
++
+ def build_pairs(
+     events: Iterable[RecommendationEvent],
+     feature_lookup: Callable[[RecommendationEvent], dict[str, float]],
+     time_decay_tau_days: float = DEFAULT_TAU_DAYS,
+ ) -> list[ChoicePair]:
+     """Build weighted preference pairs from per-request recommendation events.
+ 
+     Positives are ``click``/``apply``/``accept`` events and negatives are
+     ``reject``/``ignore`` events. Every positive-negative combination in the
+     same request becomes a pair weighted by time decay and inverse propensity.
+
+--- a/tests\test_pairwise_learning.py
++++ b/tests\test_pairwise_learning.py
+@@ -18,10 +18,29 @@
+     weights = PairwiseChoiceLearner(prior).fit(pairs)
+     assert weights["skill"] >= prior["skill"]
+     assert abs(sum(weights.values()) - 1.0) < 1e-9
+ 
+ 
+ def test_propensity_clipping():
+     learner = PairwiseChoiceLearner(dict(DEFAULT_WEIGHTS))
+     pair = ChoicePair(chosen=_features(skill=1.0), rejected=_features(skill=0.0), weight=20.0)
+     weights = learner.fit([pair])
+     assert abs(sum(weights.values()) - 1.0) < 1e-9
++
++
++from app.learning.choice import ListwiseChoiceLearner
++
++
++def test_listwise_learner_prefers_chosen_candidate():
++    prior = dict(DEFAULT_WEIGHTS)
++    learner = ListwiseChoiceLearner(prior, learning_rate=0.5)
++    candidates = [
++        _features(skill=1.0, reputation=1.0),
++        _features(skill=0.1, reputation=0.1),
++        _features(skill=0.2, reputation=0.2),
++    ]
++    weights = prior
++    for _ in range(20):
++        weights = learner.learn(candidates, chosen_index=0, sample_weight=1.0)
++    score = lambda f: sum(weights[k] * f[k] for k in weights)
++    assert score(candidates[0]) > score(candidates[1])
++    assert abs(sum(weights.values()) - 1.0) < 1e-9
+

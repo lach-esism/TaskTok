@@ -1,0 +1,60 @@
+# Additive alias file for skill/category normalization.
+# Format: namespace<TAB>key<TAB>comma,separated,aliases
+# Bare lines (no namespace) are treated as skill aliases.
+# Lines are case/width-normalized before lookup.
+
+# --- skills ---
+skill	requirements	需求分析,需求澄清,需求文档,需求梳理
+skill	architecture	系统架构,架构设计,技术架构
+skill	backend	后端开发,服务端开发,后端工程师,后台开发,接口开发
+skill	frontend	前端开发,前端工程师,web前端,页面开发
+skill	qa	软件测试,测试工程师,质量保证,测试开发
+skill	devops	部署运维,运维工程师,持续集成,容器化
+skill	ux	用户体验设计,用户研究,交互设计,可用性设计
+skill	ui	界面设计,视觉界面,UI设计,高保真设计
+skill	research	行业研究,市场研究,用户研究,竞品研究
+skill	brand	品牌设计,品牌策略,视觉识别,品牌规范
+skill	graphic_design	平面设计,海报设计,包装设计,视觉物料
+skill	writing	文案写作,内容创作,软文撰写,文案策划
+skill	editing	编辑校对,文案编辑,审校,润色
+skill	publishing	排版发布,内容发布,图文排版
+skill	video	视频制作,短视频制作,宣传片制作
+skill	shooting	摄影摄像,视频拍摄,摄像,分镜拍摄
+skill	video_editing	视频剪辑,后期制作,剪辑后期,视频后期
+skill	audio	配音,音频处理,录音,声音设计
+skill	marketing	市场营销,营销推广,活动策划,品牌营销
+skill	creative	创意策划,创意文案,广告创意
+skill	analytics	数据分析,数据运营,经营分析,数据复盘
+skill	data_labeling	数据标注,图像标注,文本标注,数据采集
+skill	qa_labeling	标注质检,数据质检,质量抽检
+skill	translation	翻译,笔译,口译,译员
+skill	localization	本地化,多语言本地化,本地化翻译
+skill	ecommerce	电商运营,店铺运营,天猫运营,京东运营
+skill	customer_service	客服,售后服务,用户支持
+skill	recruiting	招聘,猎头,招聘顾问,人才招聘
+skill	sourcing	人才寻访,候选人寻访,人才库
+skill	interviewing	面试评估,面试安排,候选人评估
+skill	hr	人事,人力资源,HR,员工关系
+skill	consulting	管理咨询,战略咨询,咨询顾问,咨询项目
+skill	analysis	商业分析,经营分析,建模测算
+skill	presentation	汇报呈现,PPT制作,路演材料
+skill	training_design	课程设计,培训方案设计,培训课程设计
+skill	content_development	课件开发,课程开发,教材编写
+skill	security	信息安全,网络安全,渗透测试
+skill	design	视觉设计,设计
+skill	operations	运营管理,日常运营,活动运营
+skill	legal	法务,合规,合同审核,知识产权
+
+# --- categories ---
+category	software_dev	软件开发,软件,程序开发,小程序开发,系统开发
+category	ui_ux_design	UI设计,UX设计,用户体验设计,交互设计,界面设计
+category	brand_design	品牌设计,VI设计,logo设计,平面设计
+category	content_writing	内容写作,文案策划,文案,写作
+category	video_production	视频制作,视频拍摄,短视频制作,视频剪辑
+category	marketing_campaign	营销活动,市场活动,活动策划,整合营销
+category	data_annotation	数据标注,数据采集,图像标注
+category	translation_localization	翻译,本地化,多语言翻译
+category	ecommerce_ops	电商运营,店铺运营,天猫运营
+category	recruitment	招聘,猎头,人才招聘
+category	consulting_research	咨询调研,市场调研,行业研究,咨询
+category	training_course	培训,课程开发,企业培训,培训课程

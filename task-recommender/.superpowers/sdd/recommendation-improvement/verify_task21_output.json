@@ -1,0 +1,301 @@
+{
+  "db": "C:\\Users\\1\\Desktop\\bohack\\AI-Research-SKILLs-main\\AI-Research-SKILLs-main\\generated\\task-recommender\\data\\benchmark\\task_benchmark_large.sqlite",
+  "jsonl": "C:\\Users\\1\\Desktop\\bohack\\AI-Research-SKILLs-main\\AI-Research-SKILLs-main\\generated\\task-recommender\\data\\benchmark\\task_benchmark_large.jsonl",
+  "model_safe_loader": {
+    "labels_empty": true,
+    "stats_metadata_present": false,
+    "test_outcome_leaks": 0,
+    "train_rows": 80000,
+    "test_rows": 20000
+  },
+  "sqlite_counts": {
+    "workers": 1000,
+    "tasks": 10000,
+    "customers": 500,
+    "assignments": 100000,
+    "splits": 10000,
+    "labels": 10000
+  },
+  "split_counts": {
+    "test": 2000,
+    "train": 8000
+  },
+  "assignment_split_counts": {
+    "test": 20000,
+    "train": 80000
+  },
+  "status_counts": {
+    "accepted": 61631,
+    "rejected": 38369
+  },
+  "schema": {
+    "tasks": [
+      "task_id",
+      "customer_id",
+      "title",
+      "task_text",
+      "budget",
+      "deadline",
+      "region",
+      "remote_ok",
+      "split"
+    ],
+    "workers": [
+      "worker_id",
+      "name",
+      "resume_text",
+      "skills",
+      "specialties",
+      "level",
+      "rating",
+      "completed",
+      "on_time_rate",
+      "rework_rate",
+      "capacity_hours",
+      "current_load_hours",
+      "region",
+      "remote_ok",
+      "preferred_categories"
+    ],
+    "labels": [
+      "task_id",
+      "gold_worker_id",
+      "split"
+    ]
+  },
+  "exact_duplicates": {
+    "tasks": 0,
+    "resumes": 0,
+    "task_titles": 0
+  },
+  "near_duplicates": [
+    {
+      "label": "tasks",
+      "count": 10000,
+      "near_dup_collisions": 0,
+      "near_dup_rate": 0.0,
+      "distinct_simhashes": 10000
+    },
+    {
+      "label": "resumes",
+      "count": 1000,
+      "near_dup_collisions": 0,
+      "near_dup_rate": 0.0,
+      "distinct_simhashes": 1000
+    }
+  ],
+  "text_quality": [
+    {
+      "count": 10000,
+      "empty": 0,
+      "no_cjk": 0,
+      "with_sentence_punct": 10000,
+      "length_min": 167,
+      "length_mean": 210.8,
+      "length_max": 280,
+      "label": "tasks"
+    },
+    {
+      "count": 1000,
+      "empty": 0,
+      "no_cjk": 0,
+      "with_sentence_punct": 1000,
+      "length_min": 356,
+      "length_mean": 393.0,
+      "length_max": 449,
+      "label": "resumes"
+    }
+  ],
+  "resume_coherence": {
+    "violations": 0,
+    "examples": []
+  },
+  "assignments": {
+    "rated": 61631,
+    "rating_min": 1.0,
+    "rating_max": 5.0,
+    "on_time_rated": 61631,
+    "rework_rated": 61631
+  },
+  "metadata": {
+    "seed": 42,
+    "n_workers": 1000,
+    "n_tasks": 10000,
+    "n_assignments": 100000,
+    "scheme": "E",
+    "split": "80/20 task split",
+    "generated_at": "2026-11-14T02:15:48.143087+00:00",
+    "llm_seeds": false
+  },
+  "stat_keys": [
+    "stat:accepted",
+    "stat:budget",
+    "stat:category_distribution",
+    "stat:duration_days",
+    "stat:exposure_pool_size",
+    "stat:gold_acceptance_rate",
+    "stat:gold_accepted",
+    "stat:gold_workers",
+    "stat:industry_distribution",
+    "stat:max_gold_share",
+    "stat:n_assignments",
+    "stat:n_customers",
+    "stat:n_tasks",
+    "stat:n_workers",
+    "stat:on_time_rate",
+    "stat:rating_distribution",
+    "stat:rejected",
+    "stat:resume_completeness",
+    "stat:resume_exact_duplicates",
+    "stat:resume_near_dup_collisions",
+    "stat:resume_near_dup_rate",
+    "stat:resume_near_dup_rejections",
+    "stat:resume_text_length",
+    "stat:split_outcomes",
+    "stat:task_exact_duplicates",
+    "stat:task_near_dup_collisions",
+    "stat:task_near_dup_rate",
+    "stat:task_near_dup_rejections",
+    "stat:task_text_length",
+    "stat:task_title_duplicates",
+    "stat:task_unique_titles",
+    "stat:test_tasks",
+    "stat:train_tasks"
+  ],
+  "distributions": {
+    "category": {
+      "brand_design": 834,
+      "consulting_research": 833,
+      "content_writing": 834,
+      "data_annotation": 833,
+      "ecommerce_ops": 833,
+      "marketing_campaign": 833,
+      "recruitment": 833,
+      "software_dev": 834,
+      "training_course": 833,
+      "translation_localization": 833,
+      "ui_ux_design": 834,
+      "video_production": 833
+    },
+    "industry": {
+      "人力资源": 500,
+      "企业服务": 500,
+      "农业": 500,
+      "制造业": 500,
+      "医疗健康": 500,
+      "半导体": 500,
+      "宠物": 500,
+      "家居": 500,
+      "教育": 500,
+      "文旅": 500,
+      "新能源": 500,
+      "新能源汽车": 500,
+      "游戏": 500,
+      "物流": 500,
+      "美妆": 500,
+      "跨境电商": 500,
+      "连锁餐饮": 500,
+      "酒旅": 500,
+      "金融科技": 500,
+      "零售": 500
+    },
+    "budget": {
+      "min": 3850.0,
+      "mean": 13074.98,
+      "max": 28800.0
+    },
+    "duration_days": {
+      "min": 3,
+      "mean": 20.06,
+      "max": 60
+    },
+    "task_text_length": {
+      "min": 167,
+      "mean": 210.8,
+      "max": 280
+    },
+    "resume_text_length": {
+      "min": 356,
+      "mean": 393.0,
+      "max": 449
+    },
+    "rating_distribution": {
+      "1": 2421,
+      "2": 14218,
+      "3": 14554,
+      "4": 18356,
+      "5": 12082
+    },
+    "on_time_rate": 0.595,
+    "resume_completeness": {
+      "name": 1.0,
+      "city": 1.0,
+      "skills": 1.0,
+      "projects": 1.0,
+      "certifications": 1.0,
+      "experience": 1.0
+    }
+  },
+  "recorded_stats": {
+    "n_workers": 1000,
+    "n_tasks": 10000,
+    "n_assignments": 100000,
+    "train_tasks": 8000,
+    "test_tasks": 2000,
+    "accepted": 61631,
+    "rejected": 38369,
+    "task_exact_duplicates": 0,
+    "task_title_duplicates": 0,
+    "task_unique_titles": 10000,
+    "task_near_dup_collisions": 0,
+    "task_near_dup_rate": 0.0,
+    "task_near_dup_rejections": 651,
+    "resume_exact_duplicates": 0,
+    "resume_near_dup_collisions": 0,
+    "resume_near_dup_rate": 0.0,
+    "resume_near_dup_rejections": 1641,
+    "gold_workers": 964,
+    "gold_accepted": 7681,
+    "gold_acceptance_rate": 0.7681,
+    "exposure_pool_size": 10,
+    "max_gold_share": 0.0058,
+    "split_outcomes": {
+      "train": {
+        "assignments": 80000,
+        "accepted": 49323,
+        "rejected": 30677,
+        "rated": 49323,
+        "mean_rating": 3.381,
+        "on_time_rate": 0.5941
+      },
+      "test": {
+        "assignments": 20000,
+        "accepted": 12308,
+        "rejected": 7692,
+        "rated": 12308,
+        "mean_rating": 3.378,
+        "on_time_rate": 0.599
+      }
+    }
+  },
+  "jsonl_counts": {
+    "meta": 1,
+    "worker": 1000,
+    "task": 10000,
+    "customer": 500,
+    "assignment": 100000,
+    "split": 10000
+  },
+  "jsonl_bad_label_records": 0,
+  "jsonl_model_safety": {
+    "meta_has_stats": false,
+    "meta_has_stat_keys": false,
+    "test_outcome_leaks": 0,
+    "outcome_policy": {
+      "test_split": "redacted",
+      "train_split": "full"
+    }
+  },
+  "failures": [],
+  "ok": true
+}

@@ -1,0 +1,737 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-17 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\events.py
+CHANGED app\main.py
+CHANGED app\schemas.py
+CHANGED tests\conftest.py
+ADDED   tests\test_api_events.py
+CHANGED tests\test_phase2_api.py
+
+## Diff
+
+--- a/app\events.py
++++ b/app\events.py
+@@ -101,28 +101,40 @@
+             event.request_id == request_id
+             and event.candidate_id == candidate_id
+             and event.action == action
+             for event in self.store.events
+         ):
+             raise ValueError(
+                 "duplicate event for "
+                 f"({request_id}, {candidate_id}, {action})"
+             )
+         context = dict(metadata or {})
++        candidate_type = (
++            context.get("candidate_type")
++            or impression.metadata.get("candidate_type")
++            or "worker"
++        )
++        task_id = context.get("task_id") or impression.metadata.get("task_id")
++        if not task_id:
++            task_id = (
++                candidate_id
++                if candidate_type == "task"
++                else impression.query_id
++            )
+         event = RecommendationEvent(
+             event_id=uuid.uuid4().hex,
+             request_id=request_id,
+             user_id=user_id,
+             role=role,
+-            task_id=impression.query_id,
++            task_id=task_id,
+             candidate_id=candidate_id,
+-            candidate_type=context.get("candidate_type", "worker"),
++            candidate_type=candidate_type,
+             rank=impression.candidate_ids.index(candidate_id) + 1,
+             score=float(context.get("score", 0.0)),
+             propensity=impression.propensities[candidate_id],
+             weights_version=str(context.get("weights_version", "v0000")),
+             action=action,
+             created_at=self.store.reference_time,
+             metadata=context,
+         )
+         self.store.events.append(event)
+         self._persist("events", asdict(event))
+
+--- a/app\main.py
++++ b/app\main.py
+@@ -1,35 +1,37 @@
+ """FastAPI application factory and routes."""
+ 
+ from __future__ import annotations
+ 
+ import json
++import uuid
+ from dataclasses import asdict
+ from pathlib import Path
+ 
+ from fastapi import FastAPI, HTTPException, Query
+ from fastapi.responses import RedirectResponse
+ from fastapi.staticfiles import StaticFiles
+ 
+ from app.acceptance.service import AcceptanceService
+ from app.benchmark.db import BenchmarkRepository, build_benchmark_db
+ from app.benchmark.runner import BenchmarkRoundRunner
+ from app.chains.compose import compose_templates
+ from app.chains.decompose import decompose, quality_score
+ from app.chains.plan_store import ChainPlanStore
+ from app.chains.planner import plan_chain, propagate_breach, replan_chain
+ from app.config import APP_VERSION, DEFAULT_WEIGHTS
+ from app.data.store import Store
+ from app.data.synthetic import generate_dataset
+ from app.data.templates import load_templates
+ from app.domain import Task, TaskChain, Worker
+ from app.evaluation_phase2 import evaluate_two_runs
++from app.events import EventService
+ from app.feedback import FeedbackService
+ from app.features import candidate_features, pay_fit_score, skill_score
+ from app.learning.acceptance import AcceptanceModel, accept_features
+ from app.learning.exploration import ExplorationPolicy
+ from app.learning.online import OnlineWeightLearner
+ from app.learning.weights import AHP_PRIOR
+ from app.semantic import (
+     SemanticMatcher,
+     build_matcher,
+     build_task_text,
+@@ -46,20 +48,22 @@
+ from app.preference.worker import (
+     WorkerPreferenceProfile,
+     update_worker_preferences,
+ )
+ from app.schemas import (
+     CandidateResponse,
+     ClassifyRequest,
+     CreateAssignmentRequest,
+     DecisionRequest,
+     DecomposeRequest,
++    EventsRequest,
++    EventsResponse,
+     FeedbackRequest,
+     NodeRecommendRequest,
+     NodeStatusRequest,
+     ReviewRequest,
+     SubmissionRequest,
+     OnboardingRequest,
+     PlanRollbackRequest,
+     RecommendResponse,
+     RecommendTasksRequest,
+     RecommendWorkersRequest,
+@@ -175,20 +179,21 @@
+     except Exception:  # noqa: BLE001 - an unfitted model degrades to prior
+         return None
+     return model if model.is_fitted else None
+ 
+ 
+ def _node_candidates(
+     chain: TaskChain,
+     node_id: str,
+     current: Store,
+     top_n: int,
++    exploration: ExplorationPolicy,
+     weights: dict[str, float] | None = None,
+     semantic_matcher: SemanticMatcher | None = None,
+     acceptance_model: AcceptanceModel | None = None,
+ ) -> RecommendResponse:
+     node = next(
+         (
+             candidate
+             for candidate in chain.nodes
+             if candidate.key == node_id or candidate.subtask_id == node_id
+         ),
+@@ -217,23 +222,21 @@
+     service = RecommendationService(
+         current,
+         weights=weights,
+         semantic_matcher=semantic_matcher,
+         acceptance_model=acceptance_model,
+     )
+     pool_size = min(100, max(top_n * 3, top_n + 1))
+     candidates = service.recommend_workers_for_task(
+         temporary_task, top_n=pool_size
+     )
+-    candidates = ExplorationPolicy(epsilon=0.10, seed=42).rerank(
+-        candidates, k=top_n
+-    )
++    candidates = exploration.rerank(candidates, k=top_n)
+     return RecommendResponse(
+         query_id=node.subtask_id,
+         candidates=[
+             CandidateResponse(
+                 candidate_id=candidate.candidate_id,
+                 score=candidate.score,
+                 breakdown=candidate.breakdown,
+                 reasons=candidate.reasons,
+                 cold_start=candidate.cold_start,
+                 propensity=candidate.propensity,
+@@ -241,20 +244,22 @@
+             for candidate in candidates
+         ],
+         reason=None if candidates else "no eligible candidates",
+     )
+ 
+ 
+ def create_app(
+     store: Store | None = None,
+     weights_dir: Path | None = None,
+     benchmark_db: Path | None = None,
++    events_dir: Path | None = None,
++    exploration_seed: int | None = None,
+ ) -> FastAPI:
+     """Create the Phase 2 application."""
+     app = FastAPI(title="Task Assignment Recommender", version=APP_VERSION)
+     test_assignments = []
+     if store is None:
+         dataset = generate_dataset()
+         store = Store(
+             workers=dataset.workers,
+             customers=dataset.customers,
+             tasks=dataset.tasks,
+@@ -286,20 +291,29 @@
+     app.state.benchmark_db = Path(benchmark_db or BENCHMARK_DB_PATH)
+     if not TEMPLATE_PATH.exists():
+         raise RuntimeError(f"template file not found: {TEMPLATE_PATH}")
+     app.state.templates = load_templates(TEMPLATE_PATH)
+ 
+     def require_store() -> Store:
+         if app.state.store is None:
+             raise HTTPException(status_code=503, detail="store is not initialized")
+         return app.state.store
+ 
++    app.state.events = EventService(
++        require_store(),
++        persist_dir=events_dir
++        or Path(__file__).resolve().parent.parent / "data" / "events",
++    )
++    app.state.exploration = ExplorationPolicy(
++        epsilon=0.10, seed=exploration_seed
++    )
++
+     @app.get("/health")
+     def health() -> dict[str, str]:
+         return {"status": "ok", "version": APP_VERSION}
+ 
+     @app.get("/workers")
+     def list_workers() -> list[dict]:
+         current = require_store()
+         return [asdict(worker) for worker in current.workers.values()]
+ 
+     @app.get("/resumes")
+@@ -566,20 +580,38 @@
+                 request.worker_id,
+                 request.customer_id,
+                 request.recommendation_context,
+             )
+         except KeyError:
+             raise HTTPException(
+                 status_code=404, detail="task or worker not found"
+             )
+         except ValueError as error:
+             raise HTTPException(status_code=409, detail=str(error))
++        context = request.recommendation_context
++        if context is not None and context.request_id:
++            try:
++                app.state.events.record_event(
++                    context.request_id,
++                    request.worker_id,
++                    "accept",
++                    user_id=request.customer_id,
++                    role="customer",
++                    metadata={
++                        "weights_version": app.state.weight_store.active().version
++                    },
++                )
++            except (KeyError, ValueError):
++                # The assignment still succeeds when the recommendation
++                # request is unknown, e.g. it predates this process, or the
++                # accept was already recorded through POST /events.
++                pass
+         return asdict(assignment)
+ 
+     @app.post("/feedback")
+     def create_feedback(request: FeedbackRequest) -> dict:
+         current = require_store()
+         service = FeedbackService(current)
+         try:
+             feedback = service.record_feedback(
+                 request.assignment_id,
+                 request.overall_rating,
+@@ -831,92 +863,153 @@
+         data = json.loads(path.read_text(encoding="utf-8"))
+         return data.get("learning_curve", {})
+ 
+     @app.get("/metrics/learning-rounds")
+     def metrics_learning_rounds() -> dict:
+         path = REPORTS_DIR / "learning_rounds.json"
+         if not path.exists():
+             return {"available": False}
+         return json.loads(path.read_text(encoding="utf-8"))
+ 
++    @app.post("/events", response_model=EventsResponse)
++    def record_events(request: EventsRequest) -> EventsResponse:
++        weights_version = app.state.weight_store.active().version
++        accepted = 0
++        for item in request.events:
++            metadata = dict(item.metadata)
++            if "candidate_type" in item.model_fields_set:
++                metadata["candidate_type"] = item.candidate_type
++            if "task_id" in item.model_fields_set:
++                metadata["task_id"] = item.task_id
++            metadata["weights_version"] = weights_version
++            try:
++                app.state.events.record_event(
++                    item.request_id,
++                    item.candidate_id,
++                    item.action,
++                    user_id=item.user_id,
++                    role=item.role,
++                    metadata=metadata,
++                )
++            except KeyError as error:
++                raise HTTPException(
++                    status_code=404, detail=f"unknown event target: {error}"
++                )
++            except ValueError as error:
++                raise HTTPException(status_code=409, detail=str(error))
++            accepted += 1
++        return EventsResponse(accepted=accepted)
++
++    @app.get("/events/metrics")
++    def event_metrics() -> dict:
++        return app.state.events.funnel_metrics()
++
+     @app.post("/recommend/workers", response_model=RecommendResponse)
+     def recommend_workers(request: RecommendWorkersRequest) -> RecommendResponse:
+         current = require_store()
+         service = RecommendationService(
+             current,
+             weights=app.state.weight_store.active().weights,
+             semantic_matcher=app.state.semantic_matcher,
+             acceptance_model=app.state.acceptance_model,
+         )
+         pool_size = min(100, max(request.top_n * 3, request.top_n + 1))
+         try:
+             candidates = service.recommend_workers(
+                 request.task_id,
+                 top_n=pool_size,
+                 user_id=request.user_id,
+             )
+         except KeyError:
+             raise HTTPException(status_code=404, detail="task not found")
+-        candidates = ExplorationPolicy(epsilon=0.10, seed=42).rerank(
++        candidates = app.state.exploration.rerank(
+             candidates, k=request.top_n
+         )
++        request_id = uuid.uuid4().hex
++        if candidates:
++            app.state.events.record_impression(
++                request_id,
++                request.task_id,
++                [candidate.candidate_id for candidate in candidates],
++                {
++                    candidate.candidate_id: candidate.propensity
++                    for candidate in candidates
++                },
++                "epsilon_greedy_topk",
++                metadata={"candidate_type": "worker"},
++            )
+         return RecommendResponse(
+             query_id=request.task_id,
+             candidates=[
+                 CandidateResponse(
+                     candidate_id=candidate.candidate_id,
+                     score=candidate.score,
+                     breakdown=candidate.breakdown,
+                     reasons=candidate.reasons,
+                     cold_start=candidate.cold_start,
+                     propensity=candidate.propensity,
+                 )
+                 for candidate in candidates
+             ],
+             reason=None if candidates else "no eligible candidates",
++            request_id=request_id,
+         )
+ 
+     @app.post("/recommend/tasks", response_model=RecommendResponse)
+     def recommend_tasks(request: RecommendTasksRequest) -> RecommendResponse:
+         current = require_store()
+         service = RecommendationService(
+             current,
+             weights=app.state.weight_store.active().weights,
+             semantic_matcher=app.state.semantic_matcher,
+             acceptance_model=app.state.acceptance_model,
+         )
+         pool_size = min(100, max(request.top_n * 3, request.top_n + 1))
+         try:
+             candidates = service.recommend_tasks(
+                 request.worker_id,
+                 top_n=pool_size,
+                 user_id=request.user_id,
+             )
+         except KeyError:
+             raise HTTPException(status_code=404, detail="worker not found")
+-        candidates = ExplorationPolicy(epsilon=0.10, seed=42).rerank(
++        candidates = app.state.exploration.rerank(
+             candidates, k=request.top_n
+         )
++        request_id = uuid.uuid4().hex
++        if candidates:
++            app.state.events.record_impression(
++                request_id,
++                request.worker_id,
++                [candidate.candidate_id for candidate in candidates],
++                {
++                    candidate.candidate_id: candidate.propensity
++                    for candidate in candidates
++                },
++                "epsilon_greedy_topk",
++                metadata={"candidate_type": "task"},
++            )
+         return RecommendResponse(
+             query_id=request.worker_id,
+             candidates=[
+                 CandidateResponse(
+                     candidate_id=candidate.candidate_id,
+                     score=candidate.score,
+                     breakdown=candidate.breakdown,
+                     reasons=candidate.reasons,
+                     cold_start=candidate.cold_start,
+                     propensity=candidate.propensity,
+                 )
+                 for candidate in candidates
+             ],
+             reason=None if candidates else "no eligible candidates",
++            request_id=request_id,
+         )
+ 
+     @app.post("/chains/decompose")
+     def decompose_chain(request: DecomposeRequest) -> dict:
+         current = require_store()
+         task = current.tasks.get(request.task_id)
+         if task is None:
+             raise HTTPException(status_code=404, detail="task not found")
+         try:
+             if request.mode == "compose":
+@@ -1104,16 +1197,17 @@
+     ) -> RecommendResponse:
+         current = require_store()
+         chain = app.state.chains.get(chain_id)
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+         return _node_candidates(
+             chain,
+             node_id,
+             current,
+             request.top_n,
++            app.state.exploration,
+             weights=app.state.weight_store.active().weights,
+             semantic_matcher=app.state.semantic_matcher,
+             acceptance_model=app.state.acceptance_model,
+         )
+ 
+     return app
+
+--- a/app\schemas.py
++++ b/app\schemas.py
+@@ -1,15 +1,16 @@
+ """Pydantic request and response schemas."""
+ 
+ from __future__ import annotations
+ 
+ from datetime import datetime
++from typing import Literal
+ 
+ from pydantic import BaseModel, Field
+ 
+ 
+ class RecommendWorkersRequest(BaseModel):
+     task_id: str
+     top_n: int = Field(default=10, ge=1, le=100)
+     explain: bool = True
+     user_id: str | None = None
+ 
+@@ -27,20 +28,41 @@
+     breakdown: dict[str, float]
+     reasons: list[str]
+     cold_start: bool
+     propensity: float = 1.0
+ 
+ 
+ class RecommendResponse(BaseModel):
+     query_id: str
+     candidates: list[CandidateResponse]
+     reason: str | None = None
++    request_id: str = ""
++
++
++class EventItem(BaseModel):
++    request_id: str
++    candidate_id: str
++    candidate_type: str = "worker"
++    action: Literal["click", "apply", "accept", "reject", "ignore"]
++    task_id: str | None = None
++    user_id: str | None = None
++    role: str = "customer"
++    metadata: dict = Field(default_factory=dict)
++
++
++class EventsRequest(BaseModel):
++    events: list[EventItem]
++
++
++class EventsResponse(BaseModel):
++    accepted: int
++    rejected: list[dict] = Field(default_factory=list)
+ 
+ 
+ class ClassifyRequest(BaseModel):
+     text: str = Field(min_length=4, max_length=5000)
+     top_k: int = Field(default=3, ge=1, le=6)
+ 
+ 
+ class SubmissionRequest(BaseModel):
+     worker_id: str
+     artifacts: dict
+@@ -69,20 +91,21 @@
+ 
+ class NodeRecommendRequest(BaseModel):
+     top_n: int = Field(default=10, ge=1, le=100)
+ 
+ 
+ class RecommendationContext(BaseModel):
+     score: float = 0.0
+     rank: int = 0
+     propensity: float = Field(default=1.0, ge=0, le=1)
+     weights_version: str = "v0000"
++    request_id: str = ""
+ 
+ 
+ class CreateAssignmentRequest(BaseModel):
+     task_id: str
+     worker_id: str
+     customer_id: str
+     recommendation_context: RecommendationContext | None = None
+ 
+ 
+ class FeedbackRequest(BaseModel):
+
+--- a/tests\conftest.py
++++ b/tests\conftest.py
+@@ -232,11 +232,18 @@
+         priority=3,
+         estimated_hours=8,
+         deadline=NOW + timedelta(days=14),
+         region="CN",
+         remote_ok=True,
+     )
+ 
+ 
+ @pytest.fixture
+ def client(small_store: Store, tmp_path) -> TestClient:
+-    return TestClient(create_app(small_store, weights_dir=tmp_path))
++    return TestClient(
++        create_app(
++            small_store,
++            weights_dir=tmp_path,
++            events_dir=tmp_path / "events",
++            exploration_seed=42,
++        )
++    )
+
+--- a/tests\test_api_events.py
++++ b/tests\test_api_events.py
+@@ -0,0 +1,130 @@
++def test_recommend_returns_request_id_and_events_flow(client):
++    response = client.post("/recommend/workers", json={"task_id": "t1", "top_n": 3})
++    assert response.status_code == 200
++    body = response.json()
++    assert body["request_id"]
++    candidate = body["candidates"][0]["candidate_id"]
++    event = client.post(
++        "/events",
++        json={"events": [{
++            "request_id": body["request_id"],
++            "candidate_id": candidate,
++            "action": "click",
++            "task_id": "t1",
++            "user_id": "c1",
++            "role": "customer",
++        }]},
++    )
++    assert event.status_code == 200
++    metrics = client.get("/events/metrics").json()
++    assert metrics["clicks"] >= 1
++
++
++def test_events_reject_duplicates_and_invalid_actions(client):
++    response = client.post("/recommend/workers", json={"task_id": "t1", "top_n": 1})
++    body = response.json()
++    candidate = body["candidates"][0]["candidate_id"]
++    payload = {"events": [{
++        "request_id": body["request_id"], "candidate_id": candidate,
++        "action": "click", "task_id": "t1",
++    }]}
++    assert client.post("/events", json=payload).status_code == 200
++    assert client.post("/events", json=payload).status_code == 409
++    bad = {"events": [{
++        "request_id": body["request_id"], "candidate_id": candidate,
++        "action": "nope", "task_id": "t1",
++    }]}
++    assert client.post("/events", json=bad).status_code == 422
++
++
++def test_task_event_uses_candidate_task_id(client):
++    response = client.post(
++        "/recommend/tasks", json={"worker_id": "w_good", "top_n": 1}
++    )
++    body = response.json()
++    candidate = body["candidates"][0]["candidate_id"]
++    event = client.post(
++        "/events",
++        json={"events": [{
++            "request_id": body["request_id"],
++            "candidate_id": candidate,
++            "candidate_type": "task",
++            "action": "click",
++            "task_id": candidate,
++        }]},
++    )
++    assert event.status_code == 200
++    stored = client.app.state.store.events[-1]
++    assert stored.candidate_type == "task"
++    assert stored.task_id == candidate
++
++
++def test_task_event_labels_fall_back_to_impression(client):
++    response = client.post(
++        "/recommend/tasks", json={"worker_id": "w_good", "top_n": 1}
++    )
++    body = response.json()
++    candidate = body["candidates"][0]["candidate_id"]
++    event = client.post(
++        "/events",
++        json={"events": [{
++            "request_id": body["request_id"],
++            "candidate_id": candidate,
++            "action": "click",
++        }]},
++    )
++    assert event.status_code == 200
++    stored = client.app.state.store.events[-1]
++    assert stored.candidate_type == "task"
++    assert stored.task_id == candidate
++
++
++def test_empty_recommendations_do_not_record_impressions(client):
++    before = client.get("/events/metrics").json()["impressions"]
++    workers = client.post(
++        "/recommend/workers", json={"task_id": "t_empty"}
++    ).json()
++    tasks = client.post(
++        "/recommend/tasks", json={"worker_id": "w_bad"}
++    ).json()
++    assert workers["candidates"] == []
++    assert tasks["candidates"] == []
++    assert workers["request_id"]
++    assert tasks["request_id"]
++    assert client.get("/events/metrics").json()["impressions"] == before
++
++
++def test_assignment_succeeds_after_duplicate_accept_event(client):
++    response = client.post(
++        "/recommend/workers", json={"task_id": "t1", "top_n": 3}
++    )
++    body = response.json()
++    candidate = body["candidates"][0]["candidate_id"]
++    accept = client.post(
++        "/events",
++        json={"events": [{
++            "request_id": body["request_id"],
++            "candidate_id": candidate,
++            "action": "accept",
++            "task_id": "t1",
++            "user_id": "c1",
++            "role": "customer",
++        }]},
++    )
++    assert accept.status_code == 200
++    assignment = client.post(
++        "/assignments",
++        json={
++            "task_id": "t1",
++            "worker_id": candidate,
++            "customer_id": "c1",
++            "recommendation_context": {"request_id": body["request_id"]},
++        },
++    )
++    assert assignment.status_code == 200
++    stored = client.app.state.store.events[-1]
++    assert stored.action == "accept"
++    assert stored.weights_version == (
++        client.app.state.weight_store.active().version
++    )
++    assert client.get("/events/metrics").json()["accepts"] == 1
+
+--- a/tests\test_phase2_api.py
++++ b/tests\test_phase2_api.py
+@@ -55,24 +55,34 @@
+     assert all(0.0 < candidate["propensity"] <= 1.0 for candidate in candidates)
+     assert any(candidate["propensity"] < 1.0 for candidate in candidates)
+ 
+ 
+ def test_active_weight_version_changes_and_rollback_restores(
+     small_store, tmp_path
+ ):
+     from fastapi.testclient import TestClient
+     from app.main import create_app
+ 
+-    client = TestClient(create_app(small_store, weights_dir=tmp_path))
++    client = TestClient(
++        create_app(
++            small_store,
++            weights_dir=tmp_path,
++            events_dir=tmp_path / "events",
++            exploration_seed=42,
++        )
++    )
+     baseline = client.post(
+         "/recommend/workers", json={"task_id": "t1", "top_n": 5}
+     ).json()
++    # Impressions are exposure-fairness inputs; reset them so the rollback
++    # comparison runs under identical exposure state.
++    small_store.impressions.clear()
+     client.app.state.weight_store.create(
+         {
+             "reputation": 0.40,
+             "skill": 0.25,
+             "expertise": 0.10,
+             "collaborative": 0.10,
+             "preference": 0.05,
+             "load": 0.06,
+             "customer_preference": 0.04,
+         },
+@@ -80,20 +90,21 @@
+         "test",
+     )
+     learned = client.post(
+         "/recommend/workers", json={"task_id": "t1", "top_n": 5}
+     ).json()
+     assert [
+         candidate["score"] for candidate in learned["candidates"]
+     ] != [
+         candidate["score"] for candidate in baseline["candidates"]
+     ]
++    small_store.impressions.clear()
+     client.post(
+         "/weights/rollback",
+         json={"to_version": "v0000", "reason": "test"},
+     )
+     restored = client.post(
+         "/recommend/workers", json={"task_id": "t1", "top_n": 5}
+     ).json()
+     assert [
+         candidate["candidate_id"] for candidate in restored["candidates"]
+     ] == [
+

@@ -1,0 +1,1471 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-19 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\evaluation_strict.py
+CHANGED docs\recommendation-flow.md
+CHANGED README.md
+CHANGED scripts\evaluate_strict.py
+ADDED   tests\test_docs.py
+CHANGED tests\test_strict_eval.py
+
+## Diff
+
+--- a/app\evaluation_strict.py
++++ b/app\evaluation_strict.py
+@@ -10,30 +10,35 @@
+ 
+ import math
+ import random
+ import statistics
+ import time
+ from datetime import datetime, timezone
+ 
+ from app.config import DEFAULT_WEIGHTS
+ from app.data.store import Store
+ from app.data.synthetic import generate_dataset
+-from app.domain import Assignment, Dataset, Impression
++from app.domain import Assignment, Dataset, Feedback, Impression
++from app.features import fuse_scores
++from app.learning.calibration import MIN_SAMPLES, PlattCalibrator
+ from app.service import RecommendationService, is_eligible
+ 
+ VALID_CANDIDATE_MODES = ("all", "exposed")
+ 
+ # Defaults for the strict report. They mirror the plan's protocol: a paired
+ # bootstrap over all test queries and 100 timed recommendations.
+ BOOTSTRAP_SAMPLES = 1000
+ BOOTSTRAP_SEED = 42
+ LATENCY_SAMPLES = 100
++CALIBRATION_BINS = 5
++POSITIVE_RATING = 4
++IDENTITY_TOLERANCE = 1e-9
+ 
+ _DIRECTIONS = (
+     "task_to_workers",
+     "task_to_workers_exposed",
+     "worker_to_tasks",
+     "worker_to_tasks_exposed",
+ )
+ _METRICS = ("hr", "ndcg", "mrr")
+ 
+ # (assignment, hr, ndcg, mrr, served top-k candidates)
+@@ -379,20 +384,181 @@
+     high = _percentile(ordered, 0.975)
+     fraction_le_zero = sum(1 for item in means if item <= 0.0) / len(means)
+     fraction_ge_zero = sum(1 for item in means if item >= 0.0) / len(means)
+     p_value = min(1.0, 2.0 * min(fraction_le_zero, fraction_ge_zero))
+     return {
+         "mean": mean,
+         "low": low,
+         "high": high,
+         "p_value": p_value,
+     }
++
++
++def weights_equivalent(
++    left: dict[str, float],
++    right: dict[str, float],
++    tolerance: float = IDENTITY_TOLERANCE,
++) -> bool:
++    """Return whether two weight dicts are numerically the same model.
++
++    Key sets must match exactly, so a partial or extra-key candidate is never
++    reported as identical to the baseline just because the shared keys match.
++    """
++    if set(left) != set(right):
++        return False
++    return all(
++        abs(float(left[key]) - float(right[key])) <= tolerance
++        for key in left
++    )
++
++
++def _positive_rate(labels: list[int]) -> float | None:
++    return sum(labels) / len(labels) if labels else None
++
++
++def _raw_brier(scores: list[float], labels: list[int]) -> float:
++    if not scores:
++        return 0.0
++    return sum(
++        (float(score) - label) ** 2 for score, label in zip(scores, labels)
++    ) / len(scores)
++
++
++def _calibration_pairs(
++    service: RecommendationService,
++    assignments: list[Assignment],
++    feedback: list[Feedback],
++    weights: dict[str, float],
++    cache: dict[tuple[str, str], float],
++) -> tuple[list[float], list[int]]:
++    """Return candidate scores and ``rating >= 4`` labels for assignments.
++
++    Scores come from the same serving-parity ``features_for`` path used by the
++    recommender, fused with the candidate weights. Only pairs with feedback are
++    returned. ``cache`` is scoped to one train-only store, so features computed
++    for a train pair cannot be reused against a different dataset.
++    """
++    ratings = {
++        item.assignment_id: int(item.overall_rating) for item in feedback
++    }
++    scores: list[float] = []
++    labels: list[int] = []
++    for assignment in assignments:
++        rating = ratings.get(assignment.assignment_id)
++        if rating is None:
++            continue
++        key = (assignment.task_id, assignment.worker_id)
++        score = cache.get(key)
++        if score is None:
++            try:
++                features = service.features_for(
++                    assignment.task_id, assignment.worker_id
++                )
++            except KeyError:
++                continue
++            score = fuse_scores(features, weights)
++            cache[key] = score
++        scores.append(score)
++        labels.append(1 if rating >= POSITIVE_RATING else 0)
++    return scores, labels
++
++
++def _reliability_bins(
++    calibrator: PlattCalibrator,
++    scores: list[float],
++    labels: list[int],
++    n_bins: int = CALIBRATION_BINS,
++) -> list[dict]:
++    """Equal-width reliability bins over calibrated test probabilities."""
++    counts = [0] * n_bins
++    predicted_sums = [0.0] * n_bins
++    positive_sums = [0] * n_bins
++    for score, label in zip(scores, labels):
++        probability = calibrator.predict(score)
++        index = min(int(probability * n_bins), n_bins - 1)
++        counts[index] += 1
++        predicted_sums[index] += probability
++        positive_sums[index] += label
++
++    bins: list[dict] = []
++    for index in range(n_bins):
++        low = index / n_bins
++        high = (index + 1) / n_bins
++        count = counts[index]
++        bins.append(
++            {
++                "bin_low": round(low, 6),
++                "bin_high": round(high, 6),
++                "count": count,
++                "mean_predicted": (
++                    predicted_sums[index] / count if count else None
++                ),
++                "observed_rate": (
++                    positive_sums[index] / count if count else None
++                ),
++            }
++        )
++    return bins
++
++
++def _calibration_report(
++    train_scores: list[float],
++    train_labels: list[int],
++    test_scores: list[float],
++    test_labels: list[int],
++) -> dict:
++    """Fit on train and report Brier/reliability on test.
++
++    Calibration is unavailable unless there are enough train observations,
++    both label classes, and at least one test observation. Unavailable reports
++    never contain fabricated Brier scores or bins.
++    """
++    report = {
++        "available": False,
++        "reason": None,
++        "label": "rating>=4",
++        "train_samples": len(train_scores),
++        "test_samples": len(test_scores),
++        "train_positive_rate": _positive_rate(train_labels),
++        "test_positive_rate": _positive_rate(test_labels),
++        "brier": None,
++        "raw_brier": None,
++        "a": None,
++        "b": None,
++        "reliability_bins": [],
++    }
++    if len(train_scores) < MIN_SAMPLES:
++        report["reason"] = (
++            f"fewer than {MIN_SAMPLES} train (score, label) pairs"
++        )
++        return report
++    if len(set(train_labels)) < 2:
++        report["reason"] = "train labels contain a single class"
++        return report
++    if not test_scores:
++        report["reason"] = "no test (score, label) pairs"
++        return report
++
++    calibrator = PlattCalibrator().fit(train_scores, train_labels)
++    report.update(
++        {
++            "available": True,
++            "brier": calibrator.brier(test_scores, test_labels),
++            "raw_brier": _raw_brier(test_scores, test_labels),
++            "a": calibrator.a,
++            "b": calibrator.b,
++            "reliability_bins": _reliability_bins(
++                calibrator, test_scores, test_labels
++            ),
++        }
++    )
++    return report
+ 
+ 
+ def _paired_delta_values(
+     baseline_rows: list[Row],
+     candidate_rows: list[Row],
+ ) -> dict[str, list[float]]:
+     baseline = {row[0].assignment_id: row for row in baseline_rows}
+     candidate = {row[0].assignment_id: row for row in candidate_rows}
+     keys = sorted(baseline.keys() & candidate.keys())
+     return {
+@@ -558,52 +724,78 @@
+         name: {metric: [] for metric in _METRICS}
+         for name in _DIRECTIONS
+     }
+     cold_delta_values: dict[str, dict[str, list[float]]] = {
+         name: {metric: [] for metric in _METRICS}
+         for name in _DIRECTIONS
+     }
+     violations = 0
+     latencies: list[float] = []
+     saw_cold_workers = False
++    cold_query_count = 0
++    calibration_train_scores: list[float] = []
++    calibration_train_labels: list[int] = []
++    calibration_test_scores: list[float] = []
++    calibration_test_labels: list[int] = []
+ 
+     for data in datasets:
+         store = build_eval_store(data)
+         test_assignments = data.test
+         test_impressions = data.test_impressions
+         baseline_service = RecommendationService(
+             store, weights=DEFAULT_WEIGHTS
+         )
+         candidate_service = RecommendationService(store, weights=weights)
+ 
+         baseline_rows = _evaluation_rows(
+             store, baseline_service, test_assignments, k, test_impressions
+         )
+         candidate_rows = _evaluation_rows(
+             store, candidate_service, test_assignments, k, test_impressions
+         )
++
++        calibration_cache: dict[tuple[str, str], float] = {}
++        train_scores, train_labels = _calibration_pairs(
++            candidate_service,
++            data.train,
++            data.train_feedback,
++            weights,
++            calibration_cache,
++        )
++        test_scores, test_labels = _calibration_pairs(
++            candidate_service,
++            test_assignments,
++            data.test_feedback,
++            weights,
++            calibration_cache,
++        )
++        calibration_train_scores.extend(train_scores)
++        calibration_train_labels.extend(train_labels)
++        calibration_test_scores.extend(test_scores)
++        calibration_test_labels.extend(test_labels)
+ 
+         train_workers = {
+             assignment.worker_id for assignment in data.train
+         }
+         cold_worker_ids = {
+             worker_id
+             for worker_id in store.workers
+             if worker_id not in train_workers
+         }
+         if cold_worker_ids:
+             saw_cold_workers = True
+         cold_ids = {
+             assignment.assignment_id
+             for assignment in test_assignments
+             if assignment.worker_id in cold_worker_ids
+         }
++        cold_query_count += len(cold_ids)
+ 
+         for name in _DIRECTIONS:
+             pooled_baseline[name].extend(baseline_rows[name])
+             pooled_candidate[name].extend(candidate_rows[name])
+ 
+             cold_baseline = [
+                 row
+                 for row in baseline_rows[name]
+                 if row[0].assignment_id in cold_ids
+             ]
+@@ -659,20 +851,22 @@
+     elif not pooled_cold_baseline["task_to_workers"]:
+         cold_reason = (
+             "cold workers exist but have no test assignments"
+         )
+     else:
+         cold_reason = None
+ 
+     cold_start = {
+         "available": saw_cold_workers,
+         "reason": cold_reason,
++        "queries": cold_query_count,
++        "measured": bool(saw_cold_workers and cold_query_count > 0),
+         "baseline": {
+             name: _aggregate_rows(pooled_cold_baseline[name])
+             for name in _DIRECTIONS
+         },
+         "candidate": {
+             name: _aggregate_rows(pooled_cold_candidate[name])
+             for name in _DIRECTIONS
+         },
+         "deltas": {
+             name: {
+@@ -688,22 +882,28 @@
+     }
+ 
+     ordered_latencies = sorted(latencies)
+     return {
+         "seeds": list(seed_list),
+         "k": k,
+         "baselines": baselines,
+         "candidate": candidate,
+         "deltas": deltas,
+         "cold_start": cold_start,
+-        "baseline_equals_candidate": (
+-            dict(DEFAULT_WEIGHTS) == dict(weights)
++        "calibration": _calibration_report(
++            calibration_train_scores,
++            calibration_train_labels,
++            calibration_test_scores,
++            calibration_test_labels,
++        ),
++        "baseline_equals_candidate": weights_equivalent(
++            DEFAULT_WEIGHTS, weights
+         ),
+         "constraint_violations": violations,
+         "latency_p50_ms": (
+             round(_percentile(ordered_latencies, 0.5), 4)
+             if ordered_latencies
+             else 0.0
+         ),
+         "latency_p95_ms": (
+             round(_percentile(ordered_latencies, 0.95), 4)
+             if ordered_latencies
+
+--- a/docs\recommendation-flow.md
++++ b/docs\recommendation-flow.md
+@@ -1,13 +1,13 @@
+ # 任务推荐机制：完整流程
+ 
+-> 版本：2026-11-13  
++> 版本：2026-11-14  
+ > 代码目录：`generated/task-recommender/`  
+ > 范围：主推荐链路、验收学习链路、1000 任务对答案基准
+ 
+ ---
+ 
+ ## 1. 总览
+ 
+ 系统里目前有三条相关但不同的链路：
+ 
+ | 链路 | 入口 | 是否有标准答案 | 作用 |
+@@ -36,31 +36,26 @@
+     H --> I[返回 Top-N]
+     I --> J[采纳 POST /assignments]
+     J --> K[反馈 POST /feedback]
+     K --> L[个人权重 / 偏好画像 / 学习快照]
+     K --> M[批量重估 POST /weights/recompute]
+ ```
+ 
+ 纯文本版：
+ 
+ ```text
+-请求
+-  → 硬约束过滤
+-  → 候选池 + ItemCF
+-  → 七维特征
+-  → 全局/个人权重
+-  → 加权融合
+-  → 排序 + 解释
+-  → epsilon-greedy 探索
+-  → Top-N
+-  → 采纳 → 反馈 → 学习 / 版本
+-```
++请求 → 硬约束 → 候选 + ItemCF → 语义/七维特征 → 权重 → 精确 ε-greedy
++→ Top-N + request_id → impression → click/apply/accept/reject/ignore
++→ pairwise/listwise 选择学习 → 权重版本 / 校准 / 回滚
++```
++
++事件与选择学习不改变排序器本身：排序仍是七维线性融合，选择学习只估计这七个权重。`strict` 评估在独立的 train-only Store 上重放 test 查询，不读取训练期不可见的数据。
+ 
+ ### 2.2 输入
+ 
+ **任务 → 人**
+ 
+ ```json
+ {
+   "task_id": "t0001",
+   "top_n": 5,
+   "user_id": "c0001"
+@@ -226,31 +221,99 @@
+ 
+ ### 2.9 探索重排
+ 
+ Top-N 前做 epsilon-greedy：
+ 
+ ```text
+ epsilon = 0.10
+ ```
+ 
+ - 90% 保留原 Top-N；
+-- 10% 从剩余候选随机替换最后一名；
+-- exploited 候选 `propensity = 0.9`；
+-- explored 候选 `propensity = 1 / 候选数`。
++- 10% 从第 K 名及其后的 tail 中均匀采样，若采到 tail 则替换最后一名；
++- 记录的是**包含概率**（inclusion probability），不是“是否被探索”的标记。
++
++设候选池大小为 `N`、返回 `K = min(k, N)`、探索率 `ε`、探索池大小 `N-K+1`：
++
++```text
++top-(K-1) 候选：p = 1.0
++第 K 名候选：    p = (1 - ε) + ε / (N - K + 1)
++第 K 名之后：    p = ε / (N - K + 1)
++N <= K：         p = 1.0（全部返回）
++```
+ 
+ propensity 会随采纳记录写入分配，供 IPS/SNIPS 评估。
+ 
+ 代码：`app/learning/exploration.py`。
+ 
+ ### 2.10 返回 Top-N
+ 
+-最终返回 `top_n` 个候选。前端展示分数拆解、推荐理由和冷启动标记。
++最终返回 `top_n` 个候选与 `request_id`。前端展示分数拆解、推荐理由和冷启动标记。
++
++### 2.11 曝光、事件与 propensity
++
++每次推荐返回 `request_id`，服务端写入一条 `Impression`：
++
++```text
++request_id
++query_id（task_id 或 worker_id）
++candidate_ids
++propensities（每个候选的 logging propensity）
++policy（如 epsilon_greedy）
++metadata（candidate_type、task_id、assignment_id 等）
++```
++
++客户端随后调用 `POST /events` 上报以下动作：
++
++```text
++click / apply / accept / reject / ignore
++```
++
++每个动作写成一条 `RecommendationEvent`，包含 `request_id`、`candidate_id`、`rank`、`score`、`propensity`、`weights_version` 与 `action`。`GET /events/metrics` 聚合曝光数、候选数、点击率、申请率、接受率、拒绝率与忽略率。
++
++`propensity` 是精确的 logging **包含概率**，而不是事后估计：
++
++```text
++设 N = 候选池大小，K = min(k, N)，ε = 探索率，探索池大小 = N - K + 1
++top-(K-1) 候选：p = 1.0
++第 K 名候选：    p = (1 - ε) + ε / (N - K + 1)
++第 K 名之后：    p = ε / (N - K + 1)
++N <= K：         p = 1.0
++```
++
++事件、采纳记录与 IPS/SNIPS 评估复用同一个 propensity，保证日志策略可回放。
++
++### 2.12 严格评估（strict evaluation）
++
++`scripts/evaluate_strict.py` 使用独立的严格评估协议：
++
++```text
++train 数据 → 构造 train-only Store 与全部特征（含 ItemCF）
++test 查询 → 只用于评分（排序与 HR/NDCG/MRR）与构造 exposed 候选集
++test 反馈 → 只用于校准评估标签（rating>=4），不参与特征或训练
++baseline 权重 vs candidate 权重 → 同一次生成的数据上成对比较
++```
++
++- 指标：双向 `HR@k`、`NDCG@k`、`MRR@k`；每个 test 查询成一个成对样本。
++- 置信区间：对逐查询 delta 做配对 bootstrap（默认 1000 次）。
++- 护栏：约束违规数、延迟 p50/p95。
++- 冷启动：JSON 包含 `cold_start.available`、`cold_start.reason`、`cold_start.queries`、`cold_start.measured`；只有 `available=true` 且 `queries>0` 时 `measured` 才为 true，否则报告 N/A。
++- 校准：在 train 分数/标签上拟合 `PlattCalibrator`，在 test 上报告 `P(rating>=4)` 的 Brier 分数与可靠性分箱；校准不参与排序。
++- 身份检查：`baseline_equals_candidate=true`（有效权重在浮点容差内相同）时不得宣称提升。
++
++```bash
++python scripts/evaluate_strict.py --seeds 42,43,44,45,46 --k 10 \
++  --candidate-weights data/weights/weights_v0007.json
++```
++
++不传 `--candidate-weights` 会使用 active/default 权重，可能产生 identity 报告并覆盖已发布结果；发布严格评估时必须显式传入真实学习权重。
++
++报告写入 `reports/strict_eval.json` 与 `reports/strict_eval.md`。
+ 
+ ---
+ 
+ ## 3. 采纳、反馈与学习链路
+ 
+ ### 3.1 采纳
+ 
+ `POST /assignments`
+ 
+ 记录：
+@@ -372,41 +435,45 @@
+ ### 4.3 特征
+ 
+ - 字符 2–4 gram TF-IDF 相似度；
+ - 任务技能与简历技能重叠；
+ - 信誉；
+ - 负载；
+ - 区域/远程匹配；
+ - worker 类别偏好；
+ - 客户类别偏好。
+ 
++> **已知缺口**：`app/benchmark/recommender.py` 目前没有向 `BenchmarkFeatureBuilder` 传入 ItemCF，因此基准链路的 `collaborative` 特征恒为 `0.0`。该维度的权重会被学习但不会影响排序；Task 21 接入 ItemCF 后才会改变。主推荐链路的 ItemCF 正常。
++
+ ### 4.4 学习
+ 
+ - listwise softmax，候选集为当前 Top-20；
+ - 学习率 `0.05`；
+ - 只用 800 条训练任务；
+ - 每轮更新一次权重。
+ 
+ ### 4.5 10 轮结果
+ 
+ | 轮次 | Top-1 | Top-5 | 测试 Top-1 |
+ |---|---|---|---|
+-| R1 | 0.563 | 0.913 | 0.560 |
+-| R2 | 0.612 | 0.959 | 0.625 |
+-| R3 | 0.619 | 0.972 | 0.635 |
+-| R4 | 0.668 | 0.979 | 0.670 |
+-| R5 | 0.674 | 0.985 | 0.670 |
+-| R6 | 0.690 | 0.988 | 0.695 |
+-| R7 | 0.708 | 0.988 | 0.735 |
+-| R8 | 0.722 | 0.989 | 0.750 |
+-| R9 | 0.726 | 0.995 | 0.765 |
+-| R10 | 0.731 | 1.000 | 0.750 |
++| R1 | 0.367 | 0.872 | 0.365 |
++| R2 | 0.401 | 0.907 | 0.385 |
++| R3 | 0.446 | 0.934 | 0.450 |
++| R4 | 0.530 | 0.948 | 0.540 |
++| R5 | 0.530 | 0.953 | 0.545 |
++| R6 | 0.532 | 0.954 | 0.535 |
++| R7 | 0.540 | 0.952 | 0.545 |
++| R8 | 0.545 | 0.951 | 0.555 |
++| R9 | 0.546 | 0.950 | 0.555 |
++| R10 | 0.568 | 0.946 | 0.580 |
++
++> 这是 2026-11-14 的重新基线（Task 3 特征 + Task 14 基准改动后）。R1 的 `0.367` 是 fresh baseline，R10 的 `0.568` 不低于它；但 R10 绝对值 `0.568` **低于历史 R10 的 `0.731`（-0.163）**。历史数字来自旧数据/旧特征，不能直接比较，也不能据此宣称已恢复历史水平。基准 `collaborative` 仍为 0，见 §4.3 的已知缺口。
+ 
+ 可视化：
+ 
+ - `reports/benchmark_curve.png/svg`
+ - `reports/benchmark_curve_dark.png/svg`
+ - `reports/benchmark_visual.md`
+ 
+ 脚本：
+ 
+ ```bash
+@@ -431,30 +498,36 @@
+ ---
+ 
+ ## 6. 当前边界
+ 
+ 1. **自然语言尚未自动进入主推荐**：`/classify` 能识别类别和字段，但还需要显式创建 `Task`。
+ 2. **简历视图是展示层**：`/workers/{id}/resume` 不改变主推荐特征；基准链路才直接使用简历文本。
+ 3. **验收只支持 `consulting_research`**：其他类别返回 422。
+ 4. **学习是事件驱动的**：反馈、验收、批量重估会更新权重；没有实时点击流学习。
+ 5. **对答案基准和线上推荐是两套评估**：基准有标准答案，线上只有反馈和验收结果。
+ 6. **基准使用固定 1,000 条任务**：衡量权重恢复，不是完全未见过任务的泛化；可继续扩展 rolling test。
++7. **基准 `collaborative` 仍为 0**：`BenchmarkRecommender` 尚未接入 ItemCF，Task 21 处理；因此基准的协同维度当前不可解释，不能据此判断 ItemCF 效果。
++8. **校准不改变排序**：`P(rating>=4)` 只用于报告可解释性；排序仍由七维线性分数决定。
+ 
+ ---
+ 
+ ## 7. 关键代码索引
+ 
+ | 模块 | 文件 |
+ |---|---|
+ | 推荐编排 / 硬约束 / 排序 | `app/service.py` |
+ | 七维特征 / 融合 | `app/features.py` |
+ | 信誉 / 违约 | `app/reputation.py` |
+ | 探索与 propensity | `app/learning/exploration.py` |
+ | 在线学习 / 批量重估 | `app/learning/online.py` |
+ | 三级个性化 | `app/personalization/` |
+ | 反馈与信誉聚合 | `app/feedback.py` |
+ | 权重版本 / 回滚 | `app/versioning.py` |
++| 事件与漏斗指标 | `app/events.py`、`app/main.py`（`/events`） |
++| 选择学习（pairwise/listwise） | `app/learning/choice.py`、`app/learning/online.py` |
++| 校准报告 | `app/learning/calibration.py`、`app/evaluation_strict.py` |
++| 严格评估 | `app/evaluation_strict.py`、`scripts/evaluate_strict.py` |
+ | 自然语言分类 | `app/nlp/` |
+ | 验收闭环 | `app/acceptance/` |
+ | 对答案基准 | `app/benchmark/` |
+ | API 路由 | `app/main.py` |
+ | 前端 | `frontend/` |
+
+--- a/README.md
++++ b/README.md
+@@ -28,20 +28,37 @@
+ - Phase 2 评估脚本：`scripts/evaluate_phase2.py`；评委演示：`scripts/demo_judges.py`。
+ 
+ ## Phase 3 新增能力（无 LLM）
+ 
+ - **多模板组合**：`mode="compose"` 合并多个领域模板，共享需求/交付节点，去重并校验 DAG。
+ - **Beam Search / MILP 规划**：`plan_chain_beam`、`plan_chain_milp`；MILP 限制 ≤20 节点，失败时回退 Beam。
+ - **计划版本与回滚**：`GET /chains/{id}/plans`、`POST /chains/{id}/plan/rollback`。
+ - **自动重规划**：`POST /chains/{id}/replan` 锁定已完成节点，只重算受影响部分，并生成新计划版本。
+ - **Phase 2 清理**：重复分配 409、上下文校验 422、权重版本校验/原子写、投影幂等与信誉最大、分领域评分写入、ItemCF 反馈过滤、ground-truth 脚本。
+ - **明确不做 LLM**：没有 LLM 客户端、提示词或 token 依赖。
++
++## 推荐机制改进（事件、选择学习、严格评估）
++
++- **事件采集**：`POST /events` 记录 `click` / `apply` / `accept` / `reject` / `ignore`，事件写入 `RecommendationEvent`；`GET /events/metrics` 返回曝光、点击、申请、接受、拒绝、忽略与漏斗转化率。推荐接口返回 `request_id`，事件必须能回溯到对应 `Impression`，重复事件返回 409。
++- **精确 propensity**：`Impression` 保存每个候选的 logging **包含概率**（inclusion probability），不是“是否被探索”的标记。设候选池大小为 `N`、返回 `K = min(k, N)`、探索率为 `ε`、探索池大小为 `N-K+1`：top-(K-1) 的 `p=1.0`；第 K 名 `p=(1-ε)+ε/(N-K+1)`；第 K 名之后（tail）`p=ε/(N-K+1)`。当 `N<=K` 时全部为 `1.0`。事件和采纳记录都带上该 propensity，供 IPS/SNIPS 评估。
++- **选择学习**：pairwise / listwise 选择学习只估计七维线性权重，不训练新的排序模型；排序器仍然是七维线性加权融合（`score = Σ weight_i × feature_i`），没有黑盒模型。
++- **严格评估**：`scripts/evaluate_strict.py` 用 train-only Store 构造特征；test 数据只用于评分（给 test 查询排序、计算 HR/NDCG/MRR）和校准评估标签（`rating>=4`），不参与特征构造或权重学习。报告 `HR@k`、`NDCG@k`、`MRR@k`、配对 bootstrap 95% CI、约束违规数、冷启动可用性、延迟，以及校准后的 `P(rating>=4)` 的 Brier 分数与可靠性分箱。
++- **离线泄漏隔离**：`candidate_mode="exposed"` 只使用 test impressions 定义候选集；test impressions 不写入 Store，也不进入特征/训练代码。train-only Store 负责所有特征与 ItemCF 输入。
++
++```bash
++python scripts/evaluate_strict.py --seeds 42,43,44,45,46 --k 10 \
++  --candidate-weights data/weights/weights_v0007.json
++```
++
++必须传真实学习权重；不传 `--candidate-weights` 时脚本会退回 baseline/active 权重，可能得到 identity 报告（`baseline_equals_candidate: true`），并覆盖已发布的报告。结果写入 `reports/strict_eval.json` 与 `reports/strict_eval.md`。JSON 中冷启动字段为 `cold_start.available`、`cold_start.reason`、`cold_start.queries`、`cold_start.measured`；只有 `available` 为 true 且 `queries > 0` 时 `measured` 才为 true，否则报告中标记 N/A，不冒充通过的护栏。若有效权重与基线相同（含浮点容差），报告显示 `baseline_equals_candidate: true`，不宣称提升。
++
++> 基准说明：`app/benchmark/recommender.py` 目前没有传入 ItemCF，因此 1000 任务基准中的 `collaborative` 维度仍恒为 0，直到 Task 21 接入 ItemCF。主推荐链路的 ItemCF 不受影响。
+ 
+ ## 验收闭环（B2B 调研 P0）
+ 
+ 第一版只支持 `consulting_research` 任务，把“什么算完成”写成 10 条可执行标准：
+ 
+ | 标准 | 层 | 硬门槛 | 权重 |
+ |---|---|---|---|
+ | 市场规模 / 客户细分 / 竞争格局 / 进入建议章节 | 机器 | 是 | 各 0.08 |
+ | 至少 8 个来源，含 URL 与日期 | 机器 | 是 | 0.15 |
+ | 数据表含市场/规模/CAGR/来源 | 机器 | 是 | 0.10 |
+@@ -63,27 +80,29 @@
+ ## 1000 任务对答案学习基准（SQLite）
+ 
+ `data/benchmark/task_benchmark.sqlite` 是一个严格的轮次基准：
+ 
+ - **1,000 条自然语言任务**：标题、正文、要求、预算、截止日期；800 条训练、200 条测试。
+ - **100 份自然语言简历**：姓名、职位、经历、项目、技能标签。
+ - **标签独立存放**：`labels` 表保存 `task_id → gold_worker_id`；`tasks` 表没有 gold 字段。推荐器只读 `workers` / `tasks` / `customers`，评分和学习阶段才读 `labels`。
+ - **每轮协议**：清空上一轮推荐缓存 → 重新推荐 → 对答案算 Top-1/Top-5/MRR/NDCG → 只用训练集做 listwise 学习 → 下一轮。
+ - **遗忘答案**：只清推荐缓存，不清学到的权重；因此下一轮必须靠泛化，不能靠记住上一轮答案。
+ 
+-10 轮结果（`reports/benchmark_rounds.md`）：
++10 轮结果（`reports/benchmark_rounds.md`，2026-11-14 重新基线）：
+ 
+ | 轮次 | Top-1 | Top-5 | 测试 Top-1 |
+ |---|---|---|---|
+-| 1 | 0.563 | 0.913 | 0.560 |
+-| 5 | 0.674 | 0.985 | 0.670 |
+-| 10 | 0.731 | 1.000 | 0.750 |
++| 1 | 0.367 | 0.872 | 0.365 |
++| 5 | 0.530 | 0.953 | 0.545 |
++| 10 | 0.568 | 0.946 | 0.580 |
++
++> 这是 Task 3 新特征与 Task 14 基准特征改动后的新基线。第 1 轮 Top-1 `0.367` 是 fresh baseline，第 10 轮 `0.568` 不低于它；但第 10 轮绝对值 `0.568` **低于历史 R10 的 `0.731`（-0.163）**，历史数字来自旧数据/旧特征，不能与本次直接比较，也不应宣称已恢复到历史水平。`collaborative` 维度在基准中仍恒为 0（`BenchmarkRecommender` 尚未接入 ItemCF），Task 21 会修复；因此本轮权重变化中的 `collaborative` 不代表协同特征有效。
+ 
+ 脚本：
+ 
+ ```bash
+ python scripts/build_benchmark.py
+ python scripts/run_benchmark_rounds.py --rounds 10
+ python scripts/plot_benchmark.py
+ ```
+ 
+ 可视化产物：`reports/benchmark_curve.png/svg`（浅色）、`benchmark_curve_dark.png/svg`（深色）、`reports/benchmark_visual.md`。
+@@ -151,21 +170,21 @@
+ curl http://127.0.0.1:8000/health
+ ```
+ 
+ ## 测试
+ 
+ ```bash
+ cd generated/task-recommender
+ python -m pytest tests/ -q
+ ```
+ 
+-当前 150 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、前端静态托管、API 冒烟。
++当前 244 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、事件/曝光/漏斗、选择学习与权重绑定、严格评估与校准、文档约定、前端静态托管、API 冒烟。
+ 
+ ## 离线评估
+ 
+ ```bash
+ cd generated/task-recommender
+ python scripts/evaluate.py
+ ```
+ 
+ 结果写入 `reports/phase1_metrics.json`。本次运行（seed=42）：
+ 
+@@ -250,20 +269,22 @@
+ | 方法 | 路径 | 说明 |
+ |---|---|---|
+ | GET | `/health` | 健康检查 |
+ | GET | `/workers` | worker 列表 |
+ | GET | `/workers/{id}` | worker 详情 |
+ | GET | `/resumes` | 简历列表（仅表面信息） |
+ | GET | `/workers/{id}/resume` | 简历 + 平台原始数据 |
+ | GET | `/tasks` | 任务列表 |
+ | GET | `/tasks/{id}` | 任务详情 |
+ | POST | `/classify` | 自然语言任务分类 + 字段抽取（无 LLM） |
++| POST | `/events` | 记录曝光后的 click/apply/accept/reject/ignore 事件 |
++| GET | `/events/metrics` | 事件漏斗指标（曝光、点击、接受、拒绝、忽略） |
+ | GET | `/acceptance/demo` | B2B 调研验收演示任务 + 标准 + 示例交付物 |
+ | POST | `/acceptance/demo/learning?rounds=5` | 连续验收并返回权重漂移 + Top-5 排序变化 |
+ | GET | `/acceptance/metrics` | 平台验收指标 |
+ | GET | `/benchmark/summary` | 1000 任务基准的元数据与逐轮结果 |
+ | POST | `/benchmark/run?rounds=5` | 跑对答案学习轮次 |
+ | GET | `/tasks/{id}/acceptance-spec` | 任务验收标准 |
+ | POST | `/tasks/{id}/submissions` | 提交交付物并跑机器校验 |
+ | POST | `/submissions/{id}/review` | 同行/客户评分 |
+ | POST | `/submissions/{id}/decision` | 接受 / 返工 / 驳回 / 争议 |
+ | GET | `/tasks/{id}/acceptance-records` | 验收记录 |
+
+--- a/scripts\evaluate_strict.py
++++ b/scripts\evaluate_strict.py
+@@ -6,20 +6,21 @@
+ import json
+ import sys
+ from pathlib import Path
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+ sys.path.insert(0, str(ROOT))
+ 
+ from app.config import DEFAULT_WEIGHTS  # noqa: E402
+ from app.data.synthetic import generate_dataset  # noqa: E402
+ from app.evaluation_strict import evaluate_strict  # noqa: E402
++from app.learning.weights import KEYS as WEIGHT_KEYS  # noqa: E402
+ 
+ _DIRECTIONS = (
+     "task_to_workers",
+     "task_to_workers_exposed",
+     "worker_to_tasks",
+     "worker_to_tasks_exposed",
+ )
+ _METRICS = ("hr", "ndcg", "mrr")
+ 
+ 
+@@ -53,20 +54,33 @@
+     for key, value in payload.items():
+         if isinstance(value, bool) or not isinstance(
+             value, (int, float)
+         ):
+             raise ValueError(
+                 f"candidate weight {key!r} is not numeric"
+             )
+         weights[str(key)] = float(value)
+     if not weights:
+         raise ValueError("candidate weights JSON object is empty")
++    expected = set(WEIGHT_KEYS)
++    missing = sorted(expected - set(weights))
++    extra = sorted(set(weights) - expected)
++    if missing or extra:
++        raise ValueError(
++            "candidate weights must contain exactly the seven canonical "
++            f"keys; missing={missing}, extra={extra}"
++        )
++    negative = sorted(key for key, value in weights.items() if value < 0)
++    if negative:
++        raise ValueError(
++            f"candidate weights must be non-negative; got {negative}"
++        )
+     total = sum(weights.values())
+     if abs(total - 1.0) > 1e-6:
+         raise ValueError(
+             f"candidate weights must sum to 1.0, got {total}"
+         )
+     return weights
+ 
+ 
+ def _load_candidate_weights(
+     root: Path, override_path: str | None = None
+@@ -93,20 +107,159 @@
+         return dict(DEFAULT_WEIGHTS), "default"
+     return weights, "active"
+ 
+ 
+ def _format_delta(result: dict) -> str:
+     return (
+         f"{result['mean']:+.4f} "
+         f"[{result['low']:+.4f}, {result['high']:+.4f}] "
+         f"p={result['p_value']:.4f}"
+     )
++
++
++def _format_rate(value) -> str:
++    return "n/a" if value is None else f"{value:.4f}"
++
++
++def _relative_delta(baseline: float, candidate: float) -> float:
++    if baseline > 0.0:
++        return (candidate - baseline) / baseline
++    return 0.0 if candidate == baseline else float("inf")
++
++
++def _target_lines(result: dict) -> list[str]:
++    """Describe the plan's accuracy/guardrail targets without overclaiming."""
++    equal = bool(result["baseline_equals_candidate"])
++    if equal:
++        return [
++            "## Target check (strict metrics)",
++            "",
++            "- Accuracy target: n/a (candidate weights are identical to "
++            "the baseline)",
++            "- Guardrails: see constraint violations and cold-start status "
++            "above",
++        ]
++
++    primary = ("task_to_workers", "worker_to_tasks")
++    stats: dict[str, dict] = {}
++    for name in primary:
++        baseline = result["baselines"][name]
++        candidate = result["candidate"][name]
++        stats[name] = {
++            "ndcg_rel": _relative_delta(baseline["ndcg"], candidate["ndcg"]),
++            "hr_pp": (candidate["hr"] - baseline["hr"]) * 100.0,
++            "ndcg_ci": result["deltas"][name]["ndcg"],
++            "hr_ci": result["deltas"][name]["hr"],
++        }
++
++    lines = [
++        "## Target check (strict metrics)",
++        "",
++        (
++            "Accuracy target: NDCG@10 relative improvement ≥10% or "
++            "HR@10 ≥5pp in at least one primary direction, and the other "
++            "primary direction does not deteriorate."
++        ),
++        "",
++        "| Direction | NDCG@10 rel | HR@10 pp | NDCG CI | HR CI |",
++        "|---|---|---|---|---|",
++    ]
++    for name in primary:
++        item = stats[name]
++        lines.append(
++            f"| {name} | {item['ndcg_rel'] * 100:+.2f}% | "
++            f"{item['hr_pp']:+.2f} | "
++            f"[{item['ndcg_ci']['low']:+.4f}, "
++            f"{item['ndcg_ci']['high']:+.4f}] | "
++            f"[{item['hr_ci']['low']:+.4f}, "
++            f"{item['hr_ci']['high']:+.4f}] |"
++        )
++
++    qualifying = [
++        name
++        for name in primary
++        if (
++            stats[name]["ndcg_rel"] >= 0.10
++            and stats[name]["ndcg_ci"]["low"] > 0.0
++        )
++        or (
++            stats[name]["hr_pp"] >= 5.0
++            and stats[name]["hr_ci"]["low"] > 0.0
++        )
++    ]
++    met = False
++    if qualifying:
++        others = [name for name in primary if name not in qualifying]
++        if not others:
++            met = True
++        else:
++            other = others[0]
++            met = (
++                result["deltas"][other]["ndcg"]["mean"] >= 0.0
++                and result["deltas"][other]["hr"]["mean"] >= 0.0
++            )
++    lines.extend(
++        [
++            "",
++            f"- status: {'MET' if met else 'NOT MET'}",
++        ]
++    )
++    if not met:
++        lines.append(
++            "- gap: the conjunctive accuracy target is not met; inspect the "
++            "per-direction NDCG relative delta, HR delta, and 95% CIs above. "
++            "A relative NDCG gain on a very low absolute baseline is called "
++            "out separately and is not treated as success by itself."
++        )
++    for name in qualifying:
++        if (
++            stats[name]["ndcg_rel"] >= 0.10
++            and result["candidate"][name]["ndcg"] < 0.05
++        ):
++            lines.append(
++                f"- caveat: {name} NDCG@10 relative gain rests on a very "
++                f"low absolute baseline ({result['baselines'][name]['ndcg']:.4f})"
++            )
++    lines.extend(
++        [
++            (
++                "- Constraint violations: "
++                f"{result['constraint_violations']} "
++                f"({'PASS' if result['constraint_violations'] == 0 else 'FAIL'})"
++            ),
++        ]
++    )
++    cold = result["cold_start"]
++    cold_queries = cold.get("queries")
++    if cold_queries is None:
++        cold_queries = sum(
++            cold["baseline"][name]["queries"] for name in _DIRECTIONS
++        )
++    cold_measured = cold.get("measured")
++    if cold_measured is None:
++        cold_measured = bool(cold["available"]) and cold_queries > 0
++    lines.append(
++        "- Cold start: "
++        + ("MEASURED" if cold_measured else "N/A (not measured)")
++        + f" (queries={cold_queries})"
++    )
++    calibration = result.get("calibration", {})
++    lines.append(
++        "- Calibration: "
++        + ("reported above (ranking unaffected)"
++           if calibration.get("available")
++           else "N/A (see calibration section)")
++    )
++    lines.append(
++        "- Benchmark re-baseline: see reports/benchmark_rounds.md"
++    )
++    return lines
+ 
+ 
+ def _render_markdown(
+     result: dict, weights: dict[str, float], source: str
+ ) -> str:
+     seeds = (
+         ", ".join(str(seed) for seed in result["seeds"])
+         if result["seeds"]
+         else "(provided dataset)"
+     )
+@@ -161,46 +314,119 @@
+                 "n/a (identical weights)"
+                 if equal
+                 else _format_delta(result["deltas"][name][metric])
+             )
+             lines.append(
+                 f"| {name} | {metric} | "
+                 f"{baseline[metric]:.4f} | {candidate[metric]:.4f} | "
+                 f"{delta} |"
+             )
+ 
++    cold_queries = cold.get("queries")
++    if cold_queries is None:
++        cold_queries = sum(
++            cold["baseline"][name]["queries"] for name in _DIRECTIONS
++        )
++    cold_measured = cold.get("measured")
++    if cold_measured is None:
++        cold_measured = bool(cold["available"]) and cold_queries > 0
+     lines.extend(
+         [
+             "",
+             "## Cold start (workers with no train assignments)",
+             "",
+             f"- available: {str(bool(cold['available'])).lower()}",
+             f"- reason: {cold_reason}",
++            f"- queries: {cold_queries}",
++            f"- measured: {str(cold_measured).lower()}",
+             "",
+             "| Direction | Metric | Baseline | Candidate | Delta mean [95% CI] p |",
+             "|---|---|---|---|---|",
+         ]
+     )
+     for name in _DIRECTIONS:
+         baseline = cold["baseline"][name]
+         candidate = cold["candidate"][name]
+         for metric in _METRICS:
+-            delta = (
+-                "n/a (identical weights)"
+-                if equal
+-                else _format_delta(cold["deltas"][name][metric])
+-            )
++            if equal:
++                delta = "n/a (identical weights)"
++            elif not cold_measured:
++                delta = "n/a (cold-start subset not measured)"
++            else:
++                delta = _format_delta(cold["deltas"][name][metric])
+             lines.append(
+                 f"| {name} | {metric} | "
+                 f"{baseline[metric]:.4f} | {candidate[metric]:.4f} | "
+                 f"{delta} |"
+             )
++
++    calibration = result.get("calibration", {})
++    calibration_available = bool(calibration.get("available"))
++    calibration_reason = calibration.get("reason") or "n/a"
++    lines.extend(
++        [
++            "",
++            "## Calibration: P(rating>=4)",
++            "",
++            "> Calibration is reported for interpretability only. It does "
++            "not affect ranking.",
++            "",
++            f"- available: {str(calibration_available).lower()}",
++            f"- reason: {calibration_reason}",
++            f"- label: {calibration.get('label', 'rating>=4')}",
++            (
++                f"- train samples: {calibration.get('train_samples', 0)} "
++                f"(positive rate "
++                f"{_format_rate(calibration.get('train_positive_rate'))})"
++            ),
++            (
++                f"- test samples: {calibration.get('test_samples', 0)} "
++                f"(positive rate "
++                f"{_format_rate(calibration.get('test_positive_rate'))})"
++            ),
++        ]
++    )
++    if calibration_available:
++        lines.extend(
++            [
++                f"- Brier (calibrated): {calibration['brier']:.4f}",
++                f"- Brier (raw score): {calibration['raw_brier']:.4f}",
++                (
++                    "- Platt a/b: "
++                    f"{calibration['a']:.4f} / {calibration['b']:.4f}"
++                ),
++                "",
++                "Reliability bins (test):",
++                "",
++                "| Bin | Count | Mean predicted | Observed rate |",
++                "|---|---|---|---|",
++            ]
++        )
++        for item in calibration["reliability_bins"]:
++            predicted = _format_rate(item["mean_predicted"])
++            observed = _format_rate(item["observed_rate"])
++            lines.append(
++                f"| [{item['bin_low']:.2f}, {item['bin_high']:.2f}) | "
++                f"{item['count']} | {predicted} | {observed} |"
++            )
++    else:
++        lines.extend(
++            [
++                "",
++                (
++                    "Calibration unavailable: no Brier score or reliability "
++                    "bins are reported."
++                ),
++            ]
++        )
++
++    lines.extend(["", *_target_lines(result)])
+     return "\n".join(lines) + "\n"
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+     parser = argparse.ArgumentParser(
+         description=(
+             "Strict leakage-free evaluation of task<->worker ranking."
+         )
+     )
+     parser.add_argument(
+@@ -262,20 +488,28 @@
+                 "candidate_source": source,
+                 "baseline_equals_candidate": result[
+                     "baseline_equals_candidate"
+                 ],
+                 "baselines": result["baselines"],
+                 "candidate": result["candidate"],
+                 "deltas": result["deltas"],
+                 "cold_start": {
+                     "available": result["cold_start"]["available"],
+                     "reason": result["cold_start"]["reason"],
++                    "queries": result["cold_start"]["queries"],
++                    "measured": result["cold_start"]["measured"],
++                },
++                "calibration": {
++                    "available": result["calibration"]["available"],
++                    "reason": result["calibration"]["reason"],
++                    "brier": result["calibration"]["brier"],
++                    "raw_brier": result["calibration"]["raw_brier"],
+                 },
+                 "constraint_violations": result[
+                     "constraint_violations"
+                 ],
+                 "latency_p50_ms": result["latency_p50_ms"],
+                 "latency_p95_ms": result["latency_p95_ms"],
+                 "reports": [
+                     str(out_dir / "strict_eval.json"),
+                     str(out_dir / "strict_eval.md"),
+                 ],
+
+--- a/tests\test_docs.py
++++ b/tests\test_docs.py
+@@ -0,0 +1,30 @@
++from pathlib import Path
++
++
++def test_readme_documents_events_and_strict_eval():
++    text = Path("README.md").read_text(encoding="utf-8")
++    assert "/events" in text
++    assert "evaluate_strict.py" in text
++    assert "strict_eval" in text
++
++
++def test_flow_doc_documents_events_and_propensity():
++    text = Path("docs/recommendation-flow.md").read_text(encoding="utf-8")
++    assert "RecommendationEvent" in text
++    assert "propensity" in text
++    assert "strict" in text.lower()
++
++
++def test_docs_state_exact_propensity_command_and_cold_fields():
++    readme = Path("README.md").read_text(encoding="utf-8")
++    flow = Path("docs/recommendation-flow.md").read_text(encoding="utf-8")
++    for text in (readme, flow):
++        assert "N-K+1" in text or "N - K + 1" in text
++        assert "cold_start.queries" in text
++        assert "cold_start.measured" in text
++    assert (
++        "--candidate-weights data/weights/weights_v0007.json" in readme
++    )
++    assert (
++        "--candidate-weights data/weights/weights_v0007.json" in flow
++    )
+
+--- a/tests\test_strict_eval.py
++++ b/tests\test_strict_eval.py
+@@ -1,10 +1,12 @@
++import json
++
+ from app.evaluation_strict import build_eval_store, task_to_workers_metrics
+ from app.features import candidate_features  # noqa: F401  (import smoke)
+ from app.service import RecommendationService
+ 
+ 
+ def test_build_eval_store_excludes_test_feedback(dataset):
+     store = build_eval_store(dataset)
+     test_ids = {item.feedback_id for item in dataset.test_feedback}
+     store_ids = {item.feedback_id for item in store.feedback}
+     assert test_ids.isdisjoint(store_ids)
+@@ -139,10 +141,306 @@
+     )
+ 
+     assert metrics["queries"] == len(assignments)
+     assert 0.0 <= metrics["hr"] <= 1.0
+     assert 0.0 <= metrics["ndcg"] <= 1.0
+     assert store.impressions == before
+     assert {item.request_id for item in store.impressions} == train_ids
+     assert {item.request_id for item in store.impressions}.isdisjoint(
+         test_ids
+     )
++
++
++from dataclasses import replace
++
++import pytest
++
++from app.config import DEFAULT_WEIGHTS
++from app.evaluation_strict import evaluate_strict
++
++
++def _feedback_with_both_classes(dataset):
++    """The small fixture generates only 4-5 ratings; force a valid mix."""
++    feedback = [
++        replace(item, overall_rating=3 if index % 4 == 0 else 5)
++        for index, item in enumerate(dataset.feedback)
++    ]
++    return replace(dataset, feedback=feedback)
++
++
++def test_evaluate_strict_reports_test_calibration(dataset):
++    result = evaluate_strict(
++        _feedback_with_both_classes(dataset),
++        dict(DEFAULT_WEIGHTS),
++        k=10,
++        seeds=(),
++    )
++    calibration = result["calibration"]
++
++    assert calibration["available"] is True
++    assert calibration["reason"] is None
++    assert calibration["label"] == "rating>=4"
++    assert calibration["train_samples"] >= 10
++    assert calibration["test_samples"] > 0
++    assert 0.0 <= calibration["brier"] <= 1.0
++    assert 0.0 <= calibration["raw_brier"] <= 1.0
++    assert calibration["a"] is not None
++    assert calibration["b"] is not None
++
++    bins = calibration["reliability_bins"]
++    assert len(bins) == 5
++    assert sum(item["count"] for item in bins) == calibration[
++        "test_samples"
++    ]
++    for item in bins:
++        if item["count"] == 0:
++            assert item["mean_predicted"] is None
++            assert item["observed_rate"] is None
++        else:
++            assert 0.0 <= item["mean_predicted"] <= 1.0
++            assert 0.0 <= item["observed_rate"] <= 1.0
++
++
++def test_evaluate_strict_marks_calibration_unavailable_without_feedback(
++    dataset,
++):
++    empty = replace(dataset, feedback=[])
++    result = evaluate_strict(
++        empty, dict(DEFAULT_WEIGHTS), k=10, seeds=()
++    )
++    calibration = result["calibration"]
++
++    assert calibration["available"] is False
++    assert calibration["reason"]
++    assert calibration["train_samples"] == 0
++    assert calibration["test_samples"] == 0
++    assert calibration["brier"] is None
++    assert calibration["raw_brier"] is None
++    assert calibration["a"] is None
++    assert calibration["b"] is None
++    assert calibration["reliability_bins"] == []
++
++
++def test_cli_render_markdown_includes_calibration(dataset):
++    from scripts import evaluate_strict as cli
++
++    result = evaluate_strict(
++        _feedback_with_both_classes(dataset),
++        dict(DEFAULT_WEIGHTS),
++        k=10,
++        seeds=(),
++    )
++    text = cli._render_markdown(result, dict(DEFAULT_WEIGHTS), "override")
++
++    assert "## Calibration: P(rating>=4)" in text
++    assert "Brier (calibrated):" in text
++    assert "Brier (raw score):" in text
++    assert "Reliability bins (test):" in text
++    assert "- available: true" in text
++
++
++def test_cli_rejects_invalid_candidate_weights(tmp_path):
++    from scripts import evaluate_strict as cli
++
++    empty = tmp_path / "empty.json"
++    empty.write_text("{}", encoding="utf-8")
++    with pytest.raises(ValueError):
++        cli._read_weight_payload(empty)
++
++    partial = tmp_path / "partial.json"
++    partial.write_text(
++        '{"reputation": 0.5, "skill": 0.5}', encoding="utf-8"
++    )
++    with pytest.raises(ValueError, match="seven canonical keys"):
++        cli._read_weight_payload(partial)
++
++    extra = dict(DEFAULT_WEIGHTS)
++    extra["mystery"] = 0.1
++    extra["skill"] = extra["skill"] - 0.1
++    extra_path = tmp_path / "extra.json"
++    extra_path.write_text(json.dumps(extra), encoding="utf-8")
++    with pytest.raises(ValueError, match="seven canonical keys"):
++        cli._read_weight_payload(extra_path)
++
++    negative = dict(DEFAULT_WEIGHTS)
++    negative["reputation"] = -0.01
++    negative["skill"] = negative["skill"] + 0.01
++    negative_path = tmp_path / "negative.json"
++    negative_path.write_text(json.dumps(negative), encoding="utf-8")
++    with pytest.raises(ValueError, match="non-negative"):
++        cli._read_weight_payload(negative_path)
++
++    bad_sum = dict(DEFAULT_WEIGHTS)
++    bad_sum["reputation"] = 0.01
++    bad_sum_path = tmp_path / "bad_sum.json"
++    bad_sum_path.write_text(json.dumps(bad_sum), encoding="utf-8")
++    with pytest.raises(ValueError, match="sum to 1.0"):
++        cli._read_weight_payload(bad_sum_path)
++
++    wrapped = tmp_path / "wrapped.json"
++    wrapped.write_text(
++        json.dumps({"version": "v0007", "weights": DEFAULT_WEIGHTS}),
++        encoding="utf-8",
++    )
++    assert cli._read_weight_payload(wrapped) == dict(DEFAULT_WEIGHTS)
++
++
++def test_evaluate_strict_identity_uses_effective_weights(dataset):
++    same = evaluate_strict(
++        dataset, dict(DEFAULT_WEIGHTS), k=10, seeds=()
++    )
++    assert same["baseline_equals_candidate"] is True
++
++    near = dict(DEFAULT_WEIGHTS)
++    near["reputation"] += 5e-10
++    near["skill"] -= 5e-10
++    near_result = evaluate_strict(dataset, near, k=10, seeds=())
++    assert near_result["baseline_equals_candidate"] is True
++
++    different = dict(DEFAULT_WEIGHTS)
++    different["reputation"] += 0.01
++    different["skill"] -= 0.01
++    different_result = evaluate_strict(
++        dataset, different, k=10, seeds=()
++    )
++    assert different_result["baseline_equals_candidate"] is False
++
++
++def test_evaluate_strict_reports_cold_start_machine_fields(dataset):
++    result = evaluate_strict(
++        dataset, dict(DEFAULT_WEIGHTS), k=10, seeds=()
++    )
++    cold = result["cold_start"]
++
++    assert isinstance(cold["queries"], int)
++    assert cold["queries"] >= 0
++    assert cold["measured"] == (
++        bool(cold["available"]) and cold["queries"] > 0
++    )
++
++
++def _target_result(
++    *,
++    equal: bool = False,
++    task_ndcg: tuple[float, float, float, float] = (0.10, 0.10, 0.05, 0.15),
++    task_hr: tuple[float, float, float, float] = (0.50, 0.50, 0.40, 0.60),
++    worker_ndcg: tuple[float, float, float, float] = (0.10, 0.10, 0.05, 0.15),
++    worker_hr: tuple[float, float, float, float] = (0.50, 0.50, 0.40, 0.60),
++    cold_available: bool = False,
++    cold_queries: int = 0,
++) -> dict:
++    """Build the minimal result consumed by the target-check renderer."""
++
++    def delta(values: tuple[float, float, float, float]) -> dict:
++        mean, low, high, p_value = values
++        return {"mean": mean, "low": low, "high": high, "p_value": p_value}
++
++    def metrics(ndcg: float, hr: float) -> dict:
++        return {"ndcg": ndcg, "hr": hr, "mrr": 0.0, "queries": 10}
++
++    return {
++        "baseline_equals_candidate": equal,
++        "baselines": {
++            "task_to_workers": metrics(0.10, 0.50),
++            "worker_to_tasks": metrics(0.10, 0.50),
++        },
++        "candidate": {
++            "task_to_workers": metrics(task_ndcg[1] + 0.10, task_hr[1] + 0.50),
++            "worker_to_tasks": metrics(
++                worker_ndcg[1] + 0.10, worker_hr[1] + 0.50
++            ),
++        },
++        "deltas": {
++            "task_to_workers": {
++                "ndcg": delta(task_ndcg),
++                "hr": delta(task_hr),
++            },
++            "worker_to_tasks": {
++                "ndcg": delta(worker_ndcg),
++                "hr": delta(worker_hr),
++            },
++        },
++        "constraint_violations": 0,
++        "cold_start": {
++            "available": cold_available,
++            "reason": None,
++            "queries": cold_queries,
++            "measured": bool(cold_available and cold_queries > 0),
++        },
++        "calibration": {"available": True},
++    }
++
++
++def test_target_check_reports_met():
++    from scripts.evaluate_strict import _target_lines
++
++    # task_to_workers NDCG: baseline 0.10 -> candidate 0.20 (+100%),
++    # CI low > 0; worker_to_tasks deltas are non-negative.
++    result = _target_result(
++        task_ndcg=(0.10, 0.05, 0.15, 0.01),
++        task_hr=(0.10, 0.05, 0.15, 0.01),
++        worker_ndcg=(0.0, 0.0, 0.0, 1.0),
++        worker_hr=(0.0, 0.0, 0.0, 1.0),
++    )
++    text = "\n".join(_target_lines(result))
++    assert "- status: MET" in text
++
++
++def test_target_check_reports_not_met():
++    from scripts.evaluate_strict import _target_lines
++
++    result = _target_result(
++        task_ndcg=(0.0, -0.001, 0.001, 1.0),
++        task_hr=(0.0, -0.001, 0.001, 1.0),
++        worker_ndcg=(0.0, -0.001, 0.001, 1.0),
++        worker_hr=(0.0, -0.001, 0.001, 1.0),
++    )
++    text = "\n".join(_target_lines(result))
++    assert "- status: NOT MET" in text
++    assert "- gap:" in text
++
++
++def test_target_check_not_met_when_other_direction_deteriorates():
++    from scripts.evaluate_strict import _target_lines
++
++    result = _target_result(
++        task_ndcg=(0.10, 0.05, 0.15, 0.01),
++        task_hr=(0.10, 0.05, 0.15, 0.01),
++        worker_ndcg=(-0.001, -0.002, 0.0, 1.0),
++        worker_hr=(-0.001, -0.002, 0.0, 1.0),
++    )
++    text = "\n".join(_target_lines(result))
++    assert "- status: NOT MET" in text
++
++
++def test_target_check_reports_na_for_identity():
++    from scripts.evaluate_strict import _target_lines
++
++    result = _target_result(equal=True)
++    text = "\n".join(_target_lines(result))
++    assert "n/a (candidate weights are identical" in text
++    assert "- status: MET" not in text
++    assert "- status: NOT MET" not in text
++
++
++def test_cold_start_zero_queries_renders_na(dataset):
++    from scripts import evaluate_strict as cli
++
++    different = dict(DEFAULT_WEIGHTS)
++    different["reputation"] += 0.01
++    different["skill"] -= 0.01
++    result = evaluate_strict(dataset, different, k=10, seeds=())
++    result["cold_start"].update(
++        {
++            "available": False,
++            "reason": "no cold workers",
++            "queries": 0,
++            "measured": False,
++        }
++    )
++    text = cli._render_markdown(result, different, "override")
++
++    assert "- available: false" in text
++    assert "- queries: 0" in text
++    assert "- measured: false" in text
++    assert "n/a (cold-start subset not measured)" in text
++    assert "- Cold start: N/A (not measured) (queries=0)" in text
+

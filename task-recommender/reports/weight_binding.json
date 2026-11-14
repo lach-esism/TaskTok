@@ -1,0 +1,14 @@
+{
+  "reputation_hit_low": 0,
+  "reputation_hit_high": 0,
+  "min_hits": {
+    "reputation": 0,
+    "skill": 0,
+    "expertise": 0,
+    "collaborative": 0,
+    "preference": 0,
+    "load": 0,
+    "customer_preference": 0
+  },
+  "iterations": 1
+}

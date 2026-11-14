@@ -1,0 +1,3851 @@
+# Review package: C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender\.superpowers\sdd\recommendation-improvement\snapshots\task-22 -> C:\Users\1\Desktop\bohack\AI-Research-SKILLs-main\AI-Research-SKILLs-main\generated\task-recommender
+
+## Files changed
+CHANGED app\data\store.py
+CHANGED app\evaluation_strict.py
+CHANGED app\events.py
+CHANGED app\feedback.py
+CHANGED app\main.py
+CHANGED app\schemas.py
+CHANGED app\semantic.py
+CHANGED app\service.py
+ADDED   app\serving.py
+CHANGED app\upload\extract.py
+CHANGED docs\recommendation-flow.md
+CHANGED frontend\app.js
+CHANGED frontend\styles.css
+CHANGED README.md
+ADDED   scripts\activate_weights.py
+CHANGED scripts\evaluate_strict.py
+CHANGED scripts\tune_weights.py
+ADDED   tests\test_activate_weights.py
+CHANGED tests\test_api_events.py
+CHANGED tests\test_docs.py
+CHANGED tests\test_events.py
+CHANGED tests\test_feedback.py
+CHANGED tests\test_semantic.py
+CHANGED tests\test_strict_eval.py
+CHANGED tests\test_tune_weights.py
+CHANGED tests\test_upload.py
+
+## Diff
+
+--- a/app\data\store.py
++++ b/app\data\store.py
+@@ -56,34 +56,78 @@
+         self.feedback = list(feedback)
+         self.templates = dict(templates or {})
+         self.chains = dict(chains or {})
+         self.profiles = dict(profiles or {})
+         self.user_weight_profiles = dict(user_weight_profiles or {})
+         self.learning_snapshots = list(learning_snapshots or [])
+         self.worker_preferences = dict(worker_preferences or {})
+         self.customer_preferences = dict(customer_preferences or {})
+         self.events = list(events or [])
+         self.impressions = list(impressions or [])
++        # Incremental indexes. Records are only appended (or the list is
++        # replaced); both cases are detected here so repeated request-path
++        # calls do not rescan the whole history.
++        self._reference_ids: tuple[int, int, int] | None = None
++        self._reference_seen: list[int] = [0, 0, 0]
++        self._reference_value: datetime | None = None
++        self._recent_key = None
++        self._recent_seen = 0
++        self._recent_counts: dict[str, int] = {}
++        self._assignment_pairs_key = None
++        self._assignment_pairs: set[tuple[str, str]] = set()
++
++    def has_assignment_pair(self, task_id: str, worker_id: str) -> bool:
++        """Whether ``(task_id, worker_id)`` was ever assigned.
++
++        Eligibility checks run once per worker per query; scanning the full
++        assignment list there makes evaluation quadratic. The pair index is
++        rebuilt only when the assignment list length or identity changes.
++        """
++        key = (id(self.assignments), len(self.assignments))
++        if self._assignment_pairs_key != key:
++            self._assignment_pairs = {
++                (assignment.task_id, assignment.worker_id)
++                for assignment in self.assignments
++            }
++            self._assignment_pairs_key = key
++        return (task_id, worker_id) in self._assignment_pairs
+ 
+     @property
+     def reference_time(self) -> datetime:
+-        """Data-relative 'now' so recency checks do not drift with wall clock."""
+-        timestamps = [
+-            _aware(assignment.created_at) for assignment in self.assignments
+-        ]
+-        timestamps.extend(_aware(event.created_at) for event in self.events)
+-        timestamps.extend(
+-            _aware(impression.created_at) for impression in self.impressions
+-        )
+-        if not timestamps:
++        """Data-relative 'now' so recency checks do not drift with wall clock.
++
++        The maximum timestamp is maintained incrementally: only newly appended
++        records are inspected. A replaced or shortened list triggers a full
++        rebuild. This keeps per-request eligibility/exposure checks from
++        scanning the entire assignment/event/impression history.
++        """
++        lists = (self.assignments, self.events, self.impressions)
++        ids = tuple(id(items) for items in lists)
++        if self._reference_ids != ids or any(
++            len(items) < seen
++            for items, seen in zip(lists, self._reference_seen)
++        ):
++            self._reference_ids = ids
++            self._reference_seen = [0, 0, 0]
++            self._reference_value = None
++        for index, items in enumerate(lists):
++            for record in items[self._reference_seen[index]:]:
++                timestamp = _aware(record.created_at)
++                if (
++                    self._reference_value is None
++                    or timestamp > self._reference_value
++                ):
++                    self._reference_value = timestamp
++            self._reference_seen[index] = len(items)
++        if self._reference_value is None:
+             return datetime.now(timezone.utc)
+-        return max(timestamps)
++        return self._reference_value
+ 
+     def events_for(self, request_id: str) -> list[RecommendationEvent]:
+         return sorted(
+             (
+                 event
+                 for event in self.events
+                 if event.request_id == request_id
+             ),
+             key=lambda event: _aware(event.created_at),
+         )
+@@ -96,28 +140,49 @@
+                 if event.user_id == user_id
+             ),
+             key=lambda event: _aware(event.created_at),
+         )
+ 
+     def recent_impression_counts(
+         self,
+         now: datetime,
+         days: int = 30,
+     ) -> dict[str, int]:
++        """Candidate impression counts in the trailing window.
++
++        The window result is cached per ``(list identity, cutoff, end)`` and
++        extended only with newly appended impressions. Serving calls this once
++        per recommendation, so an O(history) rescan would make the request path
++        quadratic as the log grows.
++        """
+         cutoff = _aware(now) - timedelta(days=days)
+         end = _aware(now)
+-        counts: dict[str, int] = {}
+-        for impression in self.impressions:
+-            if cutoff <= _aware(impression.created_at) <= end:
++        key = (id(self.impressions), cutoff, end)
++        if (
++            self._recent_key == key
++            and len(self.impressions) >= self._recent_seen
++        ):
++            new_items = self.impressions[self._recent_seen:]
++        else:
++            self._recent_key = key
++            self._recent_seen = 0
++            self._recent_counts = {}
++            new_items = self.impressions
++        for impression in new_items:
++            created_at = _aware(impression.created_at)
++            if cutoff <= created_at <= end:
+                 for candidate_id in impression.candidate_ids:
+-                    counts[candidate_id] = counts.get(candidate_id, 0) + 1
+-        return counts
++                    self._recent_counts[candidate_id] = (
++                        self._recent_counts.get(candidate_id, 0) + 1
++                    )
++        self._recent_seen = len(self.impressions)
++        return dict(self._recent_counts)
+ 
+     def prior_collaboration_count(
+         self,
+         customer_id: str,
+         worker_id: str,
+         before: datetime | None = None,
+     ) -> int:
+         reference = before if before is not None else self.reference_time
+         cutoff = _aware(reference)
+         return sum(
+
+--- a/app\evaluation_strict.py
++++ b/app\evaluation_strict.py
+@@ -1,33 +1,40 @@
+ """Strict, leakage-free evaluation for task<->worker ranking.
+ 
+ Training-side data is assembled from train-only splits. Test assignments are
+ scored against that store, and test impressions may only define the candidate
+ set in ``candidate_mode="exposed"``. Ground-truth weights and benchmark labels
+ are never read here.
++
++Each evaluated seed also fits the serving ``SemanticMatcher`` and
++``AcceptanceModel`` from the train-only store and injects them into the
++baseline/candidate rankers, so reported deltas describe the same feature vector
++that ``create_app`` serves. The latency fields are in-process scoring times;
++HTTP endpoint latency is explicitly reported as unavailable.
+ """
+ 
+ from __future__ import annotations
+ 
+ import math
+ import random
+ import statistics
+ import time
+ from datetime import datetime, timezone
+ 
+ from app.config import DEFAULT_WEIGHTS
+ from app.data.store import Store
+ from app.data.synthetic import generate_dataset
+ from app.domain import Assignment, Dataset, Feedback, Impression
+ from app.features import fuse_scores
+ from app.learning.calibration import MIN_SAMPLES, PlattCalibrator
+ from app.service import RecommendationService, is_eligible
++from app.serving import build_serving_components
+ 
+ VALID_CANDIDATE_MODES = ("all", "exposed")
+ 
+ # Defaults for the strict report. They mirror the plan's protocol: a paired
+ # bootstrap over all test queries and 100 timed recommendations.
+ BOOTSTRAP_SAMPLES = 1000
+ BOOTSTRAP_SEED = 42
+ LATENCY_SAMPLES = 100
+ CALIBRATION_BINS = 5
+ POSITIVE_RATING = 4
+@@ -725,33 +732,48 @@
+         for name in _DIRECTIONS
+     }
+     cold_delta_values: dict[str, dict[str, list[float]]] = {
+         name: {metric: [] for metric in _METRICS}
+         for name in _DIRECTIONS
+     }
+     violations = 0
+     latencies: list[float] = []
+     saw_cold_workers = False
+     cold_query_count = 0
++    saw_semantic_matcher = False
++    saw_acceptance_model = False
+     calibration_train_scores: list[float] = []
+     calibration_train_labels: list[int] = []
+     calibration_test_scores: list[float] = []
+     calibration_test_labels: list[int] = []
+ 
+     for data in datasets:
+         store = build_eval_store(data)
+         test_assignments = data.test
+         test_impressions = data.test_impressions
++        # Serving parity: fit the same semantic/acceptance components that
++        # ``create_app`` injects, using this train-only store only.
++        semantic_matcher, acceptance_model = build_serving_components(store)
++        saw_semantic_matcher = saw_semantic_matcher or semantic_matcher is not None
++        saw_acceptance_model = saw_acceptance_model or acceptance_model is not None
+         baseline_service = RecommendationService(
+-            store, weights=DEFAULT_WEIGHTS
+-        )
+-        candidate_service = RecommendationService(store, weights=weights)
++            store,
++            weights=DEFAULT_WEIGHTS,
++            semantic_matcher=semantic_matcher,
++            acceptance_model=acceptance_model,
++        )
++        candidate_service = RecommendationService(
++            store,
++            weights=weights,
++            semantic_matcher=semantic_matcher,
++            acceptance_model=acceptance_model,
++        )
+ 
+         baseline_rows = _evaluation_rows(
+             store, baseline_service, test_assignments, k, test_impressions
+         )
+         candidate_rows = _evaluation_rows(
+             store, candidate_service, test_assignments, k, test_impressions
+         )
+ 
+         calibration_cache: dict[tuple[str, str], float] = {}
+         train_scores, train_labels = _calibration_pairs(
+@@ -892,21 +914,47 @@
+         "calibration": _calibration_report(
+             calibration_train_scores,
+             calibration_train_labels,
+             calibration_test_scores,
+             calibration_test_labels,
+         ),
+         "baseline_equals_candidate": weights_equivalent(
+             DEFAULT_WEIGHTS, weights
+         ),
+         "constraint_violations": violations,
++        "serving_features": {
++            "semantic_matcher": saw_semantic_matcher,
++            "acceptance_model": saw_acceptance_model,
++            "parity": "serving",
++        },
++        # In-process scoring time only. The strict evaluator calls the ranking
++        # service directly, so it cannot measure HTTP endpoint latency.
++        "scoring_latency_p50_ms": (
++            round(_percentile(ordered_latencies, 0.5), 4)
++            if ordered_latencies
++            else 0.0
++        ),
++        "scoring_latency_p95_ms": (
++            round(_percentile(ordered_latencies, 0.95), 4)
++            if ordered_latencies
++            else 0.0
++        ),
++        # Backwards-compatible aliases; read ``scoring_latency_*`` in new code.
+         "latency_p50_ms": (
+             round(_percentile(ordered_latencies, 0.5), 4)
+             if ordered_latencies
+             else 0.0
+         ),
+         "latency_p95_ms": (
+             round(_percentile(ordered_latencies, 0.95), 4)
+             if ordered_latencies
+             else 0.0
+         ),
+-    }
++        "endpoint_latency": {
++            "available": False,
++            "reason": (
++                "the strict evaluator calls the in-process ranking service; "
++                "HTTP endpoint latency is not measured"
++            ),
++            "guardrail": "N/A",
++        },
++    }
+
+--- a/app\events.py
++++ b/app\events.py
+@@ -1,71 +1,106 @@
+-"""Impression and event capture with funnel metrics."""
++"""Impression and event capture with funnel metrics.
++
++Persisted ``events.jsonl`` / ``impressions.jsonl`` files (and rotated
++``*.N.jsonl`` archives) are **audit-only**: they are never replayed into the
++in-memory store, because replaying historical accept/ignore rows would change
++training features and double-count the funnel. Rotation line counts are kept
++in memory per active file instead of rescanning the file on every append.
++"""
+ 
+ from __future__ import annotations
+ 
+ import json
+ import uuid
+ from dataclasses import asdict
+ from pathlib import Path
+ 
+ from app.data.store import Store
+ from app.domain import Impression, RecommendationEvent
+ 
+ ACTIONS = {"click", "apply", "accept", "reject", "ignore"}
++#: Client-supplied metadata keys that may be stored on an event. Target labels
++#: (``candidate_type`` / ``task_id``) are only accepted when they agree with
++#: the impression; arbitrary client keys are dropped.
++ALLOWED_METADATA_KEYS = frozenset(
++    {"candidate_type", "task_id", "score", "weights_version"}
++)
+ 
+ 
+ class EventService:
+     """Records recommendation impressions/events and computes funnel rates."""
+ 
+     def __init__(
+         self,
+         store: Store,
+         persist_dir: Path | None = None,
+         max_events: int = 1_000_000,
+     ) -> None:
+         self.store = store
+         self.persist_dir = Path(persist_dir) if persist_dir else None
+         self.max_events = max_events
++        self._impressions_by_request: dict[str, Impression] = {
++            impression.request_id: impression
++            for impression in store.impressions
++        }
++        self._seen_event_keys: set[tuple[str, str, str]] = {
++            (event.request_id, event.candidate_id, event.action)
++            for event in store.events
++        }
++        self._line_counts: dict[str, int] = {}
+         if self.persist_dir is not None:
+             self.persist_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    @staticmethod
+-    def _line_count(path: Path) -> int:
+-        if not path.exists():
+-            return 0
+-        with path.open("r", encoding="utf-8") as handle:
+-            return sum(1 for _ in handle)
++    def _line_count(self, name: str, path: Path) -> int:
++        """Count the active file once; increments are tracked in memory."""
++        if name not in self._line_counts:
++            if path.exists():
++                with path.open("r", encoding="utf-8") as handle:
++                    self._line_counts[name] = sum(1 for _ in handle)
++            else:
++                self._line_counts[name] = 0
++        return self._line_counts[name]
+ 
+     @staticmethod
+     def _rotate(path: Path) -> None:
+         index = 1
+         while True:
+             archived = path.with_name(f"{path.stem}.{index}.jsonl")
+             if not archived.exists():
+                 path.replace(archived)
+                 return
+             index += 1
+ 
+     def _persist(self, name: str, payload: dict) -> None:
+         if self.persist_dir is None:
+             return
+         path = self.persist_dir / f"{name}.jsonl"
+-        if self.max_events > 0 and self._line_count(path) >= self.max_events:
++        if (
++            self.max_events > 0
++            and self._line_count(name, path) >= self.max_events
++        ):
+             self._rotate(path)
++            self._line_counts[name] = 0
+         with path.open("a", encoding="utf-8") as handle:
+             handle.write(json.dumps(payload, ensure_ascii=False, default=str))
+             handle.write("\n")
++        self._line_counts[name] = self._line_counts.get(name, 0) + 1
+ 
+     def _impression_for(self, request_id: str) -> Impression:
+-        for impression in reversed(self.store.impressions):
+-            if impression.request_id == request_id:
+-                return impression
++        impression = self._impressions_by_request.get(request_id)
++        if impression is not None:
++            return impression
++        # Tolerate impressions appended directly to the store after start-up.
++        for candidate in reversed(self.store.impressions):
++            if candidate.request_id == request_id:
++                self._impressions_by_request[request_id] = candidate
++                return candidate
+         raise KeyError(request_id)
+ 
+     def record_impression(
+         self,
+         request_id: str,
+         query_id: str,
+         candidate_ids: list[str],
+         propensities: dict[str, float],
+         policy: str,
+         metadata: dict | None = None,
+@@ -73,77 +108,98 @@
+         impression = Impression(
+             request_id=request_id,
+             query_id=query_id,
+             candidate_ids=list(candidate_ids),
+             propensities=dict(propensities),
+             policy=policy,
+             created_at=self.store.reference_time,
+             metadata=dict(metadata or {}),
+         )
+         self.store.impressions.append(impression)
++        self._impressions_by_request[request_id] = impression
+         self._persist("impressions", asdict(impression))
+         return impression
+ 
+     def record_event(
+         self,
+         request_id: str,
+         candidate_id: str,
+         action: str,
+         user_id: str | None = None,
+         role: str = "customer",
+         metadata: dict | None = None,
+     ) -> RecommendationEvent:
+         if action not in ACTIONS:
+             raise ValueError(f"unknown action: {action}")
+         impression = self._impression_for(request_id)
+         if candidate_id not in impression.candidate_ids:
+             raise KeyError(candidate_id)
+-        if any(
+-            event.request_id == request_id
+-            and event.candidate_id == candidate_id
+-            and event.action == action
+-            for event in self.store.events
+-        ):
++        key = (request_id, candidate_id, action)
++        if key in self._seen_event_keys:
+             raise ValueError(
+                 "duplicate event for "
+                 f"({request_id}, {candidate_id}, {action})"
+             )
+-        context = dict(metadata or {})
+-        candidate_type = (
+-            context.get("candidate_type")
+-            or impression.metadata.get("candidate_type")
+-            or "worker"
+-        )
+-        task_id = context.get("task_id") or impression.metadata.get("task_id")
+-        if not task_id:
+-            task_id = (
+-                candidate_id
+-                if candidate_type == "task"
+-                else impression.query_id
+-            )
++        context = {
++            key: value
++            for key, value in dict(metadata or {}).items()
++            if key in ALLOWED_METADATA_KEYS
++        }
++        impression_type = str(
++            impression.metadata.get("candidate_type") or "worker"
++        )
++        if impression_type not in {"worker", "task"}:
++            raise ValueError(
++                f"unknown impression candidate_type: {impression_type!r}"
++            )
++        impression_task_id = impression.metadata.get("task_id") or (
++            candidate_id
++            if impression_type == "task"
++            else impression.query_id
++        )
++        client_type = context.get("candidate_type")
++        if client_type is not None and client_type != impression_type:
++            raise ValueError(
++                "candidate_type does not match the impression "
++                f"({client_type!r} != {impression_type!r})"
++            )
++        client_task_id = context.get("task_id")
++        if (
++            client_task_id is not None
++            and client_task_id != impression_task_id
++        ):
++            raise ValueError(
++                "task_id does not match the impression "
++                f"({client_task_id!r} != {impression_task_id!r})"
++            )
++        try:
++            score = float(context.get("score", 0.0))
++        except (TypeError, ValueError):
++            score = 0.0
+         event = RecommendationEvent(
+             event_id=uuid.uuid4().hex,
+             request_id=request_id,
+             user_id=user_id,
+             role=role,
+-            task_id=task_id,
++            task_id=impression_task_id,
+             candidate_id=candidate_id,
+-            candidate_type=candidate_type,
++            candidate_type=impression_type,
+             rank=impression.candidate_ids.index(candidate_id) + 1,
+-            score=float(context.get("score", 0.0)),
++            score=score,
+             propensity=impression.propensities[candidate_id],
+             weights_version=str(context.get("weights_version", "v0000")),
+             action=action,
+             created_at=self.store.reference_time,
+             metadata=context,
+         )
+         self.store.events.append(event)
++        self._seen_event_keys.add(key)
+         self._persist("events", asdict(event))
+         return event
+ 
+     def funnel_metrics(self) -> dict:
+         impressions = len(self.store.impressions)
+         candidates = sum(
+             len(impression.candidate_ids)
+             for impression in self.store.impressions
+         )
+         counts = {action: 0 for action in ACTIONS}
+
+--- a/app\feedback.py
++++ b/app\feedback.py
+@@ -91,38 +91,50 @@
+         )
+         if assignment is None:
+             raise KeyError(assignment_id)
+         if any(
+             item.assignment_id == assignment_id
+             for item in self.store.feedback
+         ):
+             raise ValueError("feedback already recorded")
+         if not 1 <= overall_rating <= 5:
+             raise ValueError("overall_rating must be between 1 and 5")
++        if communication_rating is not None and not 1 <= communication_rating <= 5:
++            raise ValueError("communication_rating must be between 1 and 5")
+ 
+         feedback = Feedback(
+             feedback_id=uuid.uuid4().hex,
+             assignment_id=assignment_id,
+             worker_id=assignment.worker_id,
+             task_id=assignment.task_id,
+             overall_rating=overall_rating,
+             created_at=self.store.reference_time,
+             quality_rating=quality_rating,
+             timeliness_rating=timeliness_rating,
+             communication_rating=communication_rating,
+             comment=comment,
+             propensity=assignment.propensity,
+         )
+         self.store.feedback.append(feedback)
+ 
+         worker = self.store.workers[assignment.worker_id]
+         worker.ratings.append(float(overall_rating))
++        # Live communication signal: the synthetic generator seeds this list
++        # from train feedback only, and serving feedback appends here so the
++        # ``customer_preference`` communication attribute reacts immediately.
++        if communication_rating is not None:
++            worker.communication_ratings.append(float(communication_rating))
++        # Resume surface text may include rating-derived fields; drop memoized
++        # worker/task text so semantic features see the updated profile.
++        from app.semantic import clear_text_caches
++
++        clear_text_caches()
+         task = self.store.tasks.get(assignment.task_id)
+         if task is not None:
+             worker.category_ratings.setdefault(task.category, []).append(
+                 float(overall_rating)
+             )
+         if assignment.status != "completed":
+             worker.completed += 1
+             if assignment.on_time:
+                 worker.on_time += 1
+         assignment.status = "completed"
+
+--- a/app\main.py
++++ b/app\main.py
+@@ -30,37 +30,38 @@
+ from app.domain import (
+     Impression,
+     RecommendationEvent,
+     Task,
+     TaskChain,
+     Worker,
+ )
+ from app.evaluation_phase2 import evaluate_two_runs
+ from app.events import EventService
+ from app.feedback import FeedbackService
+-from app.features import candidate_features, pay_fit_score, skill_score
+-from app.learning.acceptance import AcceptanceModel, accept_features
++from app.features import candidate_features
++from app.learning.acceptance import AcceptanceModel
+ from app.learning.choice import (
+     NEGATIVE_ACTIONS,
+     POSITIVE_ACTIONS,
+     ListwiseChoiceLearner,
+     PairwiseChoiceLearner,
+     build_pairs,
+ )
+ from app.learning.exploration import ExplorationPolicy
+ from app.learning.online import OnlineWeightLearner
+ from app.learning.weights import AHP_PRIOR, project_weights_with_report
+-from app.semantic import (
+-    SemanticMatcher,
+-    build_matcher,
+-    build_task_text,
+-    build_worker_text,
++from app.semantic import SemanticMatcher
++from app.serving import (
++    build_acceptance_model as _build_acceptance_model,
++)
++from app.serving import (
++    build_semantic_matcher as _build_semantic_matcher,
+ )
+ from app.nlp.classifier import get_default_classifier
+ from app.personalization.segments import Segmenter
+ from app.resume import build_resume
+ from app.personalization.user_weights import PersonalizationService
+ from app.preference.customer import (
+     CustomerPreferenceProfile,
+     update_customer_preferences,
+ )
+ from app.preference.worker import (
+@@ -70,20 +71,21 @@
+ from app.schemas import (
+     CandidateResponse,
+     ClassifyRequest,
+     CreateAssignmentRequest,
+     DecisionRequest,
+     DecomposeRequest,
+     EventsRequest,
+     EventsResponse,
+     FeedbackRequest,
+     NodeRecommendRequest,
++    MAX_EVENTS_BODY_BYTES,
+     NodeStatusRequest,
+     ReviewRequest,
+     SubmissionRequest,
+     OnboardingRequest,
+     PlanRollbackRequest,
+     RecommendResponse,
+     RecommendTasksRequest,
+     RecommendWorkersRequest,
+     ReplanRequest,
+     ResumeAnalyzeRequest,
+@@ -117,98 +119,20 @@
+         "customer_id": chain.customer_id,
+         "status": chain.status,
+         "deadline": chain.deadline,
+         "budget": chain.budget,
+         "critical_path": chain.critical_path,
+         "nodes": [asdict(node) for node in chain.nodes],
+         "edges": [asdict(edge) for edge in chain.edges],
+     }
+ 
+ 
+-def _region_match(worker: Worker, task: Task) -> float:
+-    if worker.region == task.region:
+-        return 1.0
+-    if worker.remote_ok and task.remote_ok:
+-        return 0.8
+-    return 0.3
+-
+-
+-def _build_semantic_matcher(store: Store) -> SemanticMatcher | None:
+-    """Fit one matcher over the store's worker/task corpus."""
+-    try:
+-        matcher = build_matcher()
+-        matcher.fit(
+-            [
+-                build_worker_text(worker)
+-                for worker in store.workers.values()
+-            ],
+-            [
+-                build_task_text(task)
+-                for task in store.tasks.values()
+-            ],
+-        )
+-    except Exception:  # noqa: BLE001 - a missing matcher degrades to neutral
+-        return None
+-    return matcher if matcher.is_fitted else None
+-
+-
+-def _build_acceptance_model(store: Store) -> AcceptanceModel | None:
+-    """Fit the global ``P(accept)`` model from logged accept/reject events."""
+-    counts: dict[str, tuple[int, int]] = {}
+-    for event in store.events:
+-        if event.candidate_type != "worker":
+-            continue
+-        if event.action not in {"accept", "reject"}:
+-            continue
+-        accepted, rejected = counts.get(event.candidate_id, (0, 0))
+-        if event.action == "accept":
+-            accepted += 1
+-        else:
+-            rejected += 1
+-        counts[event.candidate_id] = (accepted, rejected)
+-
+-    samples: list[tuple[dict[str, float], int]] = []
+-    for event in store.events:
+-        if event.candidate_type != "worker":
+-            continue
+-        if event.action not in {"accept", "reject"}:
+-            continue
+-        worker = store.workers.get(event.candidate_id)
+-        task = store.tasks.get(event.task_id)
+-        if worker is None or task is None:
+-            continue
+-        accepted, rejected = counts.get(worker.worker_id, (0, 0))
+-        historical = (
+-            (accepted + 1) / (accepted + rejected + 2)
+-            if accepted + rejected > 0
+-            else 0.5
+-        )
+-        samples.append(
+-            (
+-                accept_features(
+-                    worker,
+-                    task,
+-                    skill=skill_score(worker, task),
+-                    pay_fit=pay_fit_score(worker, task),
+-                    region_match=_region_match(worker, task),
+-                    historical_accept_rate=historical,
+-                ),
+-                1 if event.action == "accept" else 0,
+-            )
+-        )
+-    try:
+-        model = AcceptanceModel().fit(samples)
+-    except Exception:  # noqa: BLE001 - an unfitted model degrades to prior
+-        return None
+-    return model if model.is_fitted else None
+-
+-
+ #: Choice-learning objective used by ``POST /weights/recompute``. The
+ #: default pairwise learner is exact-event based; ``listwise`` fits one
+ #: softmax step per logged impression instead.
+ CHOICE_LEARNING_MODE = os.environ.get(
+     "CHOICE_LEARNING_MODE", "pairwise"
+ ).strip().lower()
+ CHOICE_ACTIONS = POSITIVE_ACTIONS | NEGATIVE_ACTIONS
+ 
+ 
+ def _find_impression(
+@@ -339,20 +263,21 @@
+ 
+ def _node_candidates(
+     chain: TaskChain,
+     node_id: str,
+     current: Store,
+     top_n: int,
+     exploration: ExplorationPolicy,
+     weights: dict[str, float] | None = None,
+     semantic_matcher: SemanticMatcher | None = None,
+     acceptance_model: AcceptanceModel | None = None,
++    service: RecommendationService | None = None,
+ ) -> RecommendResponse:
+     node = next(
+         (
+             candidate
+             for candidate in chain.nodes
+             if candidate.key == node_id or candidate.subtask_id == node_id
+         ),
+         None,
+     )
+     if node is None:
+@@ -368,26 +293,27 @@
+         required_level=1,
+         difficulty=3,
+         priority=3,
+         estimated_hours=node.estimated_hours,
+         deadline=chain.deadline,
+         region=root_task.region if root_task else "CN",
+         remote_ok=root_task.remote_ok if root_task else True,
+         description="",
+         status="open",
+     )
+-    service = RecommendationService(
+-        current,
+-        weights=weights,
+-        semantic_matcher=semantic_matcher,
+-        acceptance_model=acceptance_model,
+-    )
++    if service is None:
++        service = RecommendationService(
++            current,
++            weights=weights,
++            semantic_matcher=semantic_matcher,
++            acceptance_model=acceptance_model,
++        )
+     pool_size = min(100, max(top_n * 3, top_n + 1))
+     candidates = service.recommend_workers_for_task(
+         temporary_task, top_n=pool_size
+     )
+     candidates = exploration.rerank(candidates, k=top_n)
+     return RecommendResponse(
+         query_id=node.subtask_id,
+         candidates=[
+             CandidateResponse(
+                 candidate_id=candidate.candidate_id,
+@@ -533,20 +459,26 @@
+     benchmark_db: Path | None = None,
+     events_dir: Path | None = None,
+     exploration_seed: int | None = None,
+ ) -> FastAPI:
+     """Create the Phase 2 application."""
+     # Accepted uploads are capped at MAX_UPLOAD_BYTES before form parsing, so
+     # this spool threshold keeps the accepted file parts in RAM.
+     MultiPartParser.spool_max_size = upload_extract.MAX_UPLOAD_BYTES
+     app = FastAPI(title="Task Assignment Recommender", version=APP_VERSION)
+     app.add_middleware(upload_extract.UploadBodyLimitMiddleware)
++    # ``/events`` has its own smaller body cap (no multipart, JSON only).
++    app.add_middleware(
++        upload_extract.UploadBodyLimitMiddleware,
++        paths=frozenset({"/events"}),
++        limit=MAX_EVENTS_BODY_BYTES,
++    )
+     test_assignments = []
+     if store is None:
+         dataset = generate_dataset()
+         store = Store(
+             workers=dataset.workers,
+             customers=dataset.customers,
+             tasks=dataset.tasks,
+             assignments=dataset.train,
+             feedback=dataset.train_feedback,
+             events=dataset.train_events,
+@@ -586,20 +518,54 @@
+         return app.state.store
+ 
+     app.state.events = EventService(
+         require_store(),
+         persist_dir=events_dir
+         or Path(__file__).resolve().parent.parent / "data" / "events",
+     )
+     app.state.exploration = ExplorationPolicy(
+         epsilon=0.10, seed=exploration_seed
+     )
++    app.state.service_cache = None
++
++    def invalidate_service() -> None:
++        """Drop the cached ranker after assignments/feedback/weights change."""
++        app.state.service_cache = None
++
++    def active_service() -> RecommendationService:
++        """Return one cached ``RecommendationService`` for serving requests.
++
++        Rebuilding the service recreates ItemCF and the per-request context
++        indexes. The cache is keyed by the active weight version and by the
++        assignment/feedback lengths, which are the only store inputs that alter
++        ItemCF or eligibility. Impressions and events are read live through the
++        shared store, so ordinary event ingestion does not force a rebuild.
++        """
++        current = require_store()
++        version = app.state.weight_store.active().version
++        signature = (
++            version,
++            id(current),
++            len(current.assignments),
++            len(current.feedback),
++        )
++        cached = app.state.service_cache
++        if cached is not None and cached[0] == signature:
++            return cached[1]
++        service = RecommendationService(
++            current,
++            weights=app.state.weight_store.active().weights,
++            semantic_matcher=app.state.semantic_matcher,
++            acceptance_model=app.state.acceptance_model,
++        )
++        app.state.service_cache = (signature, service)
++        return service
+ 
+     @app.get("/health")
+     def health() -> dict[str, str]:
+         return {"status": "ok", "version": APP_VERSION}
+ 
+     @app.get("/workers")
+     def list_workers() -> list[dict]:
+         current = require_store()
+         return [asdict(worker) for worker in current.workers.values()]
+ 
+@@ -657,20 +623,24 @@
+         # ``calibrated_confidence``, ``confidence_threshold``, ``evidence``
+         # and ``extracted_v2`` already come from the classifier; ``fields_v2``
+         # is a stable alias for Task 22's upload/resume analysis to consume.
+         result["fields_v2"] = result.get("extracted_v2", {})
+         return result
+ 
+     # ------------------------------------------------------------------
+     # Bidirectional upload / paste analysis (drafts only, no store writes)
+     # ------------------------------------------------------------------
+     def _upload_service(current: Store) -> RecommendationService:
++        if current is app.state.store:
++            return active_service()
++        # Upload drafts may use an ephemeral store clone with a temporary
++        # worker; that store is never cached.
+         return RecommendationService(
+             current,
+             weights=app.state.weight_store.active().weights,
+             semantic_matcher=app.state.semantic_matcher,
+             acceptance_model=app.state.acceptance_model,
+         )
+ 
+     def _task_upload_payload(
+         current: Store,
+         text: str,
+@@ -1001,20 +971,21 @@
+     @app.post("/weights/rollback")
+     def rollback_weights(request: RollbackRequest) -> dict:
+         try:
+             version = app.state.weight_store.rollback(
+                 request.to_version, request.reason
+             )
+         except KeyError as error:
+             raise HTTPException(
+                 status_code=404, detail=f"unknown version: {error}"
+             )
++        invalidate_service()
+         return asdict(version)
+ 
+     @app.get("/learning/changelog")
+     def learning_changelog() -> list[dict]:
+         return app.state.weight_store.changelog()
+ 
+     @app.post("/assignments")
+     def create_assignment(request: CreateAssignmentRequest) -> dict:
+         current = require_store()
+         service = FeedbackService(current)
+@@ -1024,67 +995,95 @@
+                 request.worker_id,
+                 request.customer_id,
+                 request.recommendation_context,
+             )
+         except KeyError:
+             raise HTTPException(
+                 status_code=404, detail="task or worker not found"
+             )
+         except ValueError as error:
+             raise HTTPException(status_code=409, detail=str(error))
++        invalidate_service()
+         context = request.recommendation_context
+         if context is not None and context.request_id:
+-            candidate_id = request.worker_id
+             impression = _find_impression(
+                 current.impressions, context.request_id
+             )
+-            if (
+-                impression is not None
+-                and impression.metadata.get("candidate_type") == "task"
+-            ):
+-                candidate_id = request.task_id
+-            try:
+-                app.state.events.record_event(
+-                    context.request_id,
+-                    candidate_id,
+-                    "accept",
+-                    user_id=request.customer_id,
+-                    role="customer",
+-                    metadata={
+-                        "weights_version": app.state.weight_store.active().version
+-                    },
+-                )
+-            except (KeyError, ValueError):
+-                # The assignment still succeeds when the recommendation
+-                # request is unknown, e.g. it predates this process, or the
+-                # accept was already recorded through POST /events.
+-                pass
++            if impression is not None:
++                # Derive the accepted candidate from the impression, and only
++                # record the accept when this assignment matches the query that
++                # produced the recommendation. A client cannot attach an
++                # unrelated request_id to manufacture an accept event.
++                impression_type = str(
++                    impression.metadata.get("candidate_type") or "worker"
++                )
++                if impression_type == "task":
++                    candidate_id = request.task_id
++                    valid = (
++                        request.worker_id == impression.query_id
++                        and request.task_id in impression.candidate_ids
++                    )
++                    default_role = "worker"
++                    default_user = request.worker_id
++                else:
++                    candidate_id = request.worker_id
++                    valid = (
++                        request.task_id == impression.query_id
++                        and request.worker_id in impression.candidate_ids
++                    )
++                    default_role = "customer"
++                    default_user = request.customer_id
++                if valid:
++                    try:
++                        app.state.events.record_event(
++                            context.request_id,
++                            candidate_id,
++                            "accept",
++                            user_id=(
++                                impression.metadata.get("user_id")
++                                or default_user
++                            ),
++                            role=str(
++                                impression.metadata.get("role")
++                                or default_role
++                            ),
++                            metadata={
++                                "weights_version": (
++                                    app.state.weight_store.active().version
++                                )
++                            },
++                        )
++                    except (KeyError, ValueError):
++                        # The assignment still succeeds when the accept was
++                        # already recorded through POST /events.
++                        pass
+         return asdict(assignment)
+ 
+     @app.post("/feedback")
+     def create_feedback(request: FeedbackRequest) -> dict:
+         current = require_store()
+         service = FeedbackService(current)
+         try:
+             feedback = service.record_feedback(
+                 request.assignment_id,
+                 request.overall_rating,
+                 quality_rating=request.quality_rating,
+                 timeliness_rating=request.timeliness_rating,
+                 communication_rating=request.communication_rating,
+                 comment=request.comment,
+             )
+         except KeyError:
+             raise HTTPException(status_code=404, detail="assignment not found")
+         except ValueError as error:
+             raise HTTPException(status_code=409, detail=str(error))
+ 
++        invalidate_service()
+         response = asdict(feedback)
+         assignment = next(
+             (
+                 item
+                 for item in current.assignments
+                 if item.assignment_id == feedback.assignment_id
+             ),
+             None,
+         )
+         if assignment is not None:
+@@ -1254,26 +1253,21 @@
+         learner = OnlineWeightLearner(prior)
+         learner.batch_fit(records, epochs=1)
+         merged = dict(learner.weights)
+         updates = len(records)
+         choice_updates = 0
+         mode = getattr(
+             app.state, "choice_learning_mode", CHOICE_LEARNING_MODE
+         )
+         mode = "listwise" if mode == "listwise" else "pairwise"
+         if include_events:
+-            service = RecommendationService(
+-                current,
+-                weights=prior,
+-                semantic_matcher=app.state.semantic_matcher,
+-                acceptance_model=app.state.acceptance_model,
+-            )
++            service = active_service()
+             if mode == "listwise":
+                 choice_weights, choice_updates = _listwise_choice_weights(
+                     current, service, prior
+                 )
+             else:
+                 usable, features_by_event = _events_with_features(
+                     current.events, service
+                 )
+                 pairs = build_pairs(
+                     usable,
+@@ -1298,20 +1292,21 @@
+             encoding="utf-8",
+         )
+         source = (
+             f"batch+{mode}"
+             if include_events and choice_updates
+             else "batch"
+         )
+         version = app.state.weight_store.create(
+             final, updates, source
+         )
++        invalidate_service()
+         payload = asdict(version)
+         payload["updates"] = updates
+         payload["binding"] = binding
+         payload["mode"] = mode
+         return payload
+ 
+     @app.get("/weights/binding")
+     def weight_binding() -> dict:
+         binding = app.state.last_binding
+         if binding is None:
+@@ -1426,26 +1421,21 @@
+                 event.action == "reject" for event in request_events
+             )
+             if has_accept and has_reject:
+                 grouped[request_id] = request_events
+         if not grouped:
+             return
+         impressions_by_request = {
+             impression.request_id: impression
+             for impression in current.impressions
+         }
+-        service = RecommendationService(
+-            current,
+-            weights=app.state.weight_store.active().weights,
+-            semantic_matcher=app.state.semantic_matcher,
+-            acceptance_model=app.state.acceptance_model,
+-        )
++        service = active_service()
+         for request_id, request_events in grouped.items():
+             positives = [
+                 event
+                 for event in request_events
+                 if event.action == "accept"
+             ]
+             negatives = [
+                 event
+                 for event in request_events
+                 if event.action == "reject"
+@@ -1480,23 +1470,26 @@
+                 continue
+             learned.add(request_id)
+ 
+     @app.post("/events", response_model=EventsResponse)
+     def record_events(request: EventsRequest) -> EventsResponse:
+         weights_version = app.state.weight_store.active().version
+         accepted = 0
+         recorded: list[RecommendationEvent] = []
+         for item in request.events:
+             metadata = dict(item.metadata)
++            # Pass explicit client labels through so ``EventService`` can
++            # validate them against the impression; it derives the authoritative
++            # values and drops every non-allowlisted metadata key.
+             if "candidate_type" in item.model_fields_set:
+                 metadata["candidate_type"] = item.candidate_type
+-            if "task_id" in item.model_fields_set:
++            if item.task_id is not None:
+                 metadata["task_id"] = item.task_id
+             metadata["weights_version"] = weights_version
+             try:
+                 event = app.state.events.record_event(
+                     item.request_id,
+                     item.candidate_id,
+                     item.action,
+                     user_id=item.user_id,
+                     role=item.role,
+                     metadata=metadata,
+@@ -1512,26 +1505,21 @@
+         _learn_pairs_from_events(recorded)
+         return EventsResponse(accepted=accepted)
+ 
+     @app.get("/events/metrics")
+     def event_metrics() -> dict:
+         return app.state.events.funnel_metrics()
+ 
+     @app.post("/recommend/workers", response_model=RecommendResponse)
+     def recommend_workers(request: RecommendWorkersRequest) -> RecommendResponse:
+         current = require_store()
+-        service = RecommendationService(
+-            current,
+-            weights=app.state.weight_store.active().weights,
+-            semantic_matcher=app.state.semantic_matcher,
+-            acceptance_model=app.state.acceptance_model,
+-        )
++        service = active_service()
+         pool_size = min(100, max(request.top_n * 3, request.top_n + 1))
+         try:
+             candidates = service.recommend_workers(
+                 request.task_id,
+                 top_n=pool_size,
+                 user_id=request.user_id,
+             )
+         except KeyError:
+             raise HTTPException(status_code=404, detail="task not found")
+         candidates = app.state.exploration.rerank(
+@@ -1541,21 +1529,25 @@
+         if candidates:
+             app.state.events.record_impression(
+                 request_id,
+                 request.task_id,
+                 [candidate.candidate_id for candidate in candidates],
+                 {
+                     candidate.candidate_id: candidate.propensity
+                     for candidate in candidates
+                 },
+                 "epsilon_greedy_topk",
+-                metadata={"candidate_type": "worker"},
++                metadata={
++                    "candidate_type": "worker",
++                    "role": "customer",
++                    "user_id": request.user_id,
++                },
+             )
+         return RecommendResponse(
+             query_id=request.task_id,
+             candidates=[
+                 CandidateResponse(
+                     candidate_id=candidate.candidate_id,
+                     score=candidate.score,
+                     breakdown=candidate.breakdown,
+                     reasons=candidate.reasons,
+                     cold_start=candidate.cold_start,
+@@ -1563,26 +1555,21 @@
+                 )
+                 for candidate in candidates
+             ],
+             reason=None if candidates else "no eligible candidates",
+             request_id=request_id,
+         )
+ 
+     @app.post("/recommend/tasks", response_model=RecommendResponse)
+     def recommend_tasks(request: RecommendTasksRequest) -> RecommendResponse:
+         current = require_store()
+-        service = RecommendationService(
+-            current,
+-            weights=app.state.weight_store.active().weights,
+-            semantic_matcher=app.state.semantic_matcher,
+-            acceptance_model=app.state.acceptance_model,
+-        )
++        service = active_service()
+         pool_size = min(100, max(request.top_n * 3, request.top_n + 1))
+         try:
+             candidates = service.recommend_tasks(
+                 request.worker_id,
+                 top_n=pool_size,
+                 user_id=request.user_id,
+             )
+         except KeyError:
+             raise HTTPException(status_code=404, detail="worker not found")
+         candidates = app.state.exploration.rerank(
+@@ -1592,21 +1579,25 @@
+         if candidates:
+             app.state.events.record_impression(
+                 request_id,
+                 request.worker_id,
+                 [candidate.candidate_id for candidate in candidates],
+                 {
+                     candidate.candidate_id: candidate.propensity
+                     for candidate in candidates
+                 },
+                 "epsilon_greedy_topk",
+-                metadata={"candidate_type": "task"},
++                metadata={
++                    "candidate_type": "task",
++                    "role": "worker",
++                    "user_id": request.worker_id,
++                },
+             )
+         return RecommendResponse(
+             query_id=request.worker_id,
+             candidates=[
+                 CandidateResponse(
+                     candidate_id=candidate.candidate_id,
+                     score=candidate.score,
+                     breakdown=candidate.breakdown,
+                     reasons=candidate.reasons,
+                     cold_start=candidate.cold_start,
+@@ -1661,26 +1652,21 @@
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+         return _serialize_chain(chain)
+ 
+     @app.post("/chains/{chain_id}/plan")
+     def plan(chain_id: str) -> dict:
+         current = require_store()
+         chain = app.state.chains.get(chain_id)
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+-        service = RecommendationService(
+-            current,
+-            weights=app.state.weight_store.active().weights,
+-            semantic_matcher=app.state.semantic_matcher,
+-            acceptance_model=app.state.acceptance_model,
+-        )
++        service = active_service()
+         result = plan_chain(chain, service)
+         version = app.state.plan_store.save(result)
+         return {
+             "plan_id": result.plan_id,
+             "chain_id": result.chain_id,
+             "score": result.score,
+             "blocked": result.blocked,
+             "version": version,
+             "planner": result.planner,
+             "nodes": [asdict(node) for node in result.nodes],
+@@ -1713,26 +1699,21 @@
+         current = require_store()
+         chain = app.state.chains.get(chain_id)
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+         try:
+             active_plan = app.state.plan_store.active(chain_id)
+         except KeyError:
+             raise HTTPException(
+                 status_code=404, detail="no active plan"
+             )
+-        service = RecommendationService(
+-            current,
+-            weights=app.state.weight_store.active().weights,
+-            semantic_matcher=app.state.semantic_matcher,
+-            acceptance_model=app.state.acceptance_model,
+-        )
++        service = active_service()
+         locked_nodes = set(request.locked_nodes) | {
+             node.key
+             for node in chain.nodes
+             if node.status in {"completed", "in_progress"}
+         }
+         try:
+             result = replan_chain(
+                 chain,
+                 service,
+                 request.failed_node,
+@@ -1811,16 +1792,14 @@
+         current = require_store()
+         chain = app.state.chains.get(chain_id)
+         if chain is None:
+             raise HTTPException(status_code=404, detail="chain not found")
+         return _node_candidates(
+             chain,
+             node_id,
+             current,
+             request.top_n,
+             app.state.exploration,
+-            weights=app.state.weight_store.active().weights,
+-            semantic_matcher=app.state.semantic_matcher,
+-            acceptance_model=app.state.acceptance_model,
++            service=active_service(),
+         )
+ 
+     return app
+
+--- a/app\schemas.py
++++ b/app\schemas.py
+@@ -1,18 +1,26 @@
+ """Pydantic request and response schemas."""
+ 
+ from __future__ import annotations
+ 
+ from datetime import datetime
+ from typing import Literal
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, field_validator
++
++# Event ingestion bounds. A recommendation has at most ``top_n <= 100``
++# candidates, so a larger batch is always abusive or accidental. Metadata is a
++# small audit payload, not a free-form document store.
++MAX_EVENTS_PER_BATCH = 200
++MAX_EVENT_METADATA_KEYS = 20
++MAX_EVENT_METADATA_TEXT = 2_000
++MAX_EVENTS_BODY_BYTES = 1 * 1024 * 1024
+ 
+ 
+ class RecommendWorkersRequest(BaseModel):
+     task_id: str
+     top_n: int = Field(default=10, ge=1, le=100)
+     explain: bool = True
+     user_id: str | None = None
+ 
+ 
+ class RecommendTasksRequest(BaseModel):
+@@ -41,23 +49,48 @@
+ class EventItem(BaseModel):
+     request_id: str
+     candidate_id: str
+     candidate_type: str = "worker"
+     action: Literal["click", "apply", "accept", "reject", "ignore"]
+     task_id: str | None = None
+     user_id: str | None = None
+     role: str = "customer"
+     metadata: dict = Field(default_factory=dict)
+ 
++    @field_validator("request_id", "candidate_id")
++    @classmethod
++    def _bounded_id(cls, value: str) -> str:
++        if not value or len(value) > 128:
++            raise ValueError("id must be 1-128 characters")
++        return value
++
++    @field_validator("metadata")
++    @classmethod
++    def _bounded_metadata(cls, value: dict) -> dict:
++        if len(value) > MAX_EVENT_METADATA_KEYS:
++            raise ValueError(
++                f"metadata has more than {MAX_EVENT_METADATA_KEYS} keys"
++            )
++        text_length = sum(
++            len(str(key)) + len(str(item)) for key, item in value.items()
++        )
++        if text_length > MAX_EVENT_METADATA_TEXT:
++            raise ValueError(
++                f"metadata exceeds {MAX_EVENT_METADATA_TEXT} characters"
++            )
++        return value
++
+ 
+ class EventsRequest(BaseModel):
+-    events: list[EventItem]
++    events: list[EventItem] = Field(
++        min_length=1, max_length=MAX_EVENTS_PER_BATCH
++    )
+ 
+ 
+ class EventsResponse(BaseModel):
+     accepted: int
+     rejected: list[dict] = Field(default_factory=list)
+ 
+ 
+ class ClassifyRequest(BaseModel):
+     text: str = Field(min_length=4, max_length=5000)
+     top_k: int = Field(default=3, ge=1, le=6)
+
+--- a/app\semantic.py
++++ b/app\semantic.py
+@@ -55,25 +55,33 @@
+ #: ``semantic_similarity`` prior expected by the seven-dimension features.
+ NEUTRAL_SIMILARITY = 0.5
+ 
+ DEFAULT_SENTENCE_MODEL = "BAAI/bge-small-zh-v1.5"
+ 
+ _TFIDF_ANALYZER = "char"
+ _TFIDF_NGRAM_RANGE = (2, 4)
+ _TFIDF_MIN_DF = 2
+ _MAX_SVD_COMPONENTS = 128
+ 
+-#: Memoized resume-surface text, keyed by ``worker_id``. Inputs are assumed
+-#: static for the duration of a run (100 workers / 1,000 tasks scale).
++#: Memoized resume-surface text, keyed by ``worker_id``. Uploads create
++#: ephemeral worker drafts, so the cache is bounded and evicts the oldest entry.
++MAX_TEXT_CACHE_ENTRIES = 4_096
+ _WORKER_TEXT_CACHE: dict[str, str] = {}
+ #: Memoized task text, keyed by ``task_id``.
+ _TASK_TEXT_CACHE: dict[str, str] = {}
++
++
++def _remember_text(cache: dict[str, str], key: str, text: str) -> None:
++    """Insert ``text`` with oldest-entry eviction at the cache bound."""
++    if key not in cache and len(cache) >= MAX_TEXT_CACHE_ENTRIES:
++        cache.pop(next(iter(cache)))
++    cache[key] = text
+ 
+ 
+ def _clamp01(value: float) -> float:
+     """Clamp a cosine score to the ``[0, 1]`` range, mapping NaN to neutral."""
+     value = float(value)
+     if value != value:  # NaN
+         return NEUTRAL_SIMILARITY
+     return max(0.0, min(1.0, value))
+ 
+ 
+@@ -408,21 +416,21 @@
+         parts.append(_clean(project.get("name")))
+         parts.append(_clean(project.get("role")))
+         parts.extend(
+             _clean(bullet) for bullet in project.get("bullets", []) or []
+         )
+     parts.extend(
+         _clean(certification)
+         for certification in resume.get("certifications", []) or []
+     )
+     text = "。".join(part.strip() for part in parts if part.strip())
+-    _WORKER_TEXT_CACHE[worker.worker_id] = text
++    _remember_text(_WORKER_TEXT_CACHE, worker.worker_id, text)
+     return text
+ 
+ 
+ def build_task_text(task: Task) -> str:
+     """Join the task title, description, requirements, and category.
+ 
+     The result is memoized by ``task_id``; tasks are assumed static during a
+     run, so call :func:`clear_text_caches` after a data refresh.
+     """
+     cached = _TASK_TEXT_CACHE.get(task.task_id)
+@@ -434,12 +442,12 @@
+         for requirement in task.requirements or []
+         if (cleaned := _clean(requirement).strip())
+     )
+     parts = [
+         _clean(task.title),
+         _clean(task.description),
+         requirements,
+         _clean(task.category),
+     ]
+     text = "。".join(part.strip() for part in parts if part.strip())
+-    _TASK_TEXT_CACHE[task.task_id] = text
++    _remember_text(_TASK_TEXT_CACHE, task.task_id, text)
+     return text
+
+--- a/app\service.py
++++ b/app\service.py
+@@ -50,25 +50,21 @@
+     for skill, minimum in task.required_skills.items():
+         if worker.skills.get(skill, 0) < minimum:
+             return False, f"missing skill: {skill}"
+     if worker.level < task.required_level:
+         return False, "worker level below required"
+     if (
+         worker.current_load_hours + task.estimated_hours
+         > worker.capacity_hours
+     ):
+         return False, "worker capacity exceeded"
+-    if any(
+-        assignment.task_id == task.task_id
+-        and assignment.worker_id == worker.worker_id
+-        for assignment in store.assignments
+-    ):
++    if store.has_assignment_pair(task.task_id, worker.worker_id):
+         return False, "worker already assigned to this task"
+     if _recent_breach_count(worker, now or store.reference_time) >= BREACH_EXCLUDE_THRESHOLD:
+         return False, "worker has two or more recent breaches"
+     return True, "eligible"
+ 
+ 
+ def _as_aware(value: datetime) -> datetime:
+     return (
+         value.replace(tzinfo=timezone.utc)
+         if value.tzinfo is None
+@@ -103,24 +99,32 @@
+ class RecommendationService:
+     def __init__(
+         self,
+         store: Store,
+         weights: dict[str, float] | None = None,
+         semantic_matcher: SemanticMatcher | None = None,
+         acceptance_model: AcceptanceModel | None = None,
+     ) -> None:
+         self.store = store
+         self.weights = dict(weights or DEFAULT_WEIGHTS)
+-        self.reference_time = store.reference_time
+         self.itemcf = _build_itemcf(store)
+         self.semantic_matcher = semantic_matcher
+         self.acceptance_model = acceptance_model
++        self._acceptance_cache_key = None
++        self._acceptance_cache: dict[str, tuple[int, int]] = {}
++        self._collaboration_cache_key = None
++        self._collaboration_cache: dict[tuple[str, str], int] = {}
++
++    @property
++    def reference_time(self) -> datetime:
++        """Data-relative ``now``; cheap because ``Store`` caches it."""
++        return self.store.reference_time
+ 
+     def _weights_for(
+         self, user_id: str | None = None
+     ) -> dict[str, float]:
+         if user_id:
+             profile = self.store.user_weight_profiles.get(user_id)
+             if profile is not None:
+                 return profile.weights
+         return self.weights
+ 
+@@ -135,45 +139,59 @@
+     def _region_match(worker: Worker, task: Task) -> float:
+         if worker.region == task.region:
+             return 1.0
+         if worker.remote_ok and task.remote_ok:
+             return 0.8
+         return 0.3
+ 
+     def _acceptance_counts(self) -> dict[str, tuple[int, int]]:
+         if self.acceptance_model is None:
+             return {}
++        key = (id(self.store.events), len(self.store.events))
++        if self._acceptance_cache_key == key:
++            return self._acceptance_cache
+         counts: dict[str, tuple[int, int]] = {}
+         for event in self.store.events:
+             if event.candidate_type != "worker":
+                 continue
+             if event.action not in {"accept", "reject"}:
+                 continue
+             accepted, rejected = counts.get(event.candidate_id, (0, 0))
+             if event.action == "accept":
+                 accepted += 1
+             else:
+                 rejected += 1
+             counts[event.candidate_id] = (accepted, rejected)
++        self._acceptance_cache_key = key
++        self._acceptance_cache = counts
+         return counts
+ 
+     def _collaboration_counts(self) -> dict[tuple[str, str], int]:
+-        """Prior completed pairs, indexed once per recommendation call."""
++        """Prior completed pairs, indexed once and reused while data is static."""
+         cutoff = _as_aware(self.reference_time)
++        key = (
++            id(self.store.assignments),
++            len(self.store.assignments),
++            cutoff,
++        )
++        if self._collaboration_cache_key == key:
++            return self._collaboration_cache
+         counts: dict[tuple[str, str], int] = {}
+         for assignment in self.store.assignments:
+             if assignment.status != "completed":
+                 continue
+             if _as_aware(assignment.created_at) >= cutoff:
+                 continue
+-            key = (assignment.customer_id, assignment.worker_id)
+-            counts[key] = counts.get(key, 0) + 1
++            key_pair = (assignment.customer_id, assignment.worker_id)
++            counts[key_pair] = counts.get(key_pair, 0) + 1
++        self._collaboration_cache_key = key
++        self._collaboration_cache = counts
+         return counts
+ 
+     @staticmethod
+     def _historical_accept_rate(
+         counts: dict[str, tuple[int, int]], worker_id: str
+     ) -> float:
+         accepted, rejected = counts.get(worker_id, (0, 0))
+         if accepted + rejected == 0:
+             return 0.5
+         return (accepted + 1) / (accepted + rejected + 2)
+
+--- a/app\serving.py
++++ b/app\serving.py
+@@ -0,0 +1,131 @@
++"""Serving-parity construction of semantic and acceptance components.
++
++``create_app`` injects one fitted :class:`SemanticMatcher` and one
++:class:`AcceptanceModel` into every recommendation service. Offline evaluation
++and weight tuning must inject the same components, fitted from a **train-only**
++store, otherwise their evidence does not describe the serving ranker.
++
++The helpers here are deliberately free of FastAPI imports so
++``evaluation_strict`` and ``scripts/tune_weights.py`` can use them without
++importing ``app.main``.
++"""
++
++from __future__ import annotations
++
++from app.data.store import Store
++from app.domain import Task, Worker
++from app.features import pay_fit_score, skill_score
++from app.learning.acceptance import AcceptanceModel, accept_features
++from app.semantic import (
++    SemanticMatcher,
++    build_matcher,
++    build_task_text,
++    build_worker_text,
++)
++
++
++def region_match(worker: Worker, task: Task) -> float:
++    """1.0 for the same region, 0.8 when both sides accept remote, else 0.3."""
++    if worker.region == task.region:
++        return 1.0
++    if worker.remote_ok and task.remote_ok:
++        return 0.8
++    return 0.3
++
++
++def build_semantic_matcher(store: Store) -> SemanticMatcher | None:
++    """Fit one matcher over the store's worker/task surface text.
++
++    No labels or outcomes are read; the text corpus comes from worker and task
++    entities only, so fitting on a train-only store cannot leak test outcomes.
++    """
++    try:
++        matcher = build_matcher()
++        matcher.fit(
++            [
++                build_worker_text(worker)
++                for worker in store.workers.values()
++            ],
++            [
++                build_task_text(task)
++                for task in store.tasks.values()
++            ],
++        )
++    except Exception:  # noqa: BLE001 - a missing matcher degrades to neutral
++        return None
++    return matcher if matcher.is_fitted else None
++
++
++def build_acceptance_model(store: Store) -> AcceptanceModel | None:
++    """Fit the global ``P(accept)`` model from the store's accept/reject events."""
++    counts: dict[str, tuple[int, int]] = {}
++    for event in store.events:
++        if event.candidate_type != "worker":
++            continue
++        if event.action not in {"accept", "reject"}:
++            continue
++        accepted, rejected = counts.get(event.candidate_id, (0, 0))
++        if event.action == "accept":
++            accepted += 1
++        else:
++            rejected += 1
++        counts[event.candidate_id] = (accepted, rejected)
++
++    samples: list[tuple[dict[str, float], int]] = []
++    for event in store.events:
++        if event.candidate_type != "worker":
++            continue
++        if event.action not in {"accept", "reject"}:
++            continue
++        worker = store.workers.get(event.candidate_id)
++        task = store.tasks.get(event.task_id)
++        if worker is None or task is None:
++            continue
++        accepted, rejected = counts.get(worker.worker_id, (0, 0))
++        historical = (
++            (accepted + 1) / (accepted + rejected + 2)
++            if accepted + rejected > 0
++            else 0.5
++        )
++        samples.append(
++            (
++                accept_features(
++                    worker,
++                    task,
++                    skill=skill_score(worker, task),
++                    pay_fit=pay_fit_score(worker, task),
++                    region_match=region_match(worker, task),
++                    historical_accept_rate=historical,
++                ),
++                1 if event.action == "accept" else 0,
++            )
++        )
++    try:
++        model = AcceptanceModel().fit(samples)
++    except Exception:  # noqa: BLE001 - an unfitted model degrades to prior
++        return None
++    return model if model.is_fitted else None
++
++
++def build_serving_components(
++    store: Store,
++) -> tuple[SemanticMatcher | None, AcceptanceModel | None]:
++    """Return the ``(semantic_matcher, acceptance_model)`` serving pair."""
++    return build_semantic_matcher(store), build_acceptance_model(store)
++
++
++def serving_components(
++    store: Store,
++) -> tuple[SemanticMatcher | None, AcceptanceModel | None]:
++    """Fit (once per store) and reuse serving components for this store.
++
++    Tuning evaluates many weight vectors against the same fit store; refitting
++    TF-IDF/SVD for each candidate would dominate runtime. The cache lives on the
++    store instance and is discarded with it, so a new train-only store always
++    gets freshly fitted, train-only components.
++    """
++    cached = getattr(store, "_serving_components_cache", None)
++    if cached is None:
++        cached = build_serving_components(store)
++        store._serving_components_cache = cached
++    return cached
+
+--- a/app\upload\extract.py
++++ b/app\upload\extract.py
+@@ -1,39 +1,51 @@
+ """In-memory, whitelist-only text extraction for uploaded documents.
+ 
+ Security posture (Task 22):
+ 
+ * the filename is sanitized before it is used anywhere (path separators and
+   control characters are removed);
+ * only ``.txt`` / ``.md`` / ``.pdf`` / ``.docx`` are accepted, and the declared
+   MIME type (when meaningful) must agree with the extension;
+ * the upload is capped at :data:`MAX_UPLOAD_BYTES` (10 MB);
++* DOCX ZIP entries and PDF stream objects are inspected before the optional
++  parser decodes them: zip entry sizes/ratios and Flate expansion are bounded,
++  so a compression bomb is rejected before it can allocate memory;
+ * bytes are parsed in memory from ``io.BytesIO``; nothing is written to disk,
+   and no macro / script / embedded object is executed;
+ * optional parsers (``pypdf`` for PDF, ``python-docx`` for DOCX) are imported
+   lazily. When absent, the caller receives an :class:`UploadError` whose
+   message explains which extra to install instead of an ``ImportError``.
+ """
+ 
+ from __future__ import annotations
+ 
+ import io
+ import json
+ import re
+ import zipfile
++import zlib
+ from pathlib import PurePosixPath
+ 
+ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+ MAX_UPLOAD_MB = 10
+ # A small DOCX/PDF can inflate to a very large document; keep parsing bounded.
+ MAX_EXTRACTED_CHARS = 5_000_000
+ MAX_PDF_PAGES = 200
++# PDF streams are decoded lazily by pypdf during ``extract_text``. Scan the
++# raw stream objects first and bound both compressed declarations and Flate
++# expansions, so a small upload cannot decompress into gigabytes before the
++# post-page text check runs.
++MAX_PDF_STREAMS = 4_096
++MAX_PDF_STREAM_BYTES = 32 * 1024 * 1024
++MAX_PDF_TOTAL_DECODED = 64 * 1024 * 1024
++_PDF_HEADER_WINDOW = 8_192
+ MAX_ZIP_ENTRIES = 2_048
+ MAX_ZIP_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024
+ MAX_ZIP_ENTRY_UNCOMPRESSED = 32 * 1024 * 1024
+ MAX_ZIP_COMPRESSION_RATIO = 100
+ _ZIP_RATIO_MIN_SIZE = 1024 * 1024
+ 
+ SUPPORTED_EXTENSIONS = (".txt", ".md", ".pdf", ".docx")
+ TEXT_EXTENSIONS = (".txt", ".md")
+ UPLOAD_PATHS = frozenset({"/upload/task", "/upload/resume", "/resume/analyze"})
+ 
+@@ -74,70 +86,76 @@
+ 
+ class UploadBodyLimitMiddleware:
+     """Pure ASGI body cap applied before multipart/JSON parsing.
+ 
+     Starlette normally receives and spools a multipart body before the route
+     handler runs. This middleware runs outside form parsing, rejects an
+     over-limit ``Content-Length`` immediately, and counts streamed chunks for
+     chunked bodies. An over-limit request never reaches the endpoint.
+     """
+ 
+-    def __init__(self, app, paths: frozenset[str] | None = None) -> None:
++    def __init__(
++        self,
++        app,
++        paths: frozenset[str] | None = None,
++        limit: int | None = None,
++    ) -> None:
+         self.app = app
+         self.paths = paths or UPLOAD_PATHS
++        self.limit = MAX_UPLOAD_BYTES if limit is None else int(limit)
+ 
+     async def __call__(self, scope, receive, send) -> None:
+         path = (scope.get("path") or "").rstrip("/") or "/"
+         if scope.get("type") != "http" or path not in self.paths:
+             await self.app(scope, receive, send)
+             return
+ 
+-        limit = MAX_UPLOAD_BYTES
++        limit = self.limit
+         headers = {
+             key.decode("latin-1").lower(): value.decode("latin-1")
+             for key, value in scope.get("headers", [])
+         }
+         declared = headers.get("content-length")
+         if declared is not None:
+             try:
+                 declared_size = int(declared)
+             except ValueError:
+                 await self._reject(
+                     send, 413, "无效的 Content-Length 请求头"
+                 )
+                 return
+             if declared_size > limit:
+                 await self._reject(
+                     send,
+                     413,
+-                    f"请求体超过上传大小限制（{upload_limit_label(limit)}）",
++                    f"请求体超过大小限制（{upload_limit_label(limit)}）",
+                 )
+                 return
+ 
+         received = 0
+ 
+         async def limited_receive():
+             nonlocal received
+             message = await receive()
+             if message.get("type") == "http.request":
+                 received += len(message.get("body", b""))
+                 if received > limit:
+                     raise _BodyTooLarge
+             return message
+ 
+         try:
+             await self.app(scope, limited_receive, send)
+         except _BodyTooLarge:
+             await self._reject(
+                 send,
+                 413,
+-                f"请求体超过上传大小限制（{upload_limit_label(limit)}）",
++                f"请求体超过大小限制（{upload_limit_label(limit)}）",
+             )
+ 
+     @staticmethod
+     async def _reject(send, status: int, detail: str) -> None:
+         body = json.dumps(
+             {"detail": detail}, ensure_ascii=False
+         ).encode("utf-8")
+         await send(
+             {
+                 "type": "http.response.start",
+@@ -212,23 +230,118 @@
+     if b"\x00" in content:
+         raise UploadError("文本文件包含二进制内容，无法作为 .txt/.md 解析")
+     for encoding in ("utf-8-sig", "gb18030"):
+         try:
+             return content.decode(encoding)
+         except UnicodeDecodeError:
+             continue
+     raise UploadError("文本编码无法识别，请使用 UTF-8 或 GB18030 编码")
+ 
+ 
++_PDF_STREAM_START_RE = re.compile(
++    rb"(?<!end)stream(?:\r\n|\n|\r)", re.IGNORECASE
++)
++_PDF_INDIRECT_LENGTH_RE = re.compile(rb"/Length\s+\d+\s+\d+\s+R")
++_PDF_DIRECT_LENGTH_RE = re.compile(rb"/Length\s+(\d+)")
++
++
++def _pdf_stream_bounds(
++    content: bytes,
++) -> list[tuple[int, int, bool, int | None]]:
++    """Return ``(data_start, data_end, is_flate, declared_length)`` tuples.
++
++    This is a conservative raw scan: it only uses ``/Length`` when the value is
++    a direct integer in the nearest stream dictionary and otherwise falls back
++    to the next ``endstream`` keyword. It intentionally does not trust PDF
++    parsing to find each stream, so a malformed object cannot bypass the bound.
++    """
++    bounds: list[tuple[int, int, bool, int | None]] = []
++    for match in _PDF_STREAM_START_RE.finditer(content):
++        start = match.end()
++        window = content[
++            max(0, match.start() - _PDF_HEADER_WINDOW): match.start()
++        ]
++        obj_at = window.rfind(b"obj")
++        if obj_at != -1:
++            window = window[obj_at + 3:]
++        dict_at = window.rfind(b"<<")
++        if dict_at != -1:
++            window = window[dict_at:]
++        flate = b"/FlateDecode" in window
++        declared: int | None = None
++        if not _PDF_INDIRECT_LENGTH_RE.search(window):
++            length_match = _PDF_DIRECT_LENGTH_RE.search(window)
++            if length_match is not None:
++                declared = int(length_match.group(1))
++        end: int | None = None
++        if declared is not None and start + declared <= len(content):
++            end = start + declared
++        if end is None:
++            found = content.find(b"endstream", start)
++            end = found if found != -1 else len(content)
++        bounds.append((start, max(start, end), flate, declared))
++    return bounds
++
++
++def _inspect_pdf_streams(content: bytes) -> None:
++    """Reject PDF stream objects that would expand past the safety bound.
++
++    pypdf decodes streams lazily while extracting text, which is too late for a
++    post-page character limit to protect memory. Every raw stream is inspected
++    first: direct ``/Length`` declarations are bounded, and Flate-compressed
++    streams are inflated with a hard output cap.
++    """
++    decoded_total = 0
++    for stream_index, (start, end, flate, declared) in enumerate(
++        _pdf_stream_bounds(content), start=1
++    ):
++        if stream_index > MAX_PDF_STREAMS:
++            raise UploadError(
++                f"PDF 内部流对象过多（最多 {MAX_PDF_STREAMS} 个）"
++            )
++        if declared is not None and declared > MAX_PDF_STREAM_BYTES:
++            raise UploadError("PDF 流声明的数据过大")
++        payload = content[start:end]
++        if not flate:
++            if len(payload) > MAX_PDF_STREAM_BYTES:
++                raise UploadError("PDF 流数据过大")
++            decoded_total += len(payload)
++            if decoded_total > MAX_PDF_TOTAL_DECODED:
++                raise UploadError("PDF 解压后的总体积过大")
++            continue
++        try:
++            decompressor = zlib.decompressobj()
++            expanded = decompressor.decompress(
++                payload, MAX_PDF_STREAM_BYTES + 1
++            )
++            remaining = MAX_PDF_STREAM_BYTES + 1 - len(expanded)
++            if remaining > 0:
++                expanded += decompressor.flush(remaining)
++        except zlib.error:
++            # A malformed Flate stream is not an expansion bomb; pypdf will
++            # surface its own parse error (or skip the stream).
++            continue
++        if (
++            len(expanded) > MAX_PDF_STREAM_BYTES
++            or decompressor.unconsumed_tail
++        ):
++            raise UploadError("PDF 流解压后过大（疑似解压炸弹）")
++        decoded_total += len(expanded)
++        if decoded_total > MAX_PDF_TOTAL_DECODED:
++            raise UploadError("PDF 解压后的总体积过大")
++
++
+ def _extract_pdf(content: bytes) -> str:
+     if not content.lstrip().startswith(b"%PDF-"):
+         raise UploadError("文件不是有效的 PDF（缺少 %PDF 文件头）")
++    # Bound stream expansion before pypdf lazily decompresses anything.
++    _inspect_pdf_streams(content)
+     try:
+         pypdf = _import_pypdf()
+     except ImportError:
+         raise UploadError(
+             "PDF 解析需要可选依赖 pypdf；请安装：pip install pypdf"
+         ) from None
+     try:
+         reader = pypdf.PdfReader(io.BytesIO(content))
+         if getattr(reader, "is_encrypted", False):
+             raise UploadError("PDF 已加密，无法解析")
+
+--- a/docs\recommendation-flow.md
++++ b/docs\recommendation-flow.md
+@@ -161,21 +161,21 @@
+ 
+ ### 2.6 选择权重
+ 
+ 优先级：
+ 
+ ```text
+ 请求带 user_id 且已有个人权重 → 个人权重
+ 否则 → 当前激活的全局权重版本
+ ```
+ 
+-默认全局权重：
++AHP 先验/基线全局权重（`DEFAULT_WEIGHTS`；实际 serving 权重来自 `data/weights/active.json`，当前为 `scripts/tune_weights.py` + `scripts/activate_weights.py` 激活的 choice-tuned 版本）：
+ 
+ | 维度 | 权重 |
+ |---|---|
+ | reputation | 0.32 |
+ | skill | 0.20 |
+ | expertise | 0.15 |
+ | collaborative | 0.13 |
+ | preference | 0.10 |
+ | load | 0.06 |
+ | customer_preference | 0.04 |
+@@ -262,20 +262,22 @@
+ ```
+ 
+ 客户端随后调用 `POST /events` 上报以下动作：
+ 
+ ```text
+ click / apply / accept / reject / ignore
+ ```
+ 
+ 每个动作写成一条 `RecommendationEvent`，包含 `request_id`、`candidate_id`、`rank`、`score`、`propensity`、`weights_version` 与 `action`。`GET /events/metrics` 聚合曝光数、候选数、点击率、申请率、接受率、拒绝率与忽略率。
+ 
++服务端不信任客户端的目标标签：`candidate_type` 与 `task_id` 从对应 `Impression` 派生（worker 曝光的 `task_id=query_id`；task 曝光的 `task_id=candidate_id`），客户端显式字段只用于一致性校验，不匹配返回 409；客户端 metadata 只保留 allowlist（`candidate_type`/`task_id`/`score`/`weights_version`）。`POST /assignments` 携带 `request_id` 时，只有 task 匹配且 candidate 在曝光集合内才自动写 accept，并使用印象的 role/user。`/events` 单批最多 200 条、metadata 最多 20 个键/2000 字符，请求体超过 1 MB 在 JSON 解析前返回 413。事件追加写使用内存行计数与重复键集合，避免每次 append 重扫整个 JSONL；持久化文件仅作审计，不在启动时回放。
++
+ `propensity` 是精确的 logging **包含概率**，而不是事后估计：
+ 
+ ```text
+ 设 N = 候选池大小，K = min(k, N)，ε = 探索率，探索池大小 = N - K + 1
+ top-(K-1) 候选：p = 1.0
+ 第 K 名候选：    p = (1 - ε) + ε / (N - K + 1)
+ 第 K 名之后：    p = ε / (N - K + 1)
+ N <= K：         p = 1.0
+ ```
+ 
+@@ -285,35 +287,45 @@
+ 
+ `scripts/evaluate_strict.py` 使用独立的严格评估协议：
+ 
+ ```text
+ train 数据 → 构造 train-only Store 与全部特征（含 ItemCF）
+ test 查询 → 只用于评分（排序与 HR/NDCG/MRR）与构造 exposed 候选集
+ test 反馈 → 只用于校准评估标签（rating>=4），不参与特征或训练
+ baseline 权重 vs candidate 权重 → 同一次生成的数据上成对比较
+ ```
+ 
++- Serving parity：每个 seed 用 train-only Store 拟合 `SemanticMatcher`（worker/task 文本）与 `AcceptanceModel`（train accept/reject 事件），注入 baseline/candidate/验证服务；JSON 报告 `serving_features.parity="serving"`。
+ - 指标：双向 `HR@k`、`NDCG@k`、`MRR@k`；每个 test 查询成一个成对样本。
+ - 置信区间：对逐查询 delta 做配对 bootstrap（默认 1000 次）。
+-- 护栏：约束违规数、延迟 p50/p95。
++- 护栏：约束违规数；`scoring_latency_p50_ms/p95_ms` 仅是进程内打分时间，HTTP 端点 2× 护栏标记为 `endpoint_latency.guardrail="N/A"`。
+ - 冷启动：JSON 包含 `cold_start.available`、`cold_start.reason`、`cold_start.queries`、`cold_start.measured`；只有 `available=true` 且 `queries>0` 时 `measured` 才为 true，否则报告 N/A。
+ - 校准：在 train 分数/标签上拟合 `PlattCalibrator`，在 test 上报告 `P(rating>=4)` 的 Brier 分数与可靠性分箱；校准不参与排序。
+ - 身份检查：`baseline_equals_candidate=true`（有效权重在浮点容差内相同）时不得宣称提升。
+ 
++规范调优证据（serving-parity 特征 + 验证集调参 + 5 seed 严格测试）：
++
++```bash
++python scripts/tune_weights.py --seeds 42,43,44,45,46 --k 10
++python scripts/activate_weights.py --input data/weights/weights_choice.json
++```
++
++结果写入 `reports/strict_eval_tuned.json` / `reports/strict_eval_tuned.md`，并把 `weights_choice.json` 激活为 WeightStore 版本（`data/weights/active.json` 指向它）。通用严格评估可显式传入候选权重：
++
+ ```bash
+ python scripts/evaluate_strict.py --seeds 42,43,44,45,46 --k 10 \
+-  --candidate-weights data/weights/weights_v0007.json
+-```
+-
+-不传 `--candidate-weights` 会使用 active/default 权重，可能产生 identity 报告并覆盖已发布结果；发布严格评估时必须显式传入真实学习权重。
+-
+-报告写入 `reports/strict_eval.json` 与 `reports/strict_eval.md`。
++  --candidate-weights data/weights/weights_choice.json
++```
++
++评估器在每个 seed 内用 train-only Store 拟合与 serving 相同的 `SemanticMatcher` 和 `AcceptanceModel` 并注入 baseline/candidate 服务（JSON 字段 `serving_features.parity="serving"`）；test 数据只用于排序评分与校准标签。`scoring_latency_p50_ms/p95_ms` 是进程内打分时间，不是 HTTP 端点延迟，端点 2× 护栏在评估报告中明确为 `endpoint_latency.guardrail="N/A"`。不传 `--candidate-weights` 时使用 active 权重；若与 baseline 相同，则报 identity 且不宣称提升。
++
++报告写入 `reports/strict_eval.json` 与 `reports/strict_eval.md`。当前 tuned 证据（`reports/strict_eval_tuned.*`，5 seeds，serving parity）：worker→tasks HR@10 `0.0637 → 0.2070`（+14.33pp），NDCG@10 `0.0258 → 0.0991`（+283.55%）；task→workers HR +0.60pp / NDCG +0.21%（均值不劣化）；约束违规 0；冷启动 N/A；端点延迟 N/A；目标 **MET**。旧 `weights_v0007.json` 的 NOT MET 报告已被取代。
+ 
+ ---
+ 
+ ## 3. 采纳、反馈与学习链路
+ 
+ ### 3.1 采纳
+ 
+ `POST /assignments`
+ 
+ 记录：
+@@ -435,21 +447,21 @@
+ ### 4.3 特征
+ 
+ - 字符 2–4 gram TF-IDF 相似度；
+ - 任务技能与简历技能重叠；
+ - 信誉；
+ - 负载；
+ - 区域/远程匹配；
+ - worker 类别偏好；
+ - 客户类别偏好。
+ 
+-> **已知缺口**：`app/benchmark/recommender.py` 目前没有向 `BenchmarkFeatureBuilder` 传入 ItemCF，因此基准链路的 `collaborative` 特征恒为 `0.0`。该维度的权重会被学习但不会影响排序；Task 21 接入 ItemCF 后才会改变。主推荐链路的 ItemCF 正常。
++> **已知缺口**：**1,000 任务对答案基准**的 `app/benchmark/recommender.py` 没有向 `BenchmarkFeatureBuilder` 传入 ItemCF，因此该基准的 `collaborative` 恒为 `0.0`；主推荐链路的 ItemCF 正常。Task 21 新增的 **10,000 任务大规模基准**（`app/benchmark/large.py`）单独接入 strict train-only ItemCF，但测试任务在训练图上冷启动，所以其 `collaborative` 评估值仍为 0；两个基准不可混用。见 `reports/large_benchmark_eval.md`。
+ 
+ ### 4.4 学习
+ 
+ - listwise softmax，候选集为当前 Top-20；
+ - 学习率 `0.05`；
+ - 只用 800 条训练任务；
+ - 每轮更新一次权重。
+ 
+ ### 4.5 10 轮结果
+ 
+@@ -459,21 +471,21 @@
+ | R2 | 0.401 | 0.907 | 0.385 |
+ | R3 | 0.446 | 0.934 | 0.450 |
+ | R4 | 0.530 | 0.948 | 0.540 |
+ | R5 | 0.530 | 0.953 | 0.545 |
+ | R6 | 0.532 | 0.954 | 0.535 |
+ | R7 | 0.540 | 0.952 | 0.545 |
+ | R8 | 0.545 | 0.951 | 0.555 |
+ | R9 | 0.546 | 0.950 | 0.555 |
+ | R10 | 0.568 | 0.946 | 0.580 |
+ 
+-> 这是 2026-11-14 的重新基线（Task 3 特征 + Task 14 基准改动后）。R1 的 `0.367` 是 fresh baseline，R10 的 `0.568` 不低于它；但 R10 绝对值 `0.568` **低于历史 R10 的 `0.731`（-0.163）**。历史数字来自旧数据/旧特征，不能直接比较，也不能据此宣称已恢复历史水平。基准 `collaborative` 仍为 0，见 §4.3 的已知缺口。
++> 这是 2026-11-14 的重新基线（Task 3 特征 + Task 14 基准改动后）。R1 的 `0.367` 是 fresh baseline，R10 的 `0.568` 不低于它；但 R10 绝对值 `0.568` **低于历史 R10 的 `0.731`（-0.163）**。历史数字来自旧数据/旧特征，不能直接比较，也不能据此宣称已恢复历史水平。**1,000 任务基准的 `collaborative` 仍为 0**，见 §4.3 的已知缺口；10,000 任务大规模基准是独立的 strict train-only ItemCF，不在这张表里。
+ 
+ 可视化：
+ 
+ - `reports/benchmark_curve.png/svg`
+ - `reports/benchmark_curve_dark.png/svg`
+ - `reports/benchmark_visual.md`
+ 
+ 脚本：
+ 
+ ```bash
+@@ -492,28 +504,29 @@
+ | 是否有 gold label | 否 | 部分 | 是 |
+ | 学习触发 | 客户反馈、批量重估 | 验收决策 | 每轮对答案后 |
+ | 更新对象 | 全局/个人权重、偏好画像 | 客户个人权重、能力指标 | 基准权重 |
+ | 评估指标 | 业务反馈、IPS | 一次通过率、返工率、争议率 | Top-1 / Top-5 / MRR / NDCG |
+ | 主要代码 | `app/service.py` | `app/acceptance/` | `app/benchmark/` |
+ 
+ ---
+ 
+ ## 6. 当前边界
+ 
+-1. **自然语言尚未自动进入主推荐**：`/classify` 能识别类别和字段，但还需要显式创建 `Task`。
++1. **自然语言尚未自动进入主推荐**：`/classify`、`/upload/task`、`/upload/resume`、`/resume/analyze` 能识别类别、字段和语义，但 draft 仍需显式确认/创建 `Task`，上传不写 Store。
+ 2. **简历视图是展示层**：`/workers/{id}/resume` 不改变主推荐特征；基准链路才直接使用简历文本。
+ 3. **验收只支持 `consulting_research`**：其他类别返回 422。
+-4. **学习是事件驱动的**：反馈、验收、批量重估会更新权重；没有实时点击流学习。
++4. **学习是事件驱动的**：前端现在会上报 click/apply/reject，采纳时携带 `request_id` 由服务端记录 accept；但没有实时点击流学习（事件在重算/选择学习时消费）。
+ 5. **对答案基准和线上推荐是两套评估**：基准有标准答案，线上只有反馈和验收结果。
+-6. **基准使用固定 1,000 条任务**：衡量权重恢复，不是完全未见过任务的泛化；可继续扩展 rolling test。
+-7. **基准 `collaborative` 仍为 0**：`BenchmarkRecommender` 尚未接入 ItemCF，Task 21 处理；因此基准的协同维度当前不可解释，不能据此判断 ItemCF 效果。
++6. **1,000 任务基准是固定数据**：衡量权重恢复，不是完全未见过任务的泛化；Task 21 的 10,000 任务大规模基准提供独立的 strict train-only 评估。
++7. **1,000 任务基准 `collaborative` 仍为 0**：`BenchmarkRecommender` 未接入 ItemCF；10,000 任务大规模基准虽接入 strict train-only ItemCF，但测试任务冷启动，collab 仍为 0。两者都不能用来宣称协同特征有效。
+ 8. **校准不改变排序**：`P(rating>=4)` 只用于报告可解释性；排序仍由七维线性分数决定。
++9. **端到端延迟护栏未测量**：严格评估只测进程内打分时间，HTTP `/recommend/*` 端点延迟标记为 N/A；不能把打分时间当作端点 p95。
+ 
+ ---
+ 
+ ## 7. 关键代码索引
+ 
+ | 模块 | 文件 |
+ |---|---|
+ | 推荐编排 / 硬约束 / 排序 | `app/service.py` |
+ | 七维特征 / 融合 | `app/features.py` |
+ | 信誉 / 违约 | `app/reputation.py` |
+
+--- a/frontend\app.js
++++ b/frontend\app.js
+@@ -102,20 +102,46 @@
+     data = text;
+   }
+   if (!response.ok) {
+     let detail = data && data.detail ? data.detail : `${response.status} ${response.statusText}`;
+     if (Array.isArray(detail)) {
+       detail = detail.map((item) => item.msg || JSON.stringify(item)).join("; ");
+     }
+     throw new Error(detail);
+   }
+   return data;
++}
++
++async function postRecommendationEvent(
++  requestId,
++  candidateId,
++  candidateType,
++  action,
++  extra = {}
++) {
++  if (!requestId) return;
++  try {
++    await api("/events", {
++      method: "POST",
++      body: JSON.stringify({
++        events: [{
++          request_id: requestId,
++          candidate_id: candidateId,
++          candidate_type: candidateType,
++          action,
++          ...extra,
++        }],
++      }),
++    });
++  } catch (error) {
++    // Duplicate or stale events must never break the demo flow.
++  }
+ }
+ 
+ async function apiForm(path, form) {
+   const response = await fetch(path, { method: "POST", body: form });
+   const text = await response.text();
+   let data = null;
+   try {
+     data = text ? JSON.parse(text) : null;
+   } catch {
+     data = text;
+@@ -1635,40 +1661,44 @@
+ 
+ async function runTaskRecommendations() {
+   const taskId = $("#t2w-task").value;
+   if (!taskId) return toast("请选择任务", "error");
+   const topN = Math.max(1, Number($("#t2w-topn").value || 5));
+   try {
+     const data = await api("/recommend/workers", {
+       method: "POST",
+       body: JSON.stringify({ task_id: taskId, top_n: topN, user_id: null }),
+     });
+-    renderCandidates($("#t2w-results"), data.candidates, "task", taskId);
++    renderCandidates($("#t2w-results"), data.candidates, "task", taskId, {
++      requestId: data.request_id,
++    });
+     $("#t2w-adopt").innerHTML = "";
+     if (!data.candidates.length) {
+       toast("没有符合条件的候选人", "error");
+     }
+   } catch (error) {
+     toast(error.message, "error");
+   }
+ }
+ 
+ async function runWorkerRecommendations() {
+   const workerId = $("#w2t-worker").value;
+   if (!workerId) return toast("请选择 Worker", "error");
+   const topN = Math.max(1, Number($("#w2t-topn").value || 5));
+   try {
+     const data = await api("/recommend/tasks", {
+       method: "POST",
+       body: JSON.stringify({ worker_id: workerId, top_n: topN, user_id: null }),
+     });
+-    renderCandidates($("#w2t-results"), data.candidates, "worker", workerId);
++    renderCandidates($("#w2t-results"), data.candidates, "worker", workerId, {
++      requestId: data.request_id,
++    });
+     $("#w2t-adopt").innerHTML = "";
+     if (!data.candidates.length) {
+       toast("没有符合条件的任务", "error");
+     }
+   } catch (error) {
+     toast(error.message, "error");
+   }
+ }
+ 
+ function renderCandidates(container, candidates, mode, queryId, options = {}) {
+@@ -1715,55 +1745,89 @@
+       ? `<strong>${esc(candidateTask.title)}</strong>
+          <span class="candidate-sub">${fmtMoney(candidateTask.budget_min)}–${fmtMoney(candidateTask.budget_max)} · 截止 ${fmtDate(candidateTask.deadline)}</span>`
+       : candidateWorker
+         ? `<strong>${esc(candidateWorker.name || candidateWorker.worker_id)}</strong>
+            <span class="candidate-sub">${esc(REGION_LABELS[candidateWorker.region] || candidateWorker.region)} · L${candidateWorker.level}</span>`
+         : `<strong>${esc(candidate.candidate_id)}</strong>`;
+     const allowAdopt = options.allowAdopt !== false;
+     const adoptButton = allowAdopt
+       ? '<button class="btn primary adopt-btn">采纳并评分</button>'
+       : "";
++    const rejectButton = allowAdopt
++      ? '<button class="btn danger-ghost reject-btn">不感兴趣</button>'
++      : "";
++    // ``mode`` is the recommendation query type; the candidate is the other
++    // side: task -> workers recommends workers, worker -> tasks recommends tasks.
++    const candidateType = mode === "task" ? "worker" : "task";
++    const requestId = options.requestId || "";
+     card.innerHTML = `
+       <div class="candidate-head">
+         <span class="rank">#${index + 1}</span>
+         ${heading}
+         <span class="score">${fmt(candidate.score)}</span>
+       </div>
+       <div class="badges">${badges.join("") || '<span class="badge">常规候选</span>'}</div>
+       <div class="breakdown">${bars}</div>
+       <div class="reasons">${reasons}</div>
+-      ${adoptButton}`;
++      <div class="candidate-actions">${adoptButton}${rejectButton}</div>`;
++    card.querySelector(".candidate-head").addEventListener("click", () => {
++      postRecommendationEvent(
++        requestId,
++        candidate.candidate_id,
++        candidateType,
++        "click"
++      );
++    });
+     if (allowAdopt) {
+       card.querySelector(".adopt-btn").addEventListener("click", () =>
+-        adoptCandidate(mode, queryId, candidate)
++        adoptCandidate(mode, queryId, candidate, requestId)
+       );
++      card.querySelector(".reject-btn").addEventListener("click", async () => {
++        await postRecommendationEvent(
++          requestId,
++          candidate.candidate_id,
++          candidateType,
++          "reject"
++        );
++        card.classList.add("rejected");
++        toast("已记录不感兴趣");
++      });
+     }
+     container.appendChild(card);
+   });
+ }
+ 
+-async function adoptCandidate(mode, queryId, candidate) {
++async function adoptCandidate(mode, queryId, candidate, requestId = "") {
+   const taskId = mode === "task" ? queryId : candidate.candidate_id;
+   const workerId = mode === "task" ? candidate.candidate_id : queryId;
+   const task = state.tasks.find((item) => item.task_id === taskId);
+   try {
++    const candidateType = mode === "task" ? "worker" : "task";
++    await postRecommendationEvent(
++      requestId,
++      candidate.candidate_id,
++      candidateType,
++      "apply"
++    );
+     const assignment = await api("/assignments", {
+       method: "POST",
+       body: JSON.stringify({
+         task_id: taskId,
+         worker_id: workerId,
+         customer_id: task ? task.customer_id : "c0001",
+         recommendation_context: {
+           score: candidate.score,
+           rank: 1,
+           propensity: candidate.propensity ?? 1.0,
+           weights_version: state.weights ? state.weights.version : "v0000",
++          // Required for the server-side auto-accept event.
++          request_id: requestId,
+         },
+       }),
+     });
+     state.pendingAdopt = {
+       assignmentId: assignment.assignment_id,
+       taskId,
+       workerId,
+     };
+     const slot = mode === "task" ? $("#t2w-adopt") : $("#w2t-adopt");
+     renderFeedbackBox(slot, assignment.assignment_id, `${taskId} → ${workerId}`);
+
+--- a/frontend\styles.css
++++ b/frontend\styles.css
+@@ -184,21 +184,24 @@
+ .candidate-head .score { margin-left: auto; font-family: var(--mono); font-size: 18px; color: var(--accent-2); }
+ .rank { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+ .badges { display: flex; gap: 6px; flex-wrap: wrap; margin: 9px 0; }
+ .badge { font-size: 10px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+ .badge.warn { color: var(--amber); border-color: rgba(255, 180, 84, .35); background: rgba(255, 180, 84, .08); }
+ .badge.cold { color: var(--violet); border-color: rgba(167, 139, 250, .35); background: rgba(167, 139, 250, .08); }
+ .badge.explore { color: var(--accent-2); border-color: rgba(57, 210, 192, .35); background: rgba(57, 210, 192, .08); }
+ .breakdown { display: grid; gap: 7px; margin: 12px 0; }
+ .reasons { display: flex; flex-wrap: wrap; gap: 6px; }
+ .reason { color: var(--muted); font-size: 11px; background: rgba(147, 170, 220, .07); padding: 4px 8px; border-radius: 7px; }
+-.adopt-btn { margin-top: 12px; width: 100%; }
++.candidate-actions { display: flex; gap: 8px; margin-top: 12px; }
++.adopt-btn { flex: 1; }
++.reject-btn { flex: 0 0 auto; }
++.rejected { opacity: .55; }
+ .empty { color: var(--faint); padding: 26px; text-align: center; border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); }
+ 
+ .task-preview { margin-bottom: 16px; }
+ .task-preview-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+ .task-preview-head h3 { margin: 0 0 6px; font-size: 18px; }
+ .task-meta { color: var(--muted); font-size: 12px; line-height: 1.6; }
+ .task-budget { text-align: right; white-space: nowrap; }
+ .task-budget strong { display: block; color: var(--accent-2); font-size: 18px; }
+ .task-budget small { color: var(--faint); font-size: 11px; }
+ .task-desc { color: var(--muted); line-height: 1.7; margin: 12px 0; }
+
+--- a/README.md
++++ b/README.md
+@@ -34,31 +34,40 @@
+ - **计划版本与回滚**：`GET /chains/{id}/plans`、`POST /chains/{id}/plan/rollback`。
+ - **自动重规划**：`POST /chains/{id}/replan` 锁定已完成节点，只重算受影响部分，并生成新计划版本。
+ - **Phase 2 清理**：重复分配 409、上下文校验 422、权重版本校验/原子写、投影幂等与信誉最大、分领域评分写入、ItemCF 反馈过滤、ground-truth 脚本。
+ - **明确不做 LLM**：没有 LLM 客户端、提示词或 token 依赖。
+ 
+ ## 推荐机制改进（事件、选择学习、严格评估）
+ 
+ - **事件采集**：`POST /events` 记录 `click` / `apply` / `accept` / `reject` / `ignore`，事件写入 `RecommendationEvent`；`GET /events/metrics` 返回曝光、点击、申请、接受、拒绝、忽略与漏斗转化率。推荐接口返回 `request_id`，事件必须能回溯到对应 `Impression`，重复事件返回 409。
+ - **精确 propensity**：`Impression` 保存每个候选的 logging **包含概率**（inclusion probability），不是“是否被探索”的标记。设候选池大小为 `N`、返回 `K = min(k, N)`、探索率为 `ε`、探索池大小为 `N-K+1`：top-(K-1) 的 `p=1.0`；第 K 名 `p=(1-ε)+ε/(N-K+1)`；第 K 名之后（tail）`p=ε/(N-K+1)`。当 `N<=K` 时全部为 `1.0`。事件和采纳记录都带上该 propensity，供 IPS/SNIPS 评估。
+ - **选择学习**：pairwise / listwise 选择学习只估计七维线性权重，不训练新的排序模型；排序器仍然是七维线性加权融合（`score = Σ weight_i × feature_i`），没有黑盒模型。
+-- **严格评估**：`scripts/evaluate_strict.py` 用 train-only Store 构造特征；test 数据只用于评分（给 test 查询排序、计算 HR/NDCG/MRR）和校准评估标签（`rating>=4`），不参与特征构造或权重学习。报告 `HR@k`、`NDCG@k`、`MRR@k`、配对 bootstrap 95% CI、约束违规数、冷启动可用性、延迟，以及校准后的 `P(rating>=4)` 的 Brier 分数与可靠性分箱。
++- **严格评估（serving-parity）**：`scripts/evaluate_strict.py` 用 train-only Store 构造特征，并在每个 seed 内拟合与 `create_app` 相同的 `SemanticMatcher`（worker/task 文本）和 `AcceptanceModel`（train accept/reject 事件），注入 baseline、candidate 与验证服务；报告 JSON 的 `serving_features.parity="serving"`。test 数据只用于评分（给 test 查询排序、计算 HR/NDCG/MRR）和校准评估标签（`rating>=4`），不参与特征构造或权重学习。报告 `HR@k`、`NDCG@k`、`MRR@k`、配对 bootstrap 95% CI、约束违规数、冷启动可用性、校准后的 `P(rating>=4)` Brier 分数与可靠性分箱。延迟字段 `scoring_latency_p50_ms/p95_ms` 是**进程内打分时间**，不是 HTTP 端点延迟；`endpoint_latency.guardrail` 明确标记为 `N/A`，不冒充 2× 端点护栏。
+ - **离线泄漏隔离**：`candidate_mode="exposed"` 只使用 test impressions 定义候选集；test impressions 不写入 Store，也不进入特征/训练代码。train-only Store 负责所有特征与 ItemCF 输入。
+ 
++**规范（canonical）调优证据**：先跑 `scripts/tune_weights.py`（验证集调参 + 5 seed 严格测试），再把 `weights_choice.json` 激活为 WeightStore 版本：
++
++```bash
++python scripts/tune_weights.py --seeds 42,43,44,45,46 --k 10
++python scripts/activate_weights.py --input data/weights/weights_choice.json
++```
++
++调优结果写入 `reports/strict_eval_tuned.json` / `reports/strict_eval_tuned.md`，这是准确率目标的规范证据；`data/weights/active.json` 指向被激活的 tuned 版本。通用严格评估仍可显式传入候选权重：
++
+ ```bash
+ python scripts/evaluate_strict.py --seeds 42,43,44,45,46 --k 10 \
+-  --candidate-weights data/weights/weights_v0007.json
+-```
+-
+-必须传真实学习权重；不传 `--candidate-weights` 时脚本会退回 baseline/active 权重，可能得到 identity 报告（`baseline_equals_candidate: true`），并覆盖已发布的报告。结果写入 `reports/strict_eval.json` 与 `reports/strict_eval.md`。JSON 中冷启动字段为 `cold_start.available`、`cold_start.reason`、`cold_start.queries`、`cold_start.measured`；只有 `available` 为 true 且 `queries > 0` 时 `measured` 才为 true，否则报告中标记 N/A，不冒充通过的护栏。若有效权重与基线相同（含浮点容差），报告显示 `baseline_equals_candidate: true`，不宣称提升。
+-
+-> 基准说明：`app/benchmark/recommender.py` 目前没有传入 ItemCF，因此 1000 任务基准中的 `collaborative` 维度仍恒为 0，直到 Task 21 接入 ItemCF。主推荐链路的 ItemCF 不受影响。
++  --candidate-weights data/weights/weights_choice.json
++```
++
++不传 `--candidate-weights` 时脚本会使用 active 权重；若 active 与 baseline 相同，会得到 identity 报告（`baseline_equals_candidate: true`），且不宣称提升。JSON 中冷启动字段为 `cold_start.available`、`cold_start.reason`、`cold_start.queries`、`cold_start.measured`；只有 `available` 为 true 且 `queries > 0` 时 `measured` 才为 true，否则报告中标记 N/A。
++
++> 基准边界：**1,000 任务对答案基准**的 `collaborative` 维度仍恒为 0（`BenchmarkRecommender` 没有接入 ItemCF），不能据此判断协同效果。**Task 21 的 10,000 任务大规模基准**（1,000 workers / 100,000 assignments，80/20 时间切分）单独接入 strict train-only ItemCF：它只使用训练期分配，测试任务在 ItemCF 中冷启动，因此报告中的 strict Top-1 低于旧的非严格数字；两者不可混用。见 `reports/large_benchmark_eval.md`。
+ 
+ ## 验收闭环（B2B 调研 P0）
+ 
+ 第一版只支持 `consulting_research` 任务，把“什么算完成”写成 10 条可执行标准：
+ 
+ | 标准 | 层 | 硬门槛 | 权重 |
+ |---|---|---|---|
+ | 市场规模 / 客户细分 / 竞争格局 / 进入建议章节 | 机器 | 是 | 各 0.08 |
+ | 至少 8 个来源，含 URL 与日期 | 机器 | 是 | 0.15 |
+ | 数据表含市场/规模/CAGR/来源 | 机器 | 是 | 0.10 |
+@@ -88,33 +97,54 @@
+ - **遗忘答案**：只清推荐缓存，不清学到的权重；因此下一轮必须靠泛化，不能靠记住上一轮答案。
+ 
+ 10 轮结果（`reports/benchmark_rounds.md`，2026-11-14 重新基线）：
+ 
+ | 轮次 | Top-1 | Top-5 | 测试 Top-1 |
+ |---|---|---|---|
+ | 1 | 0.367 | 0.872 | 0.365 |
+ | 5 | 0.530 | 0.953 | 0.545 |
+ | 10 | 0.568 | 0.946 | 0.580 |
+ 
+-> 这是 Task 3 新特征与 Task 14 基准特征改动后的新基线。第 1 轮 Top-1 `0.367` 是 fresh baseline，第 10 轮 `0.568` 不低于它；但第 10 轮绝对值 `0.568` **低于历史 R10 的 `0.731`（-0.163）**，历史数字来自旧数据/旧特征，不能与本次直接比较，也不应宣称已恢复到历史水平。`collaborative` 维度在基准中仍恒为 0（`BenchmarkRecommender` 尚未接入 ItemCF），Task 21 会修复；因此本轮权重变化中的 `collaborative` 不代表协同特征有效。
++> 这是 Task 3 新特征与 Task 14 基准特征改动后的新基线。第 1 轮 Top-1 `0.367` 是 fresh baseline，第 10 轮 `0.568` 不低于它；但第 10 轮绝对值 `0.568` **低于历史 R10 的 `0.731`（-0.163）**，历史数字来自旧数据/旧特征，不能与本次直接比较，也不应宣称已恢复到历史水平。**1,000 任务基准的 `collaborative` 仍恒为 0**（`BenchmarkRecommender` 没有接入 ItemCF），因此本轮权重变化中的 `collaborative` 不代表协同特征有效。Task 21 新增的 **10,000 任务大规模基准**单独接入 strict train-only ItemCF（测试任务冷启动，collab=0），见 `reports/large_benchmark_eval.md`；它不替代本节的 1,000 任务对答案基准。
+ 
+ 脚本：
+ 
+ ```bash
+ python scripts/build_benchmark.py
+ python scripts/run_benchmark_rounds.py --rounds 10
+ python scripts/plot_benchmark.py
+ ```
+ 
+ 可视化产物：`reports/benchmark_curve.png/svg`（浅色）、`benchmark_curve_dark.png/svg`（深色）、`reports/benchmark_visual.md`。
+ 
+ 接口：`GET /benchmark/summary`、`POST /benchmark/run?rounds=5`。前端「对答案学习」标签页可一键跑 5 轮并看曲线。
++
++## 10,000 任务大规模基准（strict train-only ItemCF）
++
++`scripts/build_large_benchmark.py` 生成 1,000 名 workers、10,000 个自然语言任务、100,000 条历史分配与 500 个客户，80/20 时间切分，写入 SQLite + JSONL。评估严格只使用训练期分配：ItemCF 图不包含测试交互，测试任务在协同维度上冷启动（`collaborative=0`），因此 Top-1 低于旧的非严格数字属于预期，不应与 1,000 任务基准混用。
++
++```bash
++python scripts/build_large_benchmark.py
++python scripts/evaluate_large_benchmark.py
++```
++
++报告：`reports/large_benchmark_stats.md`、`reports/large_benchmark_eval.md`。规模统计会校验无完全重复任务、resume 结构完整与 train/test 交互隔离。
++
++## 调优权重（choice-tuned）
++
++`scripts/tune_weights.py` 只在 train 的最后 20% 验证集上做坐标搜索，严格测试集只用于最终评分；候选权重结合评分 batch fit 与 pairwise choice learning，并投影回七维权重约束。`scripts/activate_weights.py` 将 `data/weights/weights_choice.json` 写成 WeightStore 版本并激活；当前激活版本为 `v0008`（choice-tuned），`data/weights/active.json` 指向它。规范证据是 `reports/strict_eval_tuned.md`（不是旧的 `strict_eval.md`）；若 5 seed 严格测试未达目标，报告必须写 **NOT MET**，不得把 identity 报告或单次点估计当作成功。
++
++2026-11-14 serving-parity 复跑（5 seeds，`reports/strict_eval_tuned.md`）：worker→tasks HR@10 `0.0637 → 0.2070`（+14.33pp，95% CI `[+0.1307, +0.1563]`），NDCG@10 `0.0258 → 0.0991`（+283.55%，CI `[+0.0671, +0.0796]`）；task→workers HR +0.60pp / NDCG +0.21%（均值不劣化）；约束违规 0；校准 Brier 0.0323（raw 0.1186）；冷启动 N/A（无冷启动查询）。**目标 MET**。HTTP 端点延迟未测量，报告标记 N/A；进程内打分 p50/p95 为 9.53/19.86 ms，不能当作端点延迟。此前基于 `weights_v0007.json` 的 **NOT MET** 报告已被本次 tuned 证据取代。
++
++## 文档上传（任务文档 / 简历）
++
++`POST /upload/task`、`POST /upload/resume` 与 `POST /resume/analyze`（粘贴文本）把上传内容解析成 draft，只做语义分析与 Top-N，不写入 Store。支持 `.txt` / `.md` / `.pdf` / `.docx`，上传体在 multipart 解析前由 ASGI 中间件限制为 10 MB；PDF/DOCX 在交给可选解析器前先做解压边界检查（ZIP 条目/压缩比、PDF 流声明长度与 Flate 解压上限），避免压缩炸弹。缺少 `pypdf` / `python-docx` 时返回清晰的 422，不影响文本格式。
+ 
+ ## 简历视图：把技能数据包装成真实候选人
+ 
+ `app/resume.py` 把内部 `Worker` 记录转成一份可展示的简历，所有姓名、公司、项目均为合成数据：
+ 
+ - **表面**：姓名、职位标题、城市、经验年限、学历、个人简介、完成项目数、客户评分、按时交付率、工作经历、项目经历、技能标签、证书。
+ - **隐藏**：内部技能分、等级、容量/负载、专长分、评分明细、返工/违约、分类评分。默认折叠，前端「人才库」页点“查看平台原始数据”才展开。
+ - 简历按 `worker_id` 确定性生成，同一 worker 每次内容一致。
+ - 表面技能标签使用中文业务标签（如“市场进入”“竞品分析”），不暴露内部 key（如 `research`）。
+ 
+@@ -146,22 +176,22 @@
+ python scripts/run_demo.py
+ ```
+ 
+ 服务默认监听 `127.0.0.1:8000`。浏览器打开 **`http://127.0.0.1:8000/ui/`** 即可使用前端演示。
+ 
+ ## 前端演示
+ 
+ 前端是**无构建的静态 SPA**，由 FastAPI 在 `/ui/` 托管，不需要 Node 构建：
+ 
+ - **概览**：Worker/任务数量、当前权重版本、七维权重、进步曲线（200 用户 cohort 的权重恢复 cosine + NDCG）。
+-- **任务 → 人**：选择任务后先展示真实需求卡片（标题、正文、合作方要求、预算、日期），再给出 Top-N 候选人、分数拆解、推荐理由、propensity → 采纳并提交客户评分。
+-- **人 → 任务**：选择 Worker → 推荐开放任务，候选卡片显示任务标题、预算与截止日期。
++- **任务 → 人**：选择任务后先展示真实需求卡片（标题、正文、合作方要求、预算、日期），再给出 Top-N 候选人、分数拆解、推荐理由、propensity → 点击/申请/不感兴趣事件上报，采纳时把 `request_id` 写入 `recommendation_context`（服务端据此记录 accept）→ 提交客户评分。
++- **人 → 任务**：选择 Worker → 推荐开放任务，候选卡片显示任务标题、预算与截止日期；同样复用 `request_id` 与 `/events` 漏斗。
+ - **人才库**：以真实简历样式展示候选人；技能分、负载、信誉明细默认隐藏，可切换到平台原始数据。
+ - **反馈与权重**：新用户 onboarding、个人权重、学习曲线、进步曲线、全局权重 diff、重估、回滚、学习日志。
+ - **任务链**：单模板/多模板组合拆解、节点表、关键路径、计划、计划版本回滚、自动重规划、节点状态锁定。
+ - **验收闭环**：加载 B2B 调研任务 → 提交合格/缺章节交付物 → 机器校验 → 同行/客户评分 → 接受/返工/驳回 → 查看权重变化和执行者能力。
+ - **对答案学习**：一键跑 5 轮，查看 Top-1/Top-5/测试集 Top-1 曲线和逐轮权重更新。
+ - **评委演示**：一键跑通「推荐 → 采纳 → 评分 → 权重 diff → 拆解 → 计划 → 重规划 → 回滚」。
+ - **新用户成长**：同一任务、同一用户，对比 A/B 初始偏好；再提交与初始选择相反的反馈，观察权重向真实偏好修正。
+ - **20 轮对照实验**：每轮 50 次客户选择，学习组 vs 不学习组的 Top-1/Top-5 准确率曲线。
+ 
+ 前端文件：`frontend/index.html`、`frontend/styles.css`、`frontend/app.js`；根路径 `/` 会 302 到 `/ui/`。
+@@ -170,21 +200,21 @@
+ curl http://127.0.0.1:8000/health
+ ```
+ 
+ ## 测试
+ 
+ ```bash
+ cd generated/task-recommender
+ python -m pytest tests/ -q
+ ```
+ 
+-当前 244 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、事件/曝光/漏斗、选择学习与权重绑定、严格评估与校准、文档约定、前端静态托管、API 冒烟。
++当前 386 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、文档上传与解压边界、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、10,000 任务大规模 strict 基准、事件/曝光/漏斗（标签派生、批量/体积上限）、选择学习与权重绑定、serving-parity 严格评估与校准、调优权重激活、文档约定、前端静态托管、API 冒烟。
+ 
+ ## 离线评估
+ 
+ ```bash
+ cd generated/task-recommender
+ python scripts/evaluate.py
+ ```
+ 
+ 结果写入 `reports/phase1_metrics.json`。本次运行（seed=42）：
+ 
+@@ -269,20 +299,23 @@
+ | 方法 | 路径 | 说明 |
+ |---|---|---|
+ | GET | `/health` | 健康检查 |
+ | GET | `/workers` | worker 列表 |
+ | GET | `/workers/{id}` | worker 详情 |
+ | GET | `/resumes` | 简历列表（仅表面信息） |
+ | GET | `/workers/{id}/resume` | 简历 + 平台原始数据 |
+ | GET | `/tasks` | 任务列表 |
+ | GET | `/tasks/{id}` | 任务详情 |
+ | POST | `/classify` | 自然语言任务分类 + 字段抽取（无 LLM） |
++| POST | `/upload/task` | 任务文档上传 → 语义分析 → draft + Top-N workers（不落库） |
++| POST | `/upload/resume` | 简历文档上传 → 画像 draft + Top-N tasks（不落库） |
++| POST | `/resume/analyze` | 粘贴简历文本 → 画像 draft + Top-N tasks（不落库） |
+ | POST | `/events` | 记录曝光后的 click/apply/accept/reject/ignore 事件 |
+ | GET | `/events/metrics` | 事件漏斗指标（曝光、点击、接受、拒绝、忽略） |
+ | GET | `/acceptance/demo` | B2B 调研验收演示任务 + 标准 + 示例交付物 |
+ | POST | `/acceptance/demo/learning?rounds=5` | 连续验收并返回权重漂移 + Top-5 排序变化 |
+ | GET | `/acceptance/metrics` | 平台验收指标 |
+ | GET | `/benchmark/summary` | 1000 任务基准的元数据与逐轮结果 |
+ | POST | `/benchmark/run?rounds=5` | 跑对答案学习轮次 |
+ | GET | `/tasks/{id}/acceptance-spec` | 任务验收标准 |
+ | POST | `/tasks/{id}/submissions` | 提交交付物并跑机器校验 |
+ | POST | `/submissions/{id}/review` | 同行/客户评分 |
+
+--- a/scripts\activate_weights.py
++++ b/scripts\activate_weights.py
+@@ -0,0 +1,96 @@
++"""Create a WeightStore version from a raw weight JSON and activate it.
++
++``scripts/tune_weights.py`` writes ``data/weights/weights_choice.json`` but the
++serving app reads the active WeightStore version. This explicit activation step
++turns the tuned JSON into a normal versioned record (with prior, sample count,
++source, and changelog entry) and points ``active.json`` at it.
++
++Usage::
++
++    python scripts/activate_weights.py \
++        --input data/weights/weights_choice.json \
++        --source choice-tuned
++
++The input may be a bare seven-key mapping or a WeightStore payload containing
++a ``weights`` object.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from dataclasses import asdict
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++
++from app.config import DEFAULT_WEIGHTS  # noqa: E402
++from app.versioning import WeightStore  # noqa: E402
++
++
++def load_weights(path: Path) -> dict[str, float]:
++    payload = json.loads(path.read_text(encoding="utf-8"))
++    if isinstance(payload, dict) and isinstance(payload.get("weights"), dict):
++        payload = payload["weights"]
++    if not isinstance(payload, dict) or not payload:
++        raise ValueError("weights JSON must be a non-empty object")
++    return {str(key): float(value) for key, value in payload.items()}
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(
++        description="Version and activate a seven-key weight JSON file."
++    )
++    parser.add_argument(
++        "--input",
++        default=str(ROOT / "data" / "weights" / "weights_choice.json"),
++        help="raw weights JSON (default: weights_choice.json)",
++    )
++    parser.add_argument(
++        "--weights-dir",
++        default=str(ROOT / "data" / "weights"),
++        help="WeightStore directory",
++    )
++    parser.add_argument("--sample-count", type=int, default=0)
++    parser.add_argument("--source", default="choice-tuned")
++    args = parser.parse_args(argv)
++
++    try:
++        weights = load_weights(Path(args.input))
++    except (OSError, ValueError) as error:
++        print(f"error: cannot load weights: {error}", file=sys.stderr)
++        return 2
++
++    store = WeightStore(Path(args.weights_dir), prior=DEFAULT_WEIGHTS)
++    try:
++        version = store.create(
++            weights,
++            sample_count=args.sample_count,
++            source=args.source,
++        )
++    except ValueError as error:
++        print(f"error: invalid weights: {error}", file=sys.stderr)
++        return 2
++
++    print(
++        json.dumps(
++            {
++                "active_version": version.version,
++                "weights": version.weights,
++                "source": version.source,
++                "sample_count": version.sample_count,
++                "weights_dir": str(Path(args.weights_dir).resolve()),
++                "changelog": store.changelog()[-1],
++                "active": asdict(store.active()),
++            },
++            ensure_ascii=False,
++            indent=2,
++        )
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+
+--- a/scripts\evaluate_strict.py
++++ b/scripts\evaluate_strict.py
+@@ -242,20 +242,28 @@
+         + ("MEASURED" if cold_measured else "N/A (not measured)")
+         + f" (queries={cold_queries})"
+     )
+     calibration = result.get("calibration", {})
+     lines.append(
+         "- Calibration: "
+         + ("reported above (ranking unaffected)"
+            if calibration.get("available")
+            else "N/A (see calibration section)")
+     )
++    endpoint = result.get("endpoint_latency", {})
++    if endpoint.get("available"):
++        latency_line = "MEASURED"
++    elif endpoint:
++        latency_line = f"{endpoint['guardrail']} ({endpoint['reason']})"
++    else:
++        latency_line = "N/A (not measured)"
++    lines.append(f"- Latency guardrail: {latency_line}")
+     lines.append(
+         "- Benchmark re-baseline: see reports/benchmark_rounds.md"
+     )
+     return lines
+ 
+ 
+ def _render_markdown(
+     result: dict, weights: dict[str, float], source: str
+ ) -> str:
+     seeds = (
+@@ -273,23 +281,28 @@
+         f"- Seeds: {seeds}",
+         f"- k: {k}",
+         f"- Candidate source: {source}",
+         (
+             "- Candidate weights: "
+             f"{json.dumps(weights, ensure_ascii=False, sort_keys=True)}"
+         ),
+         f"- baseline_equals_candidate: {str(equal).lower()}",
+         f"- Constraint violations: {result['constraint_violations']}",
+         (
+-            "- Latency p50/p95: "
+-            f"{result['latency_p50_ms']:.4f} / "
+-            f"{result['latency_p95_ms']:.4f} ms"
++            "- In-process scoring p50/p95 (NOT HTTP endpoint latency): "
++            f"{result['scoring_latency_p50_ms']:.4f} / "
++            f"{result['scoring_latency_p95_ms']:.4f} ms"
++        ),
++        (
++            "- HTTP endpoint latency guardrail: "
++            f"{result['endpoint_latency']['guardrail']} "
++            f"({result['endpoint_latency']['reason']})"
+         ),
+     ]
+     if equal:
+         lines.extend(
+             [
+                 "",
+                 (
+                     "> **baseline_equals_candidate: true** — candidate "
+                     "weights are identical to the baseline; the deltas "
+                     "below are shown as n/a because they are zero by "
+@@ -500,22 +513,24 @@
+                 },
+                 "calibration": {
+                     "available": result["calibration"]["available"],
+                     "reason": result["calibration"]["reason"],
+                     "brier": result["calibration"]["brier"],
+                     "raw_brier": result["calibration"]["raw_brier"],
+                 },
+                 "constraint_violations": result[
+                     "constraint_violations"
+                 ],
+-                "latency_p50_ms": result["latency_p50_ms"],
+-                "latency_p95_ms": result["latency_p95_ms"],
++                "serving_features": result["serving_features"],
++                "scoring_latency_p50_ms": result["scoring_latency_p50_ms"],
++                "scoring_latency_p95_ms": result["scoring_latency_p95_ms"],
++                "endpoint_latency": result["endpoint_latency"],
+                 "reports": [
+                     str(out_dir / "strict_eval.json"),
+                     str(out_dir / "strict_eval.md"),
+                 ],
+             },
+             ensure_ascii=False,
+             indent=2,
+         )
+     )
+     return 0
+
+--- a/scripts\tune_weights.py
++++ b/scripts\tune_weights.py
+@@ -27,34 +27,34 @@
+ from app.config import DEFAULT_WEIGHTS  # noqa: E402
+ from app.data.synthetic import generate_dataset  # noqa: E402
+ from app.data.store import Store  # noqa: E402
+ from app.domain import Dataset, _split_by_assignment  # noqa: E402
+ from app.evaluation_strict import (  # noqa: E402
+     build_eval_store,
+     evaluate_strict,
+     task_to_workers_metrics,
+     worker_to_tasks_metrics,
+ )
+-from app.features import candidate_features  # noqa: E402
+ from app.learning.choice import (  # noqa: E402
+     NEGATIVE_ACTIONS,
+     POSITIVE_ACTIONS,
+     PairwiseChoiceLearner,
+     build_pairs,
+ )
+ from app.learning.online import OnlineWeightLearner  # noqa: E402
+ from app.learning.weights import (  # noqa: E402
+     AHP_PRIOR,
+     KEYS,
+     project_weights,
+ )
+ from app.service import RecommendationService  # noqa: E402
++from app.serving import serving_components  # noqa: E402
+ from scripts.evaluate_strict import (  # noqa: E402
+     _parse_seeds,
+     _render_markdown,
+ )
+ 
+ VALIDATION_FRACTION = 0.2
+ DEFAULT_BUDGET = 20
+ DEFAULT_EVAL_SEEDS = (42, 43, 44, 45, 46)
+ DEFAULT_K = 10
+ CHOICE_ACTIONS = POSITIVE_ACTIONS | NEGATIVE_ACTIONS
+@@ -105,53 +105,53 @@
+     return usable, features_by_event
+ 
+ 
+ def build_choice_candidate(dataset: Dataset, seed: int = 42) -> dict[str, float]:
+     """Build the choice-learned candidate from train data only.
+ 
+     ``seed`` is accepted for interface compatibility; every step here is
+     deterministic (no RNG is used), so the result is reproducible.
+     """
+     store = build_eval_store(dataset)
++    # Serving parity: both the rating fit and the choice-event features use the
++    # same semantic/acceptance components that ``create_app`` injects.
++    semantic_matcher, acceptance_model = serving_components(store)
++    service = RecommendationService(
++        store,
++        weights=AHP_PRIOR,
++        semantic_matcher=semantic_matcher,
++        acceptance_model=acceptance_model,
++    )
+ 
+     feedback_by_assignment = {
+         item.assignment_id: item for item in store.feedback
+     }
+     records = []
+     for assignment in store.assignments:
+         feedback = feedback_by_assignment.get(assignment.assignment_id)
+         if feedback is None:
+             continue
+         task = store.tasks.get(assignment.task_id)
+         worker = store.workers.get(assignment.worker_id)
+         if task is None or worker is None:
+             continue
+-        customer = store.customers.get(task.customer_id)
+-        if customer is None:
++        try:
++            features = service.features_for(
++                assignment.task_id, assignment.worker_id
++            )
++        except KeyError:
+             continue
+-        records.append(
+-            (
+-                candidate_features(
+-                    worker,
+-                    task,
+-                    customer,
+-                    cf_score=0.0,
+-                    now=store.reference_time,
+-                ),
+-                feedback.overall_rating,
+-            )
+-        )
++        records.append((features, feedback.overall_rating))
+ 
+     batch_learner = OnlineWeightLearner(AHP_PRIOR)
+     batch_weights = batch_learner.batch_fit(records, epochs=1)
+ 
+-    service = RecommendationService(store, weights=AHP_PRIOR)
+     usable, features_by_event = _choice_features(store.events, service)
+     pairs = build_pairs(
+         usable, lambda event: features_by_event[event.event_id]
+     )
+ 
+     merged = dict(batch_weights)
+     if pairs:
+         choice_weights = PairwiseChoiceLearner(prior=AHP_PRIOR).fit(pairs)
+         merged = {
+             key: 0.5 * merged[key] + 0.5 * choice_weights[key]
+@@ -199,22 +199,33 @@
+         feedback=fit_feedback,
+         events=fit_events,
+         impressions=fit_impressions,
+     )
+     return fit, validation, store
+ 
+ 
+ def _validation_metrics(
+     store: Store, validation_assignments, weights: dict[str, float]
+ ) -> dict:
+-    """Score one weight vector on the validation queries (primary directions)."""
+-    service = RecommendationService(store, weights=weights)
++    """Score one weight vector on the validation queries (primary directions).
++
++    Components are fitted once per fit store and reused across weight vectors,
++    so tuning evidence uses the same features as serving without refitting
++    TF-IDF/SVD on every candidate.
++    """
++    semantic_matcher, acceptance_model = serving_components(store)
++    service = RecommendationService(
++        store,
++        weights=weights,
++        semantic_matcher=semantic_matcher,
++        acceptance_model=acceptance_model,
++    )
+     return {
+         "task_to_workers": task_to_workers_metrics(
+             store, service, validation_assignments, k=DEFAULT_K
+         ),
+         "worker_to_tasks": worker_to_tasks_metrics(
+             store, service, validation_assignments, k=DEFAULT_K
+         ),
+     }
+ 
+ 
+@@ -469,22 +480,24 @@
+                     "reason": result["cold_start"]["reason"],
+                     "queries": result["cold_start"]["queries"],
+                     "measured": result["cold_start"]["measured"],
+                 },
+                 "calibration": {
+                     "available": result["calibration"]["available"],
+                     "reason": result["calibration"]["reason"],
+                     "brier": result["calibration"]["brier"],
+                     "raw_brier": result["calibration"]["raw_brier"],
+                 },
+-                "latency_p50_ms": result["latency_p50_ms"],
+-                "latency_p95_ms": result["latency_p95_ms"],
++                "serving_features": result["serving_features"],
++                "scoring_latency_p50_ms": result["scoring_latency_p50_ms"],
++                "scoring_latency_p95_ms": result["scoring_latency_p95_ms"],
++                "endpoint_latency": result["endpoint_latency"],
+                 "reports": [
+                     str(weights_path),
+                     str(report_dir / "strict_eval_tuned.json"),
+                     str(report_dir / "strict_eval_tuned.md"),
+                 ],
+             },
+             ensure_ascii=False,
+             indent=2,
+         )
+     )
+
+--- a/tests\test_activate_weights.py
++++ b/tests\test_activate_weights.py
+@@ -0,0 +1,64 @@
++"""Tests for the explicit tuned-weight activation command."""
++
++import json
++
++from app.config import DEFAULT_WEIGHTS
++from app.versioning import WeightStore
++from scripts import activate_weights as aw
++
++
++def test_activate_creates_version_and_points_active_at_it(tmp_path):
++    source = tmp_path / "weights_choice.json"
++    weights = {
++        "reputation": 0.367546550922,
++        "skill": 0.124367748878,
++        "expertise": 0.27845724286,
++        "collaborative": 0.034863927247,
++        "preference": 0.078898218881,
++        "load": 0.068106525956,
++        "customer_preference": 0.047759785256,
++    }
++    source.write_text(json.dumps(weights), encoding="utf-8")
++    weights_dir = tmp_path / "weights"
++
++    assert (
++        aw.main(
++            [
++                "--input",
++                str(source),
++                "--weights-dir",
++                str(weights_dir),
++                "--source",
++                "choice-tuned",
++            ]
++        )
++        == 0
++    )
++
++    store = WeightStore(weights_dir, prior=DEFAULT_WEIGHTS)
++    active = store.active()
++    assert active.source == "choice-tuned"
++    assert active.weights == weights
++    assert (weights_dir / f"weights_{active.version}.json").exists()
++    assert json.loads(
++        (weights_dir / "active.json").read_text(encoding="utf-8")
++    ) == {"active_version": active.version}
++
++
++def test_activate_rejects_invalid_simplex(tmp_path):
++    source = tmp_path / "bad.json"
++    bad = dict(DEFAULT_WEIGHTS)
++    bad["reputation"] = 0.99  # violates the 0.40 upper bound
++    source.write_text(json.dumps(bad), encoding="utf-8")
++
++    assert (
++        aw.main(
++            [
++                "--input",
++                str(source),
++                "--weights-dir",
++                str(tmp_path / "weights"),
++            ]
++        )
++        == 2
++    )
+
+--- a/tests\test_api_events.py
++++ b/tests\test_api_events.py
+@@ -1,11 +1,20 @@
+ import json
++from pathlib import Path
++
++import pytest
++
++from app.schemas import (
++    MAX_EVENT_METADATA_KEYS,
++    MAX_EVENTS_BODY_BYTES,
++    MAX_EVENTS_PER_BATCH,
++)
+ 
+ 
+ def test_recommend_returns_request_id_and_events_flow(client):
+     response = client.post("/recommend/workers", json={"task_id": "t1", "top_n": 3})
+     assert response.status_code == 200
+     body = response.json()
+     assert body["request_id"]
+     candidate = body["candidates"][0]["candidate_id"]
+     event = client.post(
+         "/events",
+@@ -241,20 +250,204 @@
+     stored = json.loads(binding_path.read_text(encoding="utf-8"))
+     assert stored == report
+     assert set(stored["min_hits"]) == set(report["min_hits"])
+     client.app.state.last_binding = None
+     binding = client.get("/weights/binding").json()
+     assert binding["available"] is True
+     assert binding["min_hits"] == report["min_hits"]
+     assert binding["iterations"] >= 1
+ 
+ 
++def test_events_reject_mismatched_target_labels_and_drop_extra_metadata(
++    client,
++):
++    body = client.post(
++        "/recommend/workers", json={"task_id": "t1", "top_n": 2}
++    ).json()
++    candidate = body["candidates"][0]["candidate_id"]
++    request_id = body["request_id"]
++
++    wrong_type = {
++        "events": [{
++            "request_id": request_id,
++            "candidate_id": candidate,
++            "candidate_type": "task",
++            "action": "click",
++        }]
++    }
++    assert client.post("/events", json=wrong_type).status_code == 409
++
++    wrong_task = {
++        "events": [{
++            "request_id": request_id,
++            "candidate_id": candidate,
++            "task_id": "t2",
++            "action": "apply",
++        }]
++    }
++    assert client.post("/events", json=wrong_task).status_code == 409
++
++    accepted = client.post(
++        "/events",
++        json={"events": [{
++            "request_id": request_id,
++            "candidate_id": candidate,
++            "task_id": "t1",
++            "action": "ignore",
++            "metadata": {"untrusted": "drop-me", "score": 0.5},
++        }]},
++    )
++    assert accepted.status_code == 200
++    stored = client.app.state.store.events[-1]
++    assert stored.candidate_type == "worker"
++    assert stored.task_id == "t1"
++    assert "untrusted" not in stored.metadata
++    assert stored.metadata["score"] == 0.5
++
++
++def test_worker_assignment_records_accept_only_for_matching_impression(
++    client,
++):
++    store = client.app.state.store
++    body = client.post(
++        "/recommend/workers", json={"task_id": "t1", "top_n": 3}
++    ).json()
++    candidate = next(
++        item["candidate_id"]
++        for item in body["candidates"]
++        if item["candidate_id"] != "w_other"
++    )
++    before = len(store.events)
++
++    # A different task with the same request_id must not manufacture an accept.
++    mismatched = client.post(
++        "/assignments",
++        json={
++            "task_id": "t2",
++            "worker_id": candidate,
++            "customer_id": "c1",
++            "recommendation_context": {"request_id": body["request_id"]},
++        },
++    )
++    assert mismatched.status_code == 200
++    assert len(store.events) == before
++
++    matched = client.post(
++        "/assignments",
++        json={
++            "task_id": "t1",
++            "worker_id": candidate,
++            "customer_id": "c1",
++            "recommendation_context": {"request_id": body["request_id"]},
++        },
++    )
++    assert matched.status_code == 200
++    stored = store.events[-1]
++    assert stored.action == "accept"
++    assert stored.candidate_type == "worker"
++    assert stored.task_id == "t1"
++    assert stored.candidate_id == candidate
++    assert stored.role == "customer"
++
++
++def test_events_batch_metadata_and_body_are_bounded(client):
++    events = [
++        {"request_id": "r", "candidate_id": "w", "action": "click"}
++    ] * (MAX_EVENTS_PER_BATCH + 1)
++    assert client.post("/events", json={"events": events}).status_code == 422
++
++    metadata = {f"key{i}": "value" for i in range(MAX_EVENT_METADATA_KEYS + 1)}
++    oversized_metadata = {
++        "events": [{
++            "request_id": "r",
++            "candidate_id": "w",
++            "action": "click",
++            "metadata": metadata,
++        }]
++    }
++    assert (
++        client.post("/events", json=oversized_metadata).status_code == 422
++    )
++
++    oversized_body = json.dumps(
++        {"events": [], "padding": "x" * (MAX_EVENTS_BODY_BYTES + 64)}
++    )
++    response = client.post(
++        "/events",
++        content=oversized_body,
++        headers={"content-type": "application/json"},
++    )
++    assert response.status_code == 413
++
++
++def test_recommend_reuses_cached_service_and_invalidates_on_assignment(
++    client,
++):
++    body = client.post(
++        "/recommend/workers", json={"task_id": "t1", "top_n": 2}
++    ).json()
++    first = client.app.state.service_cache[1]
++    client.post("/recommend/workers", json={"task_id": "t1", "top_n": 2})
++    assert client.app.state.service_cache[1] is first
++
++    candidate = body["candidates"][0]["candidate_id"]
++    client.post(
++        "/assignments",
++        json={
++            "task_id": "t1",
++            "worker_id": candidate,
++            "customer_id": "c1",
++        },
++    )
++    client.post("/recommend/workers", json={"task_id": "t1", "top_n": 2})
++    assert client.app.state.service_cache is not None
++    assert client.app.state.service_cache[1] is not first
++
++
++def test_feedback_updates_live_communication_signal(client):
++    assignment = client.post(
++        "/assignments",
++        json={
++            "task_id": "t2",
++            "worker_id": "w_new",
++            "customer_id": "c1",
++        },
++    ).json()
++    store = client.app.state.store
++    worker = store.workers["w_new"]
++    from app.service import RecommendationService
++
++    service = RecommendationService(store)
++    assert service._communication(worker) == pytest.approx(0.5)
++
++    response = client.post(
++        "/feedback",
++        json={
++            "assignment_id": assignment["assignment_id"],
++            "overall_rating": 5,
++            "communication_rating": 1,
++        },
++    )
++    assert response.status_code == 200
++    assert worker.communication_ratings[-1] == pytest.approx(1.0)
++    assert service._communication(worker) == pytest.approx(0.2)
++
++
++def test_frontend_recommendation_flow_uses_request_id_and_events():
++    text = Path("frontend/app.js").read_text(encoding="utf-8")
++    assert "postRecommendationEvent" in text
++    assert "request_id: requestId" in text
++    assert '"/events"' in text
++    assert '"apply"' in text
++    assert '"reject"' in text
++
++
+ def test_assignment_succeeds_after_duplicate_accept_event(client):
+     response = client.post(
+         "/recommend/workers", json={"task_id": "t1", "top_n": 3}
+     )
+     body = response.json()
+     candidate = body["candidates"][0]["candidate_id"]
+     accept = client.post(
+         "/events",
+         json={"events": [{
+             "request_id": body["request_id"],
+
+--- a/tests\test_docs.py
++++ b/tests\test_docs.py
+@@ -1,30 +1,78 @@
++import re
+ from pathlib import Path
+ 
+ 
++def _readme() -> str:
++    return Path("README.md").read_text(encoding="utf-8")
++
++
++def _flow() -> str:
++    return Path("docs/recommendation-flow.md").read_text(encoding="utf-8")
++
++
+ def test_readme_documents_events_and_strict_eval():
+-    text = Path("README.md").read_text(encoding="utf-8")
++    text = _readme()
+     assert "/events" in text
+     assert "evaluate_strict.py" in text
+     assert "strict_eval" in text
+ 
+ 
+ def test_flow_doc_documents_events_and_propensity():
+-    text = Path("docs/recommendation-flow.md").read_text(encoding="utf-8")
++    text = _flow()
+     assert "RecommendationEvent" in text
+     assert "propensity" in text
+     assert "strict" in text.lower()
+ 
+ 
+ def test_docs_state_exact_propensity_command_and_cold_fields():
+-    readme = Path("README.md").read_text(encoding="utf-8")
+-    flow = Path("docs/recommendation-flow.md").read_text(encoding="utf-8")
++    readme = _readme()
++    flow = _flow()
+     for text in (readme, flow):
+         assert "N-K+1" in text or "N - K + 1" in text
+         assert "cold_start.queries" in text
+         assert "cold_start.measured" in text
+-    assert (
+-        "--candidate-weights data/weights/weights_v0007.json" in readme
+-    )
+-    assert (
+-        "--candidate-weights data/weights/weights_v0007.json" in flow
+-    )
++    for text in (readme, flow):
++        assert "scripts/tune_weights.py" in text
++        assert "scripts/activate_weights.py" in text
++        assert "weights_choice.json" in text
++        assert "strict_eval_tuned" in text
++        assert "active.json" in text
++
++
++def test_docs_describe_serving_parity_and_endpoint_latency_boundary():
++    for text in (_readme(), _flow()):
++        assert "serving" in text.lower()
++        assert "endpoint_latency" in text or "端点" in text
++        assert "N/A" in text
++        assert "scoring_latency" in text or "进程内打分" in text
++
++
++def test_docs_distinguish_benchmarks_and_train_only_collaborative():
++    readme = _readme()
++    flow = _flow()
++    for text in (readme, flow):
++        assert "collaborative" in text
++        assert "1,000" in text or "1000" in text
++        assert "10,000" in text or "10000" in text
++        assert "train-only" in text or "训练期" in text
++    assert "large_benchmark_eval.md" in readme
++
++
++def test_readme_documents_upload_and_nlp_final_work():
++    text = _readme()
++    for token in (
++        "/upload/task",
++        "/upload/resume",
++        "/resume/analyze",
++        "build_large_benchmark.py",
++        "scripts/tune_weights.py",
++        "reports/strict_eval_tuned.md",
++        "Flate",
++    ):
++        assert token in text
++
++
++def test_readme_test_count_is_current():
++    match = re.search(r"当前 (\d+) 个测试", _readme())
++    assert match is not None
++    assert int(match.group(1)) >= 360
+
+--- a/tests\test_events.py
++++ b/tests\test_events.py
+@@ -371,10 +371,139 @@
+         json.loads(line)
+         for line in (tmp_path / "events.jsonl")
+         .read_text(encoding="utf-8")
+         .splitlines()
+     ]
+     reject_line = next(line for line in lines if line["action"] == "reject")
+     assert reject_line["candidate_id"] == "w2"
+     assert reject_line["rank"] == 2
+     assert reject_line["propensity"] == pytest.approx(0.2)
+     assert reject_line["weights_version"] == "7"
++
++
++def test_event_labels_come_from_impression_and_mismatches_are_rejected():
++    store = Store(
++        workers=[_worker()], customers=[], tasks=[], assignments=[],
++        feedback=[],
++    )
++    service = EventService(store)
++    service.record_impression(
++        "r1", "t1", ["w1"], {"w1": 1.0}, "test",
++        metadata={"candidate_type": "worker"},
++    )
++    with pytest.raises(ValueError, match="candidate_type"):
++        service.record_event(
++            "r1", "w1", "click", metadata={"candidate_type": "task"}
++        )
++    with pytest.raises(ValueError, match="task_id"):
++        service.record_event(
++            "r1", "w1", "click", metadata={"task_id": "t-other"}
++        )
++
++    event = service.record_event(
++        "r1",
++        "w1",
++        "click",
++        metadata={
++            "candidate_type": "worker",
++            "task_id": "t1",
++            "score": None,
++            "untrusted": "drop-me",
++        },
++    )
++    assert event.candidate_type == "worker"
++    assert event.task_id == "t1"
++    assert event.score == 0.0
++    assert "untrusted" not in event.metadata
++    assert set(event.metadata) <= {"candidate_type", "task_id", "score"}
++
++
++def test_task_impression_derives_task_label_without_client_input():
++    store = Store(
++        workers=[_worker()], customers=[], tasks=[], assignments=[],
++        feedback=[],
++    )
++    service = EventService(store)
++    service.record_impression(
++        "r1", "w1", ["t2"], {"t2": 1.0}, "test",
++        metadata={"candidate_type": "task"},
++    )
++    event = service.record_event("r1", "t2", "accept")
++    assert event.candidate_type == "task"
++    assert event.task_id == "t2"
++
++
++def test_duplicate_set_and_line_counts_are_seeded_and_incremental(tmp_path):
++    impression = Impression(
++        request_id="r1", query_id="t1", candidate_ids=["w1"],
++        propensities={"w1": 1.0}, policy="test",
++    )
++    existing = RecommendationEvent(
++        event_id="e1", request_id="r1", user_id="c1", role="customer",
++        task_id="t1", candidate_id="w1", candidate_type="worker",
++        rank=1, score=0.9, propensity=1.0, weights_version="v0000",
++        action="click",
++    )
++    store = Store(
++        workers=[_worker()], customers=[], tasks=[], assignments=[],
++        feedback=[], events=[existing], impressions=[impression],
++    )
++    service = EventService(store, persist_dir=tmp_path)
++    with pytest.raises(ValueError):
++        service.record_event("r1", "w1", "click")
++
++    for candidate_id in ("w2", "w3", "w4"):
++        service.record_impression(
++            f"r_{candidate_id}", "t1", [candidate_id],
++            {candidate_id: 1.0}, "test",
++        )
++        service.record_event(f"r_{candidate_id}", candidate_id, "click")
++
++    assert service._line_counts["events"] == 3
++    assert service._line_counts["impressions"] == 3
++    # The counter must be maintained in memory, not by rescanning the file.
++    assert len(
++        (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
++    ) == 3
++
++
++def test_persisted_logs_are_audit_only(tmp_path):
++    store = Store(
++        workers=[_worker()], customers=[], tasks=[], assignments=[],
++        feedback=[],
++    )
++    (tmp_path / "events.jsonl").write_text(
++        json.dumps({"action": "click"}) + "\n", encoding="utf-8"
++    )
++    service = EventService(store, persist_dir=tmp_path)
++    assert service.funnel_metrics()["clicks"] == 0
++    assert store.events == []
++
++
++def test_store_recent_counts_and_assignment_index_are_incremental():
++    store = Store(
++        workers=[_worker()], customers=[], tasks=[], assignments=[],
++        feedback=[],
++    )
++    store.impressions.append(
++        Impression(
++            request_id="r1", query_id="t1", candidate_ids=["w1"],
++            propensities={"w1": 1.0}, policy="test", created_at=NOW,
++        )
++    )
++    assert store.recent_impression_counts(NOW)["w1"] == 1
++    store.impressions.append(
++        Impression(
++            request_id="r2", query_id="t1", candidate_ids=["w1"],
++            propensities={"w1": 1.0}, policy="test", created_at=NOW,
++        )
++    )
++    assert store.recent_impression_counts(NOW)["w1"] == 2
++
++    store.assignments.append(
++        Assignment(
++            assignment_id="a1", task_id="t1", worker_id="w1",
++            customer_id="c1", status="completed", created_at=NOW,
++        )
++    )
++    assert store.has_assignment_pair("t1", "w1")
++    assert not store.has_assignment_pair("t1", "w2")
+
+--- a/tests\test_feedback.py
++++ b/tests\test_feedback.py
+@@ -99,20 +99,43 @@
+ 
+ def test_feedback_updates_category_ratings(small_store):
+     service = FeedbackService(small_store)
+     assignment = service.record_assignment("t1", "w_good", "c1")
+     service.record_feedback(assignment.assignment_id, 5)
+     assert small_store.workers["w_good"].category_ratings[
+         "software_dev"
+     ][-1] == 5.0
+ 
+ 
++def test_record_feedback_appends_communication_rating(small_store):
++    service = FeedbackService(small_store)
++    assignment = service.record_assignment("t1", "w_good", "c1")
++    worker = small_store.workers["w_good"]
++    assert worker.communication_ratings == []
++    service.record_feedback(
++        assignment.assignment_id, 5, communication_rating=2
++    )
++    assert worker.communication_ratings == [2.0]
++
++
++def test_record_feedback_clears_semantic_text_cache(small_store):
++    import app.semantic as semantic
++
++    semantic.clear_text_caches()
++    semantic.build_worker_text(small_store.workers["w_good"])
++    assert semantic._WORKER_TEXT_CACHE
++    service = FeedbackService(small_store)
++    assignment = service.record_assignment("t1", "w_good", "c1")
++    service.record_feedback(assignment.assignment_id, 5)
++    assert semantic._WORKER_TEXT_CACHE == {}
++
++
+ def test_reputation_returns_normalized_rating_and_status(client):
+     assignment = client.post(
+         "/assignments",
+         json={"task_id": "t1", "worker_id": "w_good", "customer_id": "c1"},
+     ).json()
+     client.post(
+         "/feedback",
+         json={"assignment_id": assignment["assignment_id"], "overall_rating": 5},
+     )
+     reputation = client.get("/workers/w_good/reputation").json()
+
+--- a/tests\test_semantic.py
++++ b/tests\test_semantic.py
+@@ -203,10 +203,28 @@
+     # Same IDs keep serving the memoized text even if the objects mutate.
+     worker.specialties = {"brand_design": 5}
+     task.category = "brand_design"
+     assert build_worker_text(worker) == worker_text
+     assert build_task_text(task) == task_text
+ 
+     # Clearing the caches lets the rebuilt text reflect the new fields.
+     clear_text_caches()
+     assert build_worker_text(worker) != worker_text
+     assert build_task_text(task).endswith("brand_design")
++
++
++def test_text_caches_are_bounded_and_evict_oldest(monkeypatch):
++    import app.semantic as semantic
++
++    clear_text_caches()
++    monkeypatch.setattr(semantic, "MAX_TEXT_CACHE_ENTRIES", 2)
++    for index in range(3):
++        build_worker_text(_make_worker(worker_id=f"w_bound_{index}"))
++        build_task_text(_make_task(task_id=f"t_bound_{index}"))
++
++    assert len(semantic._WORKER_TEXT_CACHE) == 2
++    assert len(semantic._TASK_TEXT_CACHE) == 2
++    assert "w_bound_0" not in semantic._WORKER_TEXT_CACHE
++    assert "t_bound_0" not in semantic._TASK_TEXT_CACHE
++    assert "w_bound_2" in semantic._WORKER_TEXT_CACHE
++    assert "t_bound_2" in semantic._TASK_TEXT_CACHE
++    clear_text_caches()
+
+--- a/tests\test_strict_eval.py
++++ b/tests\test_strict_eval.py
+@@ -415,20 +415,86 @@
+ def test_target_check_reports_na_for_identity():
+     from scripts.evaluate_strict import _target_lines
+ 
+     result = _target_result(equal=True)
+     text = "\n".join(_target_lines(result))
+     assert "n/a (candidate weights are identical" in text
+     assert "- status: MET" not in text
+     assert "- status: NOT MET" not in text
+ 
+ 
++def test_build_serving_components_fits_train_only_store(dataset):
++    from app.evaluation_strict import build_eval_store
++    from app.serving import build_serving_components
++
++    store = build_eval_store(dataset)
++    semantic_matcher, acceptance_model = build_serving_components(store)
++    assert semantic_matcher is not None
++    assert semantic_matcher.is_fitted
++    assert acceptance_model is not None
++    assert acceptance_model.is_fitted
++    # The train-only store has no test events to fit on.
++    assert {item.event_id for item in store.events} == {
++        item.event_id for item in dataset.train_events
++    }
++
++
++def test_evaluate_strict_injects_serving_components(dataset, monkeypatch):
++    """Baseline and candidate services must receive the serving components."""
++    from app import evaluation_strict as strict
++
++    recorded: list[dict] = []
++    real_service = strict.RecommendationService
++
++    class RecordingService(real_service):
++        def __init__(self, *args, **kwargs):
++            recorded.append(dict(kwargs))
++            super().__init__(*args, **kwargs)
++
++    monkeypatch.setattr(strict, "RecommendationService", RecordingService)
++    result = strict.evaluate_strict(
++        dataset, dict(DEFAULT_WEIGHTS), k=10, seeds=()
++    )
++
++    assert result["serving_features"]["parity"] == "serving"
++    assert result["serving_features"]["semantic_matcher"] is True
++    assert result["serving_features"]["acceptance_model"] is True
++    assert recorded
++    assert all(
++        item.get("semantic_matcher") is not None for item in recorded
++    )
++    assert all(
++        item.get("acceptance_model") is not None for item in recorded
++    )
++
++
++def test_evaluate_strict_marks_endpoint_latency_na(dataset):
++    from app.evaluation_strict import evaluate_strict
++
++    candidate = dict(DEFAULT_WEIGHTS)
++    candidate["reputation"] += 0.01
++    candidate["skill"] -= 0.01
++    result = evaluate_strict(
++        dataset, candidate, k=10, seeds=()
++    )
++    assert "scoring_latency_p50_ms" in result
++    assert "scoring_latency_p95_ms" in result
++    assert result["endpoint_latency"]["available"] is False
++    assert result["endpoint_latency"]["guardrail"] == "N/A"
++
++    from scripts import evaluate_strict as cli
++
++    text = cli._render_markdown(result, candidate, "override")
++    assert "NOT HTTP endpoint latency" in text
++    assert "Latency guardrail: N/A" in text
++
++
+ def test_cold_start_zero_queries_renders_na(dataset):
+     from scripts import evaluate_strict as cli
+ 
+     different = dict(DEFAULT_WEIGHTS)
+     different["reputation"] += 0.01
+     different["skill"] -= 0.01
+     result = evaluate_strict(dataset, different, k=10, seeds=())
+     result["cold_start"].update(
+         {
+             "available": False,
+
+--- a/tests\test_tune_weights.py
++++ b/tests\test_tune_weights.py
+@@ -109,20 +109,53 @@
+         counting.calls += 1
+         return original(store, validation_assignments, weights)
+ 
+     counting.calls = 0
+     monkeypatch.setattr(tw, "_validation_metrics", counting)
+     base = tw.build_choice_candidate(dataset, seed=42)
+     tw.tune_on_validation(dataset, base, budget=budget)
+     assert counting.calls <= budget + 1
+ 
+ 
++def test_tuning_services_use_serving_parity_components(dataset, monkeypatch):
++    """Both choice-feature and validation services get the serving components."""
++    recorded: list[dict] = []
++    real_service = tw.RecommendationService
++
++    class RecordingService(real_service):
++        def __init__(self, *args, **kwargs):
++            recorded.append(dict(kwargs))
++            super().__init__(*args, **kwargs)
++
++    monkeypatch.setattr(tw, "RecommendationService", RecordingService)
++
++    tw.build_choice_candidate(dataset, seed=42)
++    assert recorded
++    assert all(
++        item.get("semantic_matcher") is not None for item in recorded
++    )
++    assert all(
++        item.get("acceptance_model") is not None for item in recorded
++    )
++
++    recorded.clear()
++    _, validation, store = tw._validation_split(dataset)
++    tw._validation_metrics(store, validation, dict(DEFAULT_WEIGHTS))
++    assert recorded
++    assert all(
++        item.get("semantic_matcher") is not None for item in recorded
++    )
++    assert all(
++        item.get("acceptance_model") is not None for item in recorded
++    )
++
++
+ def test_write_weights_round_trips_seven_keys(tmp_path):
+     small = generate_dataset(
+         n_workers=12, n_tasks=30, n_assignments=80, seed=42, n_new_users=0,
+     )
+     weights = tw.build_choice_candidate(small, seed=42)
+     path = tmp_path / "weights_choice.json"
+     tw._write_weights(path, weights)
+     payload = json.loads(path.read_text(encoding="utf-8"))
+     assert set(payload) == set(KEYS)
+     _assert_valid(payload)
+
+--- a/tests\test_upload.py
++++ b/tests\test_upload.py
+@@ -5,20 +5,21 @@
+ 10 MB limit, extension/MIME whitelists, filename sanitization, and the two
+ analysis functions. No file is written to disk by any path under test.
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+ import io
+ import json
+ import zipfile
++import zlib
+ from datetime import datetime, timezone
+ from types import SimpleNamespace
+ 
+ import pytest
+ 
+ from app.semantic import SemanticMatcher
+ from app.upload import extract
+ from app.upload.analyze import (
+     analyze_resume_text,
+     analyze_task_text,
+@@ -200,20 +201,68 @@
+         extract_text(
+             "bomb.docx",
+             buffer.getvalue(),
+             content_type=(
+                 "application/vnd.openxmlformats-officedocument."
+                 "wordprocessingml.document"
+             ),
+         )
+     assert "压缩" in str(excinfo.value) or "解压" in str(excinfo.value)
+     assert document_calls == []
++
++
++def test_flate_bomb_pdf_is_rejected_before_pypdf_parse(monkeypatch):
++    """A small Flate stream that inflates past the cap must fail pre-parse."""
++    parser_calls: list[bool] = []
++
++    def _should_not_parse():
++        parser_calls.append(True)
++        raise AssertionError("pypdf must not parse an unbounded stream")
++
++    monkeypatch.setattr(extract, "_import_pypdf", _should_not_parse)
++
++    expanded_size = extract.MAX_PDF_STREAM_BYTES + 1024
++    payload = zlib.compress(b"\x00" * expanded_size, 9)
++    content = (
++        b"%PDF-1.7\n1 0 obj\n<< /Length "
++        + str(len(payload)).encode("ascii")
++        + b" /Filter /FlateDecode >>\nstream\n"
++        + payload
++        + b"\nendstream\nendobj\n%%EOF\n"
++    )
++    # The compressed file is far below the 10 MB upload cap.
++    assert len(content) < MAX_UPLOAD_BYTES
++
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("bomb.pdf", content)
++    assert "解压" in str(excinfo.value) or "压缩" in str(excinfo.value)
++    assert parser_calls == []
++
++
++def test_pdf_declared_stream_length_is_bounded(monkeypatch):
++    """An uncompressed stream declaring an oversized length is rejected."""
++    monkeypatch.setattr(
++        extract,
++        "_import_pypdf",
++        lambda: (_ for _ in ()).throw(
++            AssertionError("pypdf must not run for a rejected stream")
++        ),
++    )
++    declared = extract.MAX_PDF_STREAM_BYTES + 1
++    content = (
++        b"%PDF-1.7\n1 0 obj\n<< /Length "
++        + str(declared).encode("ascii")
++        + b" >>\nstream\nshort\nendstream\nendobj\n%%EOF\n"
++    )
++    with pytest.raises(UploadError) as excinfo:
++        extract_text("declared.pdf", content)
++    assert "过大" in str(excinfo.value)
+ 
+ 
+ def test_pdf_page_cap_is_enforced(monkeypatch):
+     class FakePage:
+         def extract_text(self) -> str:
+             return "x"
+ 
+     class FakeReader:
+         is_encrypted = False
+         pages = [FakePage() for _ in range(extract.MAX_PDF_PAGES + 1)]
+

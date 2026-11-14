@@ -1,0 +1,22 @@
+{"event_type": "create", "version": "v0000", "source": "prior", "sample_count": 0, "updated_at": "2026-11-13T11:12:02.025279+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "smoke", "updated_at": "2026-11-13T11:22:47.445429+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "smoke", "updated_at": "2026-11-13T11:34:09.257170+00:00"}
+{"event_type": "create", "version": "v0001", "source": "batch", "sample_count": 1619, "updated_at": "2026-11-13T12:28:59.753532+00:00"}
+{"event_type": "create", "version": "v0002", "source": "batch", "sample_count": 1617, "updated_at": "2026-11-13T12:29:26.174912+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "smoke", "updated_at": "2026-11-13T12:29:26.378657+00:00"}
+{"event_type": "create", "version": "v0003", "source": "batch", "sample_count": 1618, "updated_at": "2026-11-13T12:30:24.186345+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-13T12:30:24.372473+00:00"}
+{"event_type": "create", "version": "v0004", "source": "batch", "sample_count": 1619, "updated_at": "2026-11-13T12:33:29.690983+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-13T12:33:29.898724+00:00"}
+{"event_type": "create", "version": "v0005", "source": "batch", "sample_count": 1629, "updated_at": "2026-11-13T12:39:53.583127+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-13T12:39:53.778065+00:00"}
+{"event_type": "create", "version": "v0006", "source": "batch", "sample_count": 1617, "updated_at": "2026-11-13T13:03:17.965878+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-13T13:03:18.146865+00:00"}
+{"event_type": "create", "version": "v0007", "source": "batch", "sample_count": 1622, "updated_at": "2026-11-13T14:04:52.402295+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-13T14:04:52.576322+00:00"}
+{"event_type": "create", "version": "v0008", "source": "choice-tuned", "sample_count": 0, "updated_at": "2026-11-14T03:26:19.650164+00:00"}
+{"event_type": "create", "version": "v0009", "source": "batch+pairwise", "sample_count": 34771, "updated_at": "2026-11-14T04:41:04.144959+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-14T04:41:04.329367+00:00"}
+{"event_type": "create", "version": "v0010", "source": "batch+pairwise", "sample_count": 34771, "updated_at": "2026-11-14T05:43:48.388521+00:00"}
+{"event_type": "create", "version": "v0011", "source": "batch+pairwise", "sample_count": 34772, "updated_at": "2026-11-14T05:44:13.407846+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-14T05:44:13.717178+00:00"}

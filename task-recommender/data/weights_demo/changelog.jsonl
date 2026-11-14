@@ -1,0 +1,6 @@
+{"event_type": "create", "version": "v0000", "source": "prior", "sample_count": 0, "updated_at": "2026-11-13T11:20:09.084198+00:00"}
+{"event_type": "create", "version": "v0001", "source": "demo", "sample_count": 50, "updated_at": "2026-11-13T11:20:09.099638+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-13T11:20:09.114904+00:00"}
+{"event_type": "create", "version": "v0002", "source": "batch", "sample_count": 1616, "updated_at": "2026-11-13T11:33:38.839760+00:00"}
+{"event_type": "rollback", "version": "v0000", "reason": "judge demo", "updated_at": "2026-11-13T11:33:38.863294+00:00"}
+{"event_type": "rollback", "version": "v0002", "reason": "restore learned", "updated_at": "2026-11-13T11:33:38.870020+00:00"}

@@ -1,0 +1,33 @@
+{
+  "db": "C:\\Users\\1\\Desktop\\bohack\\AI-Research-SKILLs-main\\AI-Research-SKILLs-main\\generated\\task-recommender\\data\\benchmark\\task_benchmark_large.sqlite",
+  "jsonl": "C:\\Users\\1\\Desktop\\bohack\\AI-Research-SKILLs-main\\AI-Research-SKILLs-main\\generated\\task-recommender\\data\\benchmark\\task_benchmark_large.jsonl",
+  "stats_report": "C:\\Users\\1\\Desktop\\bohack\\AI-Research-SKILLs-main\\AI-Research-SKILLs-main\\generated\\task-recommender\\reports\\large_benchmark_stats.md",
+  "seed": 42,
+  "workers": 1000,
+  "tasks": 10000,
+  "customers": 500,
+  "assignments": 100000,
+  "train_tasks": 8000,
+  "test_tasks": 2000,
+  "task_near_dup_rate": 0.0,
+  "resume_near_dup_rate": 0.0,
+  "eval_report": "C:\\Users\\1\\Desktop\\bohack\\AI-Research-SKILLs-main\\AI-Research-SKILLs-main\\generated\\task-recommender\\reports\\large_benchmark_eval.md",
+  "metrics": {
+    "top1": {
+      "mean": 0.066,
+      "std": 0.007
+    },
+    "top5": {
+      "mean": 0.2704,
+      "std": 0.0092
+    },
+    "mrr": {
+      "mean": 0.1795,
+      "std": 0.006
+    },
+    "ndcg": {
+      "mean": 0.1672,
+      "std": 0.0068
+    }
+  }
+}

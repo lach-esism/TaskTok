@@ -247,3 +247,34 @@ def client(small_store: Store, tmp_path) -> TestClient:
             exploration_seed=42,
         )
     )
+
+
+@pytest.fixture
+def split_task_factory():
+    def make(
+        description: str,
+        category: str = "software_dev",
+        estimated_hours: float = 40,
+        budget: float = 20000,
+        **overrides,
+    ):
+        values = dict(
+            task_id="t_split",
+            customer_id="c1",
+            title="测试任务",
+            description=description,
+            category=category,
+            required_skills={"backend": 3},
+            required_level=2,
+            difficulty=3,
+            priority=3,
+            estimated_hours=estimated_hours,
+            deadline=datetime.now(timezone.utc) + timedelta(days=14),
+            region="CN",
+            remote_ok=True,
+            budget=budget,
+        )
+        values.update(overrides)
+        return Task(**values)
+
+    return make

@@ -20,3 +20,4 @@ task-recommender/data/tasktok.sqlite*
 
 # Local worktrees
 .claude/worktrees/
+task-recommender/data/evolution/

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TaskTok · 自我进化演示</title>
+<link rel="icon" href="assets/logo-mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/components.css">
+<link rel="stylesheet" href="css/pages/evolution.css">
+<link rel="stylesheet" href="css/utilities.css">
+</head>
+<body class="evo">
+
+<main class="wrap">
+  <header class="evo-head">
+    <a class="row" href="./" title="回到 TaskTok"><img src="assets/logo.svg" alt="TaskTok" height="28"></a>
+    <span class="kicker">日新赛道 · 自我进化</span>
+  </header>
+
+  <section class="evo-hero">
+    <h1 class="h1">派单越用越准：只靠客户的选择</h1>
+    <p class="sub">系统给 10 个任务各推 5 名候选人，客户从里面选一个。系统看不到客户心里的标准，只能从“选了谁、没选谁”里学。两次运行之间只提交客户的选择，不改代码、参数或提示词。</p>
+  </section>
+
+  <section class="panel evo-controls">
+    <div class="evo-steps">
+      <button class="btn primary" id="btn-run"><span class="n">1</span>跑一次派单</button>
+      <button class="btn ghost" id="btn-feedback" disabled><span class="n">2</span>提交客户选择，让系统学习</button>
+      <button class="btn ghost" id="btn-rollback" disabled><span class="n">3</span>退回上一版</button>
+    </div>
+    <div class="row evo-status">
+      <span class="sub sm">当前权重版本</span><b class="mono" id="active-version">—</b>
+      <span class="grow"></span>
+      <button class="btn ghost sm" id="btn-reset" title="清空本演示的运行记录和学到的版本，回到初始权重">重置演示</button>
+    </div>
+    <p class="sub sm" id="hint"></p>
+  </section>
+
+  <section class="sec">
+    <div class="sec-head"><h2 class="h2">每次运行的成绩</h2><span class="sub sm">命中率：系统第 1 名正好是客户最想要的人</span></div>
+    <div class="evo-runs" id="runs"></div>
+  </section>
+
+  <div class="evo-grid">
+    <section class="sec">
+      <div class="sec-head"><h2 class="h2">本次派单</h2><span class="sub sm" id="run-label"></span></div>
+      <p class="sub sm evo-tip">点开任务可以替客户改选（人工纠正），不改就按客户自己的选择。</p>
+      <div class="evo-tasks" id="tasks"></div>
+    </section>
+
+    <aside>
+      <section class="sec">
+        <div class="sec-head"><h2 class="h2">学到了什么</h2><span class="sub sm" id="diff-label"></span></div>
+        <div class="panel" id="weights"></div>
+      </section>
+      <section class="sec">
+        <div class="sec-head"><h2 class="h2">学习记录</h2><span class="sub sm">每条都能退回</span></div>
+        <div class="list" id="memory"></div>
+      </section>
+      <section class="sec">
+        <div class="sec-head"><h2 class="h2">揭晓：客户的真实标准</h2></div>
+        <div class="panel">
+          <p class="sub sm">系统从未读取这组数，只用来模拟客户怎么选、以及判断“命中”。</p>
+          <div id="standard"></div>
+        </div>
+      </section>
+    </aside>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="js/evolution.js"></script>
+</body>
+</html>

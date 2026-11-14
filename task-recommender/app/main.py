@@ -45,6 +45,7 @@ from app.domain import (
 )
 from app.evaluation_phase2 import evaluate_two_runs
 from app.events import EventService
+from app.evolution.lab import EvolutionError, EvolutionLab
 from app.feedback import FeedbackService
 from app.features import candidate_features
 from app.learning.acceptance import AcceptanceModel
@@ -481,6 +482,7 @@ def create_app(
     exploration_seed: int | None = None,
     db_path: Path | str | None = None,
     materialization_log: Path | None = None,
+    evolution_dir: Path | None = None,
 ) -> FastAPI:
     """Create the Phase 2 application.
 
@@ -2138,6 +2140,59 @@ def create_app(
     @app.get("/market/me")
     def market_me(worker_id: str = DEMO_WORKER_ID) -> dict:
         return market_call(market.me, worker_id)
+
+    # ---- self-evolution demo (frontend/evolution.html) ----
+    # Own dataset and weight directory: never touches the marketplace weights.
+    evolution_root = evolution_dir or (
+        Path(__file__).resolve().parent.parent / "data" / "evolution"
+    )
+    app.state.evolution = None
+
+    def evolution_lab() -> EvolutionLab:
+        if app.state.evolution is None:
+            app.state.evolution = EvolutionLab(evolution_root)
+        return app.state.evolution
+
+    def evolution_call(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except EvolutionError as error:
+            raise HTTPException(status_code=error.status, detail=error.detail)
+
+    @app.get("/evolution")
+    def evolution_overview() -> dict:
+        lab = evolution_lab()
+        lab.pools  # build the fixed batch so setup counts are filled in
+        return lab.overview()
+
+    @app.post("/evolution/run")
+    def evolution_run() -> dict:
+        lab = evolution_lab()
+        return {"run": evolution_call(lab.run), "overview": lab.overview()}
+
+    @app.post("/evolution/feedback")
+    def evolution_feedback(payload: dict) -> dict:
+        lab = evolution_lab()
+        picks = payload.get("picks") or {}
+        if not isinstance(picks, dict):
+            raise HTTPException(status_code=422, detail="picks 必须是 {task_id: worker_id}")
+        result = evolution_call(
+            lab.feedback,
+            str(payload.get("run_id") or ""),
+            {str(k): str(v) for k, v in picks.items()},
+        )
+        return {**result, "overview": lab.overview()}
+
+    @app.post("/evolution/rollback")
+    def evolution_rollback(payload: dict | None = None) -> dict:
+        lab = evolution_lab()
+        to_version = (payload or {}).get("to_version")
+        result = evolution_call(lab.rollback, str(to_version) if to_version else None)
+        return {**result, "overview": lab.overview()}
+
+    @app.post("/evolution/reset")
+    def evolution_reset() -> dict:
+        return evolution_lab().reset()
 
     if MARKET_FRONTEND_DIR.exists():
         app.mount(

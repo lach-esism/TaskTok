@@ -16,7 +16,7 @@ cd task-recommender
 
 打开 `http://127.0.0.1:8000/app/`。数据库默认 `task-recommender/data/tasktok.sqlite`（已加入 .gitignore），首次启动自动播种并预置演示工作台；删掉这个文件即可重置。`TASKTOK_DB=其他路径` 换库，`TASKTOK_DB=`（空）走纯内存。
 
-测试：`cd task-recommender && .venv/Scripts/python.exe -m pytest tests/ -q -p no:cacheprovider`，当前 422 passed, 9 skipped。
+测试：`cd task-recommender && .venv/Scripts/python.exe -m pytest tests/ -q -p no:cacheprovider`，当前 467 passed, 9 skipped。
 
 ## 已完成（已验证）
 
@@ -33,6 +33,13 @@ cd task-recommender
 - 推荐理由已中文化。
 - 前端数据层：`js/core/api.js`（fetch 封装、/health 探测）、`js/data/remote.js`（后端在线时替换 mock 数据，包装 flow.js 的流程函数同步到后端；离线时什么都不改）。`/app/` 挂载 frontend/。
 - 浏览器走查（2026-11-15）：执行者侧 认领 → 演示选定 → 提交 → 返工 → 再提交 → 通过；发包方侧 发布 → 3 名邀请认领者 → 选定 → 模拟交付 → 返工 → 通过，前后端状态一致，控制台无报错。我的、能力图谱、收入页显示后端数据，布局正常。
+
+## 自我进化演示（日新赛道）
+
+- 后端 `app/evolution/lab.py`（EvolutionLab）+ `/evolution`、`/evolution/run`、`/evolution/feedback`（`{run_id, picks?}`）、`/evolution/rollback`、`/evolution/reset`。独立数据集（seed 42）和独立权重目录 `data/evolution/`（已 gitignore），不碰市场权重。
+- 页面 `frontend/evolution.html` + `js/evolution.js` + `css/pages/evolution.css`，复用前端设计变量。
+- 固定成绩：第 1 次 40% → 学习后 70%，回退后复现 40%；测试 `tests/test_evolution.py`。
+- 浏览器走查（桌面 + 375 宽）：跑 → 学 → 跑 → 退回 → 跑，布局正常，控制台无报错。
 
 ## 已知问题 / 待办
 

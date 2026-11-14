@@ -313,13 +313,11 @@ def test_splits_nodes_over_max_hours(split_task_factory, split_draft_factory):
 
 def test_batch_quantity_splits_annotation_node(split_task_factory, split_draft_factory):
     task = split_task_factory(
-        "标注 5000 条数据", category="data_annotation"
+        "标注 2500 条数据", category="data_annotation"
     )
-    draft = apply_split(
-        split_draft_factory(task), task, SplitPolicy(max_pieces=20)
-    )
+    draft = apply_split(split_draft_factory(task), task, SplitPolicy())
     batches = [n for n in draft.chain.nodes if n.key.startswith("batch_annotation_")]
-    assert len(batches) == 10
+    assert len(batches) == 5
     assert all("500 条" in node.split_reason for node in batches)
 
 
@@ -502,9 +500,7 @@ from app.chains.decompose import decompose
 from app.data.templates import load_templates
 
 
-def test_decompose_split_flag_sets_draft_fields(
-    split_task_factory, split_draft_factory
-):
+def test_decompose_split_flag_sets_draft_fields(split_task_factory):
     task = split_task_factory("后端接口开发；前端页面；联调测试", estimated_hours=48)
     templates = load_templates("data/chain_templates/common_task_chains.json")
     draft = decompose(
@@ -536,7 +532,7 @@ def test_api_rejects_invalid_split_policy(client):
     assert response.status_code == 422
 
 
-def test_api_split_returns_split_count(client):
+def test_api_split_returns_nodes(client):
     response = client.post("/chains/decompose", json={"task_id": "t1", "split": True})
     assert response.status_code == 200
     assert response.json()["nodes"]

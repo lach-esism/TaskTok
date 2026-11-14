@@ -1,0 +1,16 @@
+/* 任务详情：封面头图向下渐暗，接到页面底色 */
+.detail-hero{position:relative;height:230px;overflow:hidden;background:linear-gradient(160deg,rgba(48,228,192,.14),rgba(252,84,114,.08)),var(--panel)}
+.detail-hero img{width:100%;height:100%;object-fit:cover;filter:saturate(1.05)}
+.detail-hero .fscrim{position:absolute;inset:0;background:linear-gradient(180deg,rgba(8,15,25,.45),var(--ink))}
+.detail-hero .back{
+  position:absolute;top:14px;left:14px;z-index:3;width:38px;height:38px;border-radius:50%;
+  display:grid;place-items:center;background:rgba(8,15,25,.6);border:1px solid rgba(255,255,255,.16);color:#fff;backdrop-filter:blur(8px);
+}
+.detail-head{position:relative;margin-top:-58px;z-index:4;padding:0 16px}
+.detail-chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.detail-body{padding-top:0}
+
+@media (min-width:900px){
+  .detail-hero{height:320px}
+  .detail-head{margin-top:-70px;padding:0}
+}

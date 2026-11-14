@@ -1,0 +1,48 @@
+/* 我的 */
+.pf-head{display:flex;gap:14px;align-items:center}
+.cap{display:flex;flex-direction:column;gap:12px}
+.caprow{display:grid;grid-template-columns:80px 1fr 34px;gap:10px;align-items:center;font-size:13px}
+.caprow .n{color:var(--muted)}
+.caprow .v{font-family:var(--mono);font-size:12px;color:var(--text);text-align:right}
+.level{display:flex;align-items:center;gap:6px;margin-top:8px}
+.level i{width:22px;height:4px;border-radius:2px;background:var(--line)}
+.level i.on{background:var(--accent)}
+.saved-list{display:grid;grid-template-columns:1fr;gap:8px}
+.saved-card{display:flex;gap:11px;width:100%;text-align:left;padding:11px;border-radius:10px;border:1px solid var(--line-2);background:var(--panel)}
+.saved-card:hover{border-color:rgba(48,228,192,.25)}
+.saved-card .cover{width:46px;height:46px;border-radius:10px;flex:none;font-size:12px}
+.saved-card .meta{display:flex;gap:6px;margin-top:3px;flex-wrap:wrap;font-size:11px;color:var(--dim)}
+.saved-card .remove{width:30px;height:30px;border-radius:7px;display:grid;place-items:center;color:var(--dim);align-self:center;flex:none}
+.saved-card .remove:hover{background:rgba(252,84,114,.08);color:var(--risk)}
+.switch{width:42px;height:24px;border-radius:999px;background:var(--panel-3);position:relative;flex:none;transition:background .2s}
+.switch i{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.4);transition:.2s var(--ease)}
+.switch.on{background:var(--accent)}
+.switch.on i{left:21px;background:#fff}
+
+@media (min-width:900px){
+  .saved-list{grid-template-columns:1fr 1fr}
+  .pf-head{gap:20px}
+}
+.saved-main{text-align:left;align-items:center}
+.income-bars{display:flex;align-items:flex-end;gap:8px;height:74px}
+.income-bars i{display:block;flex:1;background:var(--accent);border-radius:3px 3px 0 0}
+.pf-name{font-size:24px;margin:0}
+.pref-row{min-height:44px}
+.level-note{margin-left:6px}
+
+/* 概览：三个关键数字，可点进明细 */
+.pf-stats{display:grid;grid-template-columns:repeat(3,1fr);margin-top:22px;border-top:1px solid var(--line-2);border-bottom:1px solid var(--line-2)}
+.pf-stats button{display:flex;flex-direction:column;gap:4px;padding:16px 0;text-align:left}
+.pf-stats button+button{padding-left:16px;border-left:1px solid var(--line-2)}
+.pf-stats b{font-family:var(--mono);font-size:22px;font-weight:700;letter-spacing:-.03em}
+.pf-stats span{font-size:12px;color:var(--dim)}
+.level-card{display:flex;align-items:center;gap:12px;width:100%;text-align:left;margin-top:16px;padding:14px 16px;border-radius:var(--r-m);background:var(--tint);border:1px solid var(--tint-line)}
+.level-card .level{margin-top:10px}
+/* 入口列表：一组一块，组内细线分隔 */
+.menu{margin-top:16px;border-radius:var(--r-m);background:var(--panel);overflow:hidden}
+.menu-item{display:flex;align-items:center;gap:12px;width:100%;min-height:54px;padding:0 16px;text-align:left;font-size:15px}
+.menu-item+.menu-item{border-top:1px solid var(--line-2)}
+button.menu-item:hover{background:var(--panel-2)}
+.menu-item > svg.ico{color:var(--muted)}
+.menu-val{font-size:13px;color:var(--dim);font-family:var(--mono)}
+.menu-chev{color:var(--dim)}

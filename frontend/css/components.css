@@ -1,0 +1,122 @@
+/* 通用组件：面板、按钮、标签、头像、进度条、列表、键值行、提示、弹窗、表单、分段控件 */
+.panel{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-m);padding:16px}
+.panel.tight{padding:13px}
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 18px;
+  border-radius:var(--r-s);font-weight:700;font-size:14px;letter-spacing:-.01em;border:1px solid transparent;
+  transition:transform .12s var(--ease),background .16s;
+}
+.btn:active{transform:scale(.98)}
+.btn.primary{background:var(--accent);color:var(--on-accent)}
+.btn.ghost{border-color:var(--line);color:var(--text);background:var(--panel-2)}
+.btn.ghost:hover{border-color:var(--accent-line);background:var(--panel-3)}
+.btn.danger{background:var(--risk);color:#fff}
+.btn.dark{background:rgba(8,15,25,.55);border-color:rgba(255,255,255,.18);color:#fff;backdrop-filter:blur(8px)}
+.btn.block{width:100%}
+.btn.sm{min-height:36px;padding:0 13px;font-size:13px}
+.btn[disabled]{opacity:.45;pointer-events:none}
+.chip{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 10px;border-radius:999px;font-size:12px;color:var(--muted);background:var(--chip-bg);border:1px solid var(--line-2);white-space:nowrap}
+.chip.cyan{color:var(--accent-text);border-color:transparent;background:var(--accent-soft)}
+.chip.coral{color:var(--risk);border-color:transparent;background:var(--risk-bg)}
+.chip.amber{color:var(--money);border-color:transparent;background:var(--money-bg);font-weight:600}
+.chip.pick{cursor:pointer}
+.chip.pick.on{color:var(--accent-text);border-color:transparent;background:var(--accent-soft);font-weight:600}
+.avatar{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:13px;background:var(--panel-3);color:var(--text);flex:none}
+.avatar.lg{width:56px;height:56px;font-size:18px}
+.avatar.cyan{background:var(--accent-soft);color:var(--accent)}
+.divider{height:1px;background:var(--line-2);margin:14px 0}
+.money{font-family:var(--mono);font-weight:600;letter-spacing:-.02em}
+.metric{font-family:var(--mono);font-size:22px;font-weight:600;letter-spacing:-.03em}
+.bar{height:6px;border-radius:999px;background:var(--panel-2);overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:999px;background:var(--accent);width:0;transition:width .8s var(--ease)}
+.bar.coral>i{background:var(--risk)}
+.list{display:flex;flex-direction:column;gap:10px}
+.li{display:flex;gap:10px;align-items:flex-start;font-size:14px;color:var(--muted)}
+.li .dot{width:5px;height:5px;border-radius:50%;background:var(--dim);margin-top:9px;flex:none}
+.toast{
+  position:fixed;left:50%;bottom:96px;transform:translate(-50%,14px);opacity:0;pointer-events:none;
+  background:var(--ink);color:var(--text);border:1px solid var(--line);box-shadow:0 10px 30px rgba(0,0,0,.45);padding:11px 16px;border-radius:999px;font-size:13px;z-index:90;
+  transition:opacity .22s var(--ease),transform .22s var(--ease);max-width:86vw;text-align:center;
+}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.modal{position:fixed;inset:0;background:rgba(2,6,12,.66);backdrop-filter:blur(6px);display:none;place-items:center;z-index:80;padding:18px}
+.modal.on{display:grid}
+.modal .box{width:100%;max-width:420px;background:var(--ink);border:1px solid var(--line);border-radius:var(--r-l);padding:20px;animation:viewIn .3s var(--ease)}
+.kv{display:flex;justify-content:space-between;gap:14px;padding:9px 0;border-bottom:1px solid var(--line-2);font-size:14px}
+.kv:last-child{border-bottom:0}
+.kv span{color:var(--muted);flex:none}
+.kv b{font-weight:600;text-align:right}
+.seg{display:inline-flex;align-items:center;gap:3px;padding:3px;border-radius:10px;border:1px solid var(--line-2);background:var(--panel);max-width:100%}
+.seg button{display:flex;align-items:center;justify-content:center;gap:6px;min-height:34px;padding:0 12px;border-radius:7px;color:var(--muted);font-size:12px;white-space:nowrap}
+.seg button.on{color:var(--text);background:var(--ink);box-shadow:none}
+.seg .n{font-family:var(--mono);font-size:10px;color:var(--dim)}
+.seg button.on .n{color:var(--accent)}
+.ws-empty{text-align:center;padding:28px 12px;border:1px dashed var(--line);border-radius:var(--r-m);color:var(--dim)}
+.checkitem{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--line-2);min-height:44px}
+.checkitem:last-child{border-bottom:0}
+.cbox{width:20px;height:20px;border-radius:6px;border:1.5px solid var(--line);display:grid;place-items:center;flex:none;color:transparent}
+.cbox.on{border-color:var(--accent);background:var(--accent);color:var(--on-accent)}
+/* 可点的清单行：整行是开关；勾选时方框填色、对勾弹出、文字变淡 */
+.checkitem.toggle{width:calc(100% + 16px);margin:0 -8px;padding:11px 8px;text-align:left;cursor:pointer;border-radius:8px;transition:background .16s;font-size:inherit;color:inherit}
+.checkitem.toggle:hover{background:var(--panel-2)}
+.checkitem.toggle .cbox{transition:background .2s var(--ease),border-color .2s var(--ease)}
+.checkitem.toggle .cbox svg{transform:scale(.4);opacity:0;transition:transform .24s cubic-bezier(.34,1.56,.64,1),opacity .16s}
+.checkitem.toggle.on .cbox{border-color:var(--accent);background:var(--accent);color:var(--on-accent)}
+.checkitem.toggle.on .cbox svg{transform:scale(1);opacity:1}
+.checkitem.toggle .grow{transition:color .2s}
+.checkitem.toggle.on .grow{color:var(--muted)}
+.checkitem.toggle:active .cbox{transform:scale(.9)}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.field input,.field select,.field textarea{
+  width:100%;background:var(--field);border:1px solid var(--line);border-radius:10px;padding:11px 12px;font-size:16px;color:var(--text);
+}
+.field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:rgba(48,228,192,.5)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.empty{padding:40px 0;text-align:center;color:var(--dim);font-size:14px}
+
+@media (min-width:900px){
+  .toast{bottom:36px}
+}
+
+@media (max-width:620px){
+  .two{grid-template-columns:1fr}
+  .seg{width:100%}
+  .seg button{padding:0 7px;font-size:11px}
+}
+.li .dot.accent{background:var(--accent)}
+.h1.page{font-size:26px}
+.cat-tile{display:grid;place-items:center;background:var(--tint);border:1px solid var(--tint-line);color:var(--accent);font-weight:700;letter-spacing:.04em}
+
+/* 页面头：标题 + 一句话说明；流程页另带返回链接和步骤条 */
+.page-head{margin-bottom:22px}
+.page-head .h1.page{margin:0 0 6px}
+.page-head .sub{max-width:62ch}
+.back-link{display:inline-flex;align-items:center;gap:4px;margin:0 0 10px -2px;font-size:13px;color:var(--muted)}
+.back-link:hover{color:var(--text)}
+/* 接单流程步骤条：已完成为实心青色，当前为青色描边 */
+.flow{list-style:none;display:flex;gap:6px;margin-top:16px;counter-reset:none}
+.flow li{flex:1;display:flex;align-items:center;gap:8px;padding:9px 10px;border-top:2px solid var(--line);font-size:13px;color:var(--dim)}
+.flow li i{font-style:normal;font-family:var(--mono);font-size:11px;width:20px;height:20px;border-radius:50%;display:grid;place-items:center;border:1px solid var(--line)}
+.flow li.done{border-top-color:var(--accent);color:var(--muted)}
+.flow li.done i{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.flow li.on{border-top-color:var(--accent);color:var(--text);font-weight:600}
+.flow li.on i{border-color:var(--accent);color:var(--accent)}
+@media (max-width:620px){ .flow li{padding:8px 2px;gap:5px;font-size:12px} }
+
+/* 页面底部常驻操作条：主操作永远在同一个位置 */
+.sticky-cta{position:sticky;bottom:0;margin:16px -16px -40px;background:linear-gradient(180deg,rgba(8,15,25,0),rgba(8,15,25,.96) 30%);padding:16px 16px calc(16px + env(safe-area-inset-bottom));display:flex;gap:10px;z-index:20}
+.sticky-cta .btn{flex:1}
+.sticky-cta[hidden]{display:none}
+@media (min-width:900px){
+  .sticky-cta{margin:16px 0 -60px;background:linear-gradient(180deg,rgba(8,15,25,0),rgba(8,15,25,.98) 40%);padding:16px 0 20px}
+}
+
+/* 提示块：返工意见、状态说明等需要停下来看的信息 */
+.notice{padding:12px 14px;border-radius:var(--r-m);background:var(--tint);border:1px solid var(--tint-line);font-size:14px}
+.notice b{display:block;font-weight:700}
+.notice p{margin-top:4px;color:var(--muted);line-height:1.6}
+.notice.coral{background:var(--risk-bg);border-color:rgba(252,84,114,.3)}
+.notice.coral b{color:var(--risk)}
+/* 认领确认弹窗里的流程说明 */
+.claim-steps{margin:14px 0 0;padding-left:18px;font-size:13px;color:var(--muted);line-height:1.7}

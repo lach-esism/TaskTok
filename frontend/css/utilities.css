@@ -1,0 +1,16 @@
+/* 工具类：最后加载，可覆盖组件默认值。只放单一用途的类。 */
+.row.top{align-items:flex-start}
+.flex-wrap{flex-wrap:wrap}
+.gap-sm{gap:6px}
+.gap-md{gap:8px}
+.gap-lg{gap:14px}
+.gap-xl{gap:20px}
+.center{text-align:center}
+.right{text-align:right}
+.block{display:block}
+.accent{color:var(--accent)}
+.money-text{color:var(--money)}
+.muted{color:var(--muted)}
+.strong{color:var(--text)}
+.mt8{margin-top:8px}.mt12{margin-top:12px}.mt16{margin-top:16px}
+.mb0{margin-bottom:0}

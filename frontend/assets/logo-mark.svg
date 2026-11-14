@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="TaskTok">
+  <!-- 按展柜海报：深青绿圆角底 + 薄荷青播放三角 + 珊瑚红竖条 -->
+  <rect width="64" height="64" rx="16" fill="#19302A"/>
+  <path d="M21 19L42 32 21 45Z" fill="#30E4C0"/>
+  <rect x="43" y="19" width="6" height="26" rx="2" fill="#FC5472"/>
+</svg>

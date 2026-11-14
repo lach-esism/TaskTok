@@ -1,306 +1,467 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta
-      name="description"
-      content="TaskTok：发布企业线上任务，找到更合适的执行者，并从验收结果中持续优化推荐。"
-    />
-    <title>TaskTok · 企业线上任务平台</title>
-    <link rel="stylesheet" href="./styles.css" />
-  </head>
-  <body>
-    <header class="site-header minimal-header">
-      <nav class="mode-switch" aria-label="主要导航">
-        <button type="button" class="mode-button is-active" data-view="home">首页</button>
-        <button type="button" class="mode-button" data-view="market">任务</button>
-        <button type="button" class="mode-button" data-view="profile">我的</button>
-        <button type="button" class="mode-button" data-view="lab">实验</button>
-      </nav>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TaskTok · 抖音式任务市场</title>
+<link rel="icon" href="assets/logo-mark.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/layout.css">
+<link rel="stylesheet" href="css/components.css">
+<link rel="stylesheet" href="css/pages/feed.css">
+<link rel="stylesheet" href="css/pages/task.css">
+<link rel="stylesheet" href="css/pages/search.css">
+<link rel="stylesheet" href="css/pages/workspace.css">
+<link rel="stylesheet" href="css/pages/delivery.css">
+<link rel="stylesheet" href="css/pages/publish.css">
+<link rel="stylesheet" href="css/pages/me.css">
+<link rel="stylesheet" href="css/utilities.css">
+</head>
+<body>
 
-      <div class="header-actions">
-        <button type="button" class="header-publish" data-open-publish>发布任务</button>
-      </div>
+<svg hidden aria-hidden="true">
+  <symbol id="i-feed" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M9 9h6M9 13h6M9 17h3"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="7" rx="2"/><rect x="14" y="4" width="7" height="7" rx="2"/><rect x="3" y="13" width="7" height="7" rx="2"/><rect x="14" y="13" width="7" height="7" rx="2"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h13M12 5l7 7-7 7"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H6M12 5L5 12l7 7"/></symbol>
+  <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 20s-7-4.3-7-9a4 4 0 017-2.4A4 4 0 0119 11c0 4.7-7 9-7 9z"/></symbol>
+  <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6 4h12v16l-6-4-6 4z"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><path d="M14 4l6 6-6 6M20 10H9a5 5 0 00-5 5v5"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M4 12l5 5 11-11"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l2 6 6 2-6 2-2 6-2-6-6-2 6-2z"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-bot" viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="4"/><path d="M12 3v4M9 13h.01M15 13h.01"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3L5 14h6l-1 7 8-11h-6z"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 6h16l-6 7v5l-4 2v-7z"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M13 5l6 6M4 20l4-1 10-10-3-3L5 16z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/></symbol>
+</svg>
+
+<div class="app">
+  <!-- ===== rail (desktop) ===== -->
+  <aside class="rail">
+    <div class="brand"><svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#19302A"/><path d="M10.5 9.5L21 16 10.5 22.5Z" fill="#30E4C0"/><rect x="21.5" y="9.5" width="3" height="13" rx="1" fill="#FC5472"/></svg>Task<span>Tok</span></div>
+    <nav class="nav" id="railnav"></nav>
+    <div class="foot">TaskTok Hackathon Demo<br>示例数据 · 原型版本</div>
+  </aside>
+
+  <div class="shell">
+    <!-- ===== topbar (mobile) ===== -->
+    <header class="topbar">
+      <div class="brand"><svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#19302A"/><path d="M10.5 9.5L21 16 10.5 22.5Z" fill="#30E4C0"/><rect x="21.5" y="9.5" width="3" height="13" rx="1" fill="#FC5472"/></svg>Task<span>Tok</span></div>
+      <div class="grow"></div>
+      <button class="icon-btn" data-go="search" aria-label="搜索任务"><svg class="ico"><use href="#i-search"/></svg></button>
+      <button class="icon-btn" data-go="me" aria-label="个人中心"><svg class="ico"><use href="#i-user"/></svg></button>
     </header>
 
-    <main>
-      <section class="view is-active home-view" id="home-view" aria-labelledby="home-title">
-        <div class="home-stage">
-          <div class="home-brand">
-            <h1 id="home-title">TaskTok</h1>
-          </div>
+    <main class="main" id="main">
 
-          <form class="home-search" id="quick-route">
-            <button
-              type="button"
-              class="search-add"
-              aria-label="发布任务"
-              data-open-publish
-            >
-              新建
-            </button>
-            <label class="sr-only" for="quick-task">描述你要完成的任务</label>
-            <input
-              id="quick-task"
-              name="quick-task"
-              type="text"
-              autocomplete="off"
-              placeholder="描述任务，帮你找到合适的人"
-            />
-            <button type="submit" class="search-submit" aria-label="开始匹配">
-              匹配
-            </button>
-          </form>
-
-          <div class="home-shortcuts" aria-label="任务类型">
-            <button type="button" class="shortcut" data-task-filter="content_creation">
-              <span class="shortcut-icon tone-blue">文</span>
-              <span>内容写作</span>
-            </button>
-            <button type="button" class="shortcut" data-task-filter="data_cleaning">
-              <span class="shortcut-icon tone-gold">数</span>
-              <span>数据整理</span>
-            </button>
-            <button type="button" class="shortcut" data-task-filter="compliance_review">
-              <span class="shortcut-icon tone-red">审</span>
-              <span>合规预审</span>
-            </button>
-            <button type="button" class="shortcut" data-task-filter="research_analysis">
-              <span class="shortcut-icon tone-green">研</span>
-              <span>资料研究</span>
-            </button>
-            <button type="button" class="shortcut" data-task-filter="product_docs">
-              <span class="shortcut-icon tone-gray">FAQ</span>
-              <span>产品文档</span>
-            </button>
-          </div>
-
-          <div class="recent-tasks">
-            <div class="recent-heading">
-              <span>最近任务</span>
-              <button type="button" class="text-button" data-view-target="market">
-                查看全部
-              </button>
-            </div>
-            <div class="recent-list" id="recent-list"></div>
-          </div>
-        </div>
-        <p class="home-hint">按 Enter 快速匹配 · 任务结果可随时验收和回滚</p>
-      </section>
-
-      <section class="view" id="market-view" aria-labelledby="task-browser-title">
-        <div class="market-intro">
-          <button type="button" class="back-link" data-view-target="home">返回</button>
-          <div>
-            <p class="eyebrow">TASK MARKET</p>
-            <h1 id="task-browser-title">任务</h1>
-          </div>
-          <div class="search-field">
-            <label class="sr-only" for="task-search">搜索任务</label>
-            <input id="task-search" type="search" placeholder="搜索任务或交付物" />
-          </div>
-        </div>
-
-        <section class="task-section" id="task-browser" aria-label="任务列表">
-          <div class="section-heading">
+      <!-- ===== 推荐 ===== -->
+      <section class="view on" id="view-feed">
+        <div class="feed-grid">
+          <div class="feed-scroll" id="feedScroll"></div>
+          <aside class="feed-side">
             <div>
-              <h2>推荐</h2>
-              <p>选择一个任务，查看执行者建议和下一步。</p>
+              <div class="kicker">为你推荐</div>
+              <h2 class="h2 mt8">今天为你匹配了 <span id="feedCount">0</span> 个任务</h2>
+              <p class="sub mt8">系统按“能力图谱 × 完成概率 × 报价”排序，而不是按发布时间。上下滑动或滚轮翻页，向左滑进入任务详情；右侧可收藏、分享或直接接单。</p>
             </div>
-          </div>
-
-          <div class="filter-row" id="task-filters" aria-label="任务类型筛选">
-            <button type="button" class="filter-chip is-active" data-filter="all">全部</button>
-            <button type="button" class="filter-chip" data-filter="content_creation">内容写作</button>
-            <button type="button" class="filter-chip" data-filter="data_cleaning">数据整理</button>
-            <button type="button" class="filter-chip" data-filter="compliance_review">合规预审</button>
-            <button type="button" class="filter-chip" data-filter="research_analysis">研究分析</button>
-            <button type="button" class="filter-chip" data-filter="product_docs">产品文档</button>
-          </div>
-
-          <div class="task-layout">
-            <div class="task-results">
-              <div class="results-meta">
-                <span id="results-count">12 个任务</span>
-                <span>按待处理优先排序</span>
-              </div>
-              <div class="task-list" id="task-list"></div>
-              <div class="empty-results" id="empty-results" hidden>
-                <strong>没有找到符合条件的任务</strong>
-                <span>换个关键词，或者尝试“全部”。</span>
-                <button type="button" class="text-button" id="clear-filters">清除筛选</button>
+            <div class="panel tight">
+              <div class="row between"><span class="sub">你的匹配度</span><b class="money accent">96%</b></div>
+              <div class="bar mt8"><i style="width:96%"></i></div>
+              <div class="list gap-sm mt12">
+                <div class="li"><span class="dot"></span><span>B2B 研究类任务完成 14 次，评分 Top 8%</span></div>
+                <div class="li"><span class="dot"></span><span>英文资料处理能力已验证 23 次</span></div>
+                <div class="li"><span class="dot"></span><span>按时交付率 96%，争议率 0.7%</span></div>
               </div>
             </div>
-
-            <aside class="task-detail" id="task-detail" aria-live="polite"></aside>
-          </div>
-        </section>
-      </section>
-
-      <section class="view" id="profile-view" aria-labelledby="profile-title">
-        <div class="profile-intro">
-          <div class="profile-avatar" aria-hidden="true">运</div>
-          <div class="profile-copy">
-            <p class="eyebrow">MY WORKSPACE</p>
-            <h1 id="profile-title">我的工作台</h1>
-            <p>企业运营 · 内容与增长组</p>
-          </div>
-          <button type="button" class="secondary-button" data-open-publish>新建任务</button>
-        </div>
-        <div class="profile-note">
-          <span>我的任务</span>
-          <p>等待你验收的工作会优先显示在这里。</p>
-        </div>
-        <div class="progress-summary" id="progress-summary"></div>
-        <div class="progress-columns">
-          <section>
-            <div class="simple-section-heading">
-              <h2>等待你验收</h2>
-              <span id="review-count">0 个</span>
+            <div class="panel tight">
+              <div class="row between"><span class="h3">本周动态</span><span class="chip cyan">进行中 2</span></div>
+              <div class="row between mt12"><span class="sub">待验收</span><span class="money">1 个</span></div>
+              <div class="row between mt8"><span class="sub">本月收入</span><span class="money money-text">¥31,420</span></div>
+              <button class="btn ghost block mt12" data-go="workspace">进入工作台</button>
             </div>
-            <div class="compact-task-list" id="review-list"></div>
-          </section>
-          <section>
-            <div class="simple-section-heading">
-              <h2>正在执行</h2>
-              <span id="active-count">0 个</span>
-            </div>
-            <div class="compact-task-list" id="active-list"></div>
-          </section>
-        </div>
-      </section>
-
-      <section class="view" id="lab-view" aria-labelledby="lab-title">
-        <div class="lab-hero">
-          <div>
-            <p class="eyebrow">COMPETITION DEMO</p>
-            <h1 id="lab-title">进化实验</h1>
-            <p>
-              这里是比赛用的验证界面。比较 v1 与 v2 的分配结果，查看规则变化、隐藏任务迁移和回滚一致性。
-            </p>
-          </div>
-          <button type="button" class="secondary-button" data-view-target="home">
-            返回首页
-          </button>
-        </div>
-
-        <div class="lab-metrics" id="lab-metrics"></div>
-
-        <div class="lab-controls">
-          <div class="lab-actions">
-            <button type="button" class="primary-button" id="run-v1">1. 运行 v1</button>
-            <button type="button" class="secondary-button" id="open-feedback" disabled>
-              2. 提交纠错
-            </button>
-            <button type="button" class="accent-button" id="generate-v2" disabled>
-              3. 生成并运行 v2
-            </button>
-            <button type="button" class="secondary-button" id="rollback-v1" disabled>
-              4. 回滚 v1
-            </button>
-            <button type="button" class="secondary-button" id="restore-v2" disabled>
-              恢复 v2
-            </button>
-          </div>
-          <button type="button" class="text-button" id="automate-lab">自动预演</button>
-        </div>
-
-        <div class="lab-layout">
-          <section class="lab-route-panel">
-            <div class="simple-section-heading">
-              <div>
-                <h2>路由结果</h2>
-                <p>隐藏任务已标记；它们不参与反馈学习。</p>
-              </div>
-              <span class="lab-version" id="lab-version">等待运行</span>
-            </div>
-            <div class="lab-table-wrap">
-              <table class="lab-table">
-                <thead>
-                  <tr>
-                    <th scope="col">任务</th>
-                    <th scope="col">v1</th>
-                    <th scope="col">v2</th>
-                    <th scope="col">变化原因</th>
-                  </tr>
-                </thead>
-                <tbody id="lab-table-body"></tbody>
-              </table>
-            </div>
-          </section>
-
-          <aside class="lab-ledger">
-            <div class="simple-section-heading">
-              <h2>系统学到了什么</h2>
-              <span id="ledger-status">尚无新规则</span>
-            </div>
-            <div id="lab-ledger-content"></div>
           </aside>
         </div>
-
-        <details class="audit-details">
-          <summary>运行与版本审计</summary>
-          <div id="audit-log"></div>
-        </details>
       </section>
+
+      <!-- ===== 视图 2：任务详情 ===== -->
+      <section class="view" id="view-task">
+        <div class="detail-hero">
+          <img id="dCover" alt="" hidden>
+          <div class="fscrim"></div>
+          <button class="back" id="dBack" data-back aria-label="返回"><svg class="ico"><use href="#i-back"/></svg></button>
+        </div>
+        <div class="wrap detail-body">
+          <div class="detail-head">
+            <div class="detail-chips" id="dChips"></div>
+            <h1 class="h1" id="dTitle"></h1>
+            <p class="sub" id="dDesc"></p>
+            <div class="row mt16 gap-xl">
+              <div><div class="kicker">预算</div><div class="metric money-text" id="dBudget"></div></div>
+              <div><div class="kicker">截止</div><div class="metric" id="dDeadline"></div></div>
+              <div><div class="kicker">成功率</div><div class="metric accent" id="dRate"></div></div>
+            </div>
+          </div>
+
+          <div class="sec">
+            <div class="sec-head"><h2 class="h2">任务说明</h2></div>
+            <div class="panel" id="dContract"></div>
+          </div>
+
+          <div class="sec">
+            <div class="sec-head"><h2 class="h2">交付物与验收标准</h2></div>
+            <div class="panel">
+              <div class="h3">必须交付</div>
+              <div class="list mt8" id="dOutput"></div>
+              <div class="divider"></div>
+              <div class="h3">验收方式</div>
+              <div class="list mt8" id="dAccept"></div>
+            </div>
+          </div>
+
+          <div class="sec">
+            <div class="sec-head"><h2 class="h2">发包方与执行情况</h2></div>
+            <div class="panel">
+              <div class="row"><div class="avatar cyan" id="dAv">星</div><div class="grow"><div class="h3" id="dPoster"></div><div class="sub sm">企业认证 · 历史任务 42 个 · 平均评分 4.8</div></div><span class="chip cyan">已托管</span></div>
+              <div class="divider"></div>
+              <div class="kv"><span>当前申请</span><b id="dApplicants"></b></div>
+              <div class="kv"><span>同类任务成功率</span><b id="dRate2"></b></div>
+              <div class="kv"><span>风险等级</span><b>中 · 数据需可溯源</b></div>
+            </div>
+          </div>
+
+          <div class="sec">
+            <div class="sec-head"><h2 class="h2">为什么推荐给你</h2></div>
+            <div class="list" id="dWhy"></div>
+          </div>
+
+          <div class="notice" id="dOwnerNote" hidden><b>这是你发布的任务</b><p>认领者、交付和验收都在「发布 → 我发布的任务」里处理。</p></div>
+
+          <div class="sticky-cta">
+            <button class="btn primary" id="dAcceptBtn">立即接单</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 视图 4：任务搜索 ===== -->
+      <section class="view" id="view-search">
+        <div class="wrap">
+          <header class="page-head"><h1 class="h1 page">搜索任务</h1></header>
+          <div class="searchbar mt12">
+            <svg class="ico"><use href="#i-search"/></svg>
+            <input id="searchInput" placeholder="试试「储能」「线索」「竞品」" autocomplete="off">
+            <button class="icon-btn" id="clearSearch" aria-label="清空"><svg class="ico ico-16"><use href="#i-close"/></svg></button>
+          </div>
+          <!-- 筛选栏：每个维度一个下拉，选中即生效；“全部筛选”一次改多项 -->
+          <div class="search-tools" id="filterBar"></div>
+          <div class="row between result-head">
+            <span class="sub" id="resultCount">6 个开放任务</span>
+            <button class="link-btn" id="clearAllFilters" hidden>清除全部筛选</button>
+          </div>
+          <div id="results"></div>
+        </div>
+      </section>
+
+      <!-- ===== 视图 5：接单工作台 ===== -->
+      <section class="view" id="view-workspace">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <h1 class="h1 page">工作台</h1>
+            <p class="sub">你认领的任务都在这里。发包方选定你后开始执行，提交成果后等发包方验收，通过即结算。</p>
+          </header>
+
+          <div class="seg ws-tabs" id="wsTabs"></div>
+          <div class="ws-list mt12" id="wsList"></div>
+        </div>
+      </section>
+
+      <!-- 工作台子页面：单个任务的进度与操作 -->
+      <section class="view" id="view-job">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+          </header>
+          <div id="wsDetail"></div>
+        </div>
+      </section>
+
+      <!-- ===== 提交成果（接单方） ===== -->
+      <section class="view" id="view-submit">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+            <h1 class="h1 page">提交成果</h1>
+            <p class="sub" id="submitTask"></p>
+          </header>
+          <div id="submitRework"></div>
+
+          <section class="stage">
+            <div class="sec-head"><h2 class="h2">交付物</h2><span class="sub sm" id="fileCount"></span></div>
+            <p class="sub sm stage-hint" id="submitExpect"></p>
+            <button class="drop" id="dropZone" type="button">
+              <svg class="ico"><use href="#i-up"/></svg>
+              <div class="h3">点击添加文件</div>
+              <div class="sub sm">原型环境不会真的上传，点击即可模拟添加</div>
+            </button>
+            <div class="files mt12" id="fileList"></div>
+          </section>
+
+          <section class="stage">
+            <div class="field mb0">
+              <label for="submitNote">给发包方的说明（选填）</label>
+              <textarea id="submitNote" rows="3" placeholder="完成情况、需要对方注意的地方"></textarea>
+            </div>
+          </section>
+
+          <section class="stage">
+            <div class="sec-head"><h2 class="h2">发包方会按这些标准验收</h2></div>
+            <div class="list" id="submitAccept"></div>
+          </section>
+
+          <div class="sticky-cta">
+            <button class="btn primary" id="submitWork">提交给发包方验收</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 视图 9：企业发布任务 ===== -->
+      <section class="view" id="view-publish">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <h1 class="h1 page">发布任务</h1>
+            <p class="sub">写清楚要什么、给多少钱、怎么算合格。发布后有人认领，你选定执行者，交付后由你验收。</p>
+          </header>
+
+          <div class="menu">
+            <button class="menu-item" data-go="published"><svg class="ico"><use href="#i-doc"/></svg><span class="grow">我发布的任务</span><span class="menu-val" id="publishedCount"></span><svg class="ico ico-16 menu-chev"><use href="#i-chev"/></svg></button>
+          </div>
+
+          <form id="pubForm" class="pub-form" novalidate>
+            <section class="pub-sec">
+              <h2 class="pub-sec-title"><i>1</i>要做什么</h2>
+              <div class="field"><label for="pubTitle">任务标题</label><input id="pubTitle" data-pub="title" maxlength="40" placeholder="一句话说清楚，比如：TikTok 美国区投放 CAC 降到 35 美元以下"></div>
+              <div class="field"><label for="pubDesc">背景和要求</label><textarea id="pubDesc" data-pub="desc" rows="4" placeholder="现在的情况、要达到的目标、已有的资料"></textarea></div>
+              <div class="field">
+                <label>交付物 <span class="label-hint">执行者最后要交给你的东西</span></label>
+                <div class="list-editor" data-list="outputs"></div>
+              </div>
+            </section>
+
+            <section class="pub-sec">
+              <h2 class="pub-sec-title"><i>2</i>预算和时间</h2>
+              <div class="two">
+                <div class="field"><label for="pubBudget">预算（元）</label><input id="pubBudget" data-pub="budget" type="number" min="100" step="100" inputmode="numeric"></div>
+                <div class="field"><label for="pubLevel">难度</label>
+                  <select id="pubLevel" data-pub="level"><option value="L1">L1 简单执行</option><option value="L2">L2 专业任务</option><option value="L3">L3 复杂分析</option><option value="L4">L4 跨任务协调</option></select>
+                </div>
+              </div>
+              <div class="two">
+                <div class="field"><label for="pubClaimDeadline">认领截止</label><input id="pubClaimDeadline" data-pub="claimDeadline" type="date"></div>
+                <div class="field"><label for="pubDeliverDeadline">交付截止</label><input id="pubDeliverDeadline" data-pub="deliverDeadline" type="date"></div>
+              </div>
+            </section>
+
+            <section class="pub-sec">
+              <h2 class="pub-sec-title"><i>3</i>怎么验收</h2>
+              <div class="field">
+                <label>验收方式</label>
+                <div class="verify-options" id="pubVerifyOptions"></div>
+              </div>
+              <div class="field mb0">
+                <label>验收标准 <span class="label-hint">验收时你会逐条核对，全部满足才算通过</span></label>
+                <div class="list-editor" data-list="accept"></div>
+              </div>
+            </section>
+          </form>
+
+          <div class="sticky-cta">
+            <button class="btn primary" id="pubSubmit">发布任务</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 发布子页面：我发布的任务列表 -->
+      <section class="view" id="view-published">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+            <h1 class="h1 page">我发布的任务</h1>
+            <p class="sub">招募中的任务去选执行者，交付后在这里验收。</p>
+          </header>
+          <div id="pubPublishedEmpty" class="empty" hidden>还没有发布任务。<button class="link-btn" data-go="publish">去发布</button></div>
+          <div class="published-list" id="pubTaskList"></div>
+        </div>
+      </section>
+
+      <!-- 发布子页面：单个已发布任务 -->
+      <section class="view" id="view-pubtask">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+          </header>
+          <div id="pubTaskDetail"></div>
+        </div>
+      </section>
+
+      <!-- ===== 视图 10：个人中心 ===== -->
+      <section class="view" id="view-me">
+        <div class="wrap narrow">
+          <div class="pf-head">
+            <div class="avatar lg cyan">李</div>
+            <div class="grow">
+              <div class="row gap-md"><h1 class="h1 pf-name">李洋</h1><span class="chip cyan">L3 复杂分析</span></div>
+              <p class="sub md">市场研究 / B2B 线索 / AI 产业研究</p>
+            </div>
+          </div>
+
+          <!-- 概览只放最常看的三个数；点进去看明细 -->
+          <div class="pf-stats">
+            <button data-go="income"><b class="money-text">¥31,420</b><span>本月收入</span></button>
+            <button data-go="skills"><b>137</b><span>完成任务</span></button>
+            <button data-go="skills"><b>96%</b><span>按时率</span></button>
+          </div>
+
+          <button class="level-card" data-go="skills">
+            <span class="grow">
+              <span class="h3 block">距 L4 还差 12 个复杂任务</span>
+              <span class="level"><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i></span>
+            </span>
+            <svg class="ico ico-16 menu-chev"><use href="#i-chev"/></svg>
+          </button>
+
+          <div class="menu">
+            <button class="menu-item" data-go="saved"><svg class="ico"><use href="#i-bookmark"/></svg><span class="grow">我的收藏</span><span class="menu-val" id="savedCount"></span><svg class="ico ico-16 menu-chev"><use href="#i-chev"/></svg></button>
+            <button class="menu-item" data-go="history"><svg class="ico"><use href="#i-clock"/></svg><span class="grow">浏览记录</span><span class="menu-val" id="recentCount"></span><svg class="ico ico-16 menu-chev"><use href="#i-chev"/></svg></button>
+          </div>
+          <div class="menu">
+            <button class="menu-item" data-go="skills"><svg class="ico"><use href="#i-spark"/></svg><span class="grow">能力图谱</span><span class="menu-val">市场研究 92</span><svg class="ico ico-16 menu-chev"><use href="#i-chev"/></svg></button>
+            <button class="menu-item" data-go="income"><svg class="ico"><use href="#i-bolt"/></svg><span class="grow">收入明细</span><svg class="ico ico-16 menu-chev"><use href="#i-chev"/></svg></button>
+          </div>
+          <div class="menu">
+            <button class="menu-item" data-go="settings"><svg class="ico"><use href="#i-edit"/></svg><span class="grow">偏好设置</span><svg class="ico ico-16 menu-chev"><use href="#i-chev"/></svg></button>
+          </div>
+        </div>
+      </section>
+      <section class="view" id="view-saved">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+            <h1 class="h1 page">我的收藏</h1>
+            
+          </header>
+          <div class="saved-list" id="savedList"></div>
+        </div>
+      </section>
+      <section class="view" id="view-history">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+            <h1 class="h1 page">浏览记录</h1>
+            <p class="sub">按浏览时间倒序，最多保留 8 条。</p>
+          </header>
+          <div class="saved-list" id="recentList"></div>
+        </div>
+      </section>
+      <section class="view" id="view-skills">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+            <h1 class="h1 page">能力图谱</h1>
+            <p class="sub">由完成记录自动计算，不可自填。推荐排序看同类任务完成数、按时率和客户复购。</p>
+          </header>
+          <div class="row gap-md">
+            <div class="panel tight grow"><div class="kicker">完成</div><div class="metric">137</div></div>
+            <div class="panel tight grow"><div class="kicker">按时率</div><div class="metric accent">96%</div></div>
+            <div class="panel tight grow"><div class="kicker">复购率</div><div class="metric">73%</div></div>
+          </div>
+          <div class="sec">
+            <div class="cap">
+              <div class="caprow"><span class="n">市场研究</span><div class="bar"><i style="width:92%"></i></div><span class="v">92</span></div>
+              <div class="caprow"><span class="n">企业销售</span><div class="bar"><i style="width:87%"></i></div><span class="v">87</span></div>
+              <div class="caprow"><span class="n">AI 产业研究</span><div class="bar"><i style="width:85%"></i></div><span class="v">85</span></div>
+              <div class="caprow"><span class="n">英文访谈</span><div class="bar"><i style="width:76%"></i></div><span class="v">76</span></div>
+              <div class="caprow"><span class="n">SQL</span><div class="bar coral"><i style="width:43%"></i></div><span class="v">43</span></div>
+            </div>
+          
+          </div>
+        </div>
+      </section>
+      <section class="view" id="view-income">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+            <h1 class="h1 page">收入明细</h1>
+            
+          </header>
+          <div class="panel">
+            <div class="kicker">本月收入</div>
+            <div class="metric money-text lg mt8">¥31,420</div>
+            <div class="income-bars mt16" id="incomeBars"></div>
+            <div class="row between mt8"><span class="sub xs">11/01</span><span class="sub xs">11/13</span></div>
+          </div>
+        </div>
+      </section>
+      <section class="view" id="view-settings">
+        <div class="wrap narrow">
+          <header class="page-head">
+            <button class="back-link" data-back><svg class="ico ico-16"><use href="#i-back"/></svg><span class="back-text">返回</span></button>
+            <h1 class="h1 page">偏好设置</h1>
+            
+          </header>
+          <div class="menu">
+            <div class="menu-item"><span class="grow">接收新任务推荐通知</span><button class="switch on" data-sw="1" aria-label="切换"><i></i></button></div>
+            <div class="menu-item"><span class="grow">公开能力图谱给企业查看</span><button class="switch" data-sw="3" aria-label="切换"><i></i></button></div>
+          </div>
+        </div>
+      </section>
+
     </main>
 
-    <dialog class="dialog publish-dialog" id="publish-dialog">
-      <form method="dialog" class="dialog-form" id="publish-form">
-        <div class="dialog-heading">
-          <div>
-            <p class="eyebrow">NEW TASK</p>
-            <h2>发布一个线上任务</h2>
-            <p>写清要做什么和交付什么，系统就能给出执行者建议。</p>
-          </div>
-          <button type="button" class="icon-button" data-close-dialog aria-label="关闭">关闭</button>
-        </div>
+    <!-- ===== tabbar (mobile) ===== -->
+    <nav class="tabbar" id="tabbar"></nav>
+  </div>
+</div>
 
-        <label class="field">
-          <span>任务标题</span>
-          <input name="title" required maxlength="60" placeholder="例如：把会员权益整理成官网 FAQ" />
-        </label>
-        <label class="field">
-          <span>具体需求</span>
-          <textarea
-            name="request"
-            required
-            rows="4"
-            placeholder="说明任务对象、范围，以及是否涉及个人信息、自动续费或消费者权益。"
-          ></textarea>
-        </label>
-        <label class="field">
-          <span>交付物</span>
-          <input name="deliverable" required placeholder="例如：六问六答 FAQ，含适用版本" />
-        </label>
+<div class="toast" id="toast"></div>
+<div class="modal" id="modal"><div class="box" id="modalBox"></div></div>
+<div class="filter-drawer" id="filterDrawer" aria-hidden="true">
+  <div class="filter-scrim" data-close-filter="1"></div>
+  <section class="filter-sheet" aria-label="任务筛选">
+    <div class="filter-head">
+      <div class="h2" id="filterTitle">全部筛选</div>
+      <button class="icon-btn" data-close-filter="1" aria-label="关闭筛选"><svg class="ico"><use href="#i-close"/></svg></button>
+    </div>
+    <div class="filter-body" id="filterBody"></div>
+    <div class="filter-foot">
+      <button class="btn ghost" id="resetFilters">重置</button>
+      <button class="btn primary" id="applyFilters">查看结果</button>
+    </div>
+  </section>
+</div>
 
-        <div class="dialog-actions">
-          <button type="button" class="secondary-button" data-close-dialog>取消</button>
-          <button type="submit" class="primary-button">发布并查看推荐</button>
-        </div>
-      </form>
-    </dialog>
-
-    <dialog class="dialog feedback-dialog" id="feedback-dialog">
-      <div class="dialog-heading">
-        <div>
-          <p class="eyebrow">STRUCTURED FEEDBACK</p>
-          <h2>提交 3 条纠错</h2>
-          <p>平台接收正确执行者、任务类型、原因和任务清晰度，不会直接改代码或提示词。</p>
-        </div>
-        <button type="button" class="icon-button" data-close-dialog aria-label="关闭">关闭</button>
-      </div>
-      <div class="feedback-list" id="feedback-list"></div>
-      <div class="dialog-actions">
-        <span class="gate-note">无反馈不能生成 v2。</span>
-        <button type="button" class="accent-button" id="submit-feedback">
-          确认提交
-        </button>
-      </div>
-    </dialog>
-
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="./src/app.js"></script>
-  </body>
+<script src="js/core/dom.js"></script>
+<script src="js/core/api.js"></script>
+<script src="js/data/mock.js"></script>
+<script src="js/core/store.js"></script>
+<script src="js/core/router.js"></script>
+<script src="js/core/flow.js"></script>
+<script src="js/pages/feed.js"></script>
+<script src="js/pages/task.js"></script>
+<script src="js/pages/search.js"></script>
+<script src="js/pages/workspace.js"></script>
+<script src="js/pages/me.js"></script>
+<script src="js/pages/delivery.js"></script>
+<script src="js/pages/publish.js"></script>
+<script src="js/data/remote.js"></script>
+<script src="js/app.js"></script>
+</body>
 </html>

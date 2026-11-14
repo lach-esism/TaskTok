@@ -1,0 +1,32 @@
+/* 设计变量。组件只引用这里的语义名，不直接写色值。
+   以展柜海报 assets/poster.png 为准：深蓝黑底 + 薄荷青主色 + 珊瑚红点缀（取自 Logo）。 */
+:root{
+  color-scheme:dark;
+
+  /* 底色与面板（海报底 #080F19，卡片 #0C1824，描边 #2A3C46） */
+  --ink:#080F19; --ink-2:#0A1320;
+  --panel:#0C1824; --panel-2:#111D29; --panel-3:#1A2836;
+  --field:#0A1420;
+  --bar:rgba(8,15,25,.88);
+  --line:rgba(120,160,190,.20); --line-2:rgba(120,160,190,.12);
+
+  /* 文字（标题 #F2F5FA，正文 #A3B3C2） */
+  --text:#F2F5FA; --muted:#A3B3C2; --dim:#6E7F90;
+
+  /* 品牌与状态：薄荷青 #30E4C0；珊瑚红取自 Logo 竖条 */
+  --accent:#30E4C0; --accent-text:#30E4C0; --accent-soft:rgba(48,228,192,.10); --accent-line:rgba(48,228,192,.32);
+  --on-accent:#04201B;
+  --coral:#FC5472;
+  --money:#30E4C0; --money-bg:rgba(48,228,192,.10);
+  --risk:#FC5472; --risk-bg:rgba(252,84,114,.10);
+  --chip-bg:rgba(255,255,255,.05);
+  /* 海报“流程条”那种带青色的深底，用于强调块 */
+  --tint:#0F2427; --tint-line:#2D544F;
+
+  /* 形状、字体、动效 */
+  --r-s:9px; --r-m:14px; --r-l:20px;
+  --sans:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --ease:cubic-bezier(.22,.61,.36,1);
+}
+/* 断点：≥900px 桌面（侧栏布局）；≤620px 窄屏（表单单列、筛选改底部弹层） */

@@ -1,0 +1,61 @@
+/* 发布 */
+.verify-options{display:grid;grid-template-columns:1fr;gap:8px}
+.verify-option{display:flex;gap:10px;align-items:flex-start;padding:12px;border-radius:10px;border:1px solid var(--line-2);background:var(--field);cursor:pointer}
+.verify-option.on{border-color:rgba(48,228,192,.4);background:var(--accent-soft)}
+.verify-radio{width:18px;height:18px;border-radius:50%;border:1px solid var(--line);display:grid;place-items:center;flex:none;margin-top:2px}
+.verify-radio i{width:8px;height:8px;border-radius:50%;background:transparent}
+.verify-option.on .verify-radio{border-color:var(--accent)}
+.verify-option.on .verify-radio i{background:var(--accent)}
+.verify-copy b{display:block;font-size:13px;line-height:1.4}
+.verify-copy span{display:block;margin-top:2px;font-size:11px;color:var(--dim);line-height:1.5}
+.published-list{display:flex;flex-direction:column;gap:10px}
+.published-card{width:100%;padding:14px 16px;text-align:left;border-radius:var(--r-m);background:var(--panel)}
+.published-card:hover{background:var(--panel-2)}
+.published-card .title{font-size:15px;font-weight:700;line-height:1.5;margin:4px 0 7px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.published-card .meta{display:flex;gap:7px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--dim)}
+.publish-status{display:inline-flex;align-items:center;gap:5px;height:25px;padding:0 8px;border-radius:999px;font-size:11px;background:var(--money-bg);color:var(--money);border:1px solid transparent}
+.publish-status.closed{background:var(--panel-2);color:var(--muted);border-color:var(--line-2)}
+
+
+
+
+.verify-option{width:100%;text-align:left}
+
+/* 新建表单：三段，每段带编号 */
+.pub-form{margin-top:8px}
+.pub-sec{padding:22px 0;border-top:1px solid var(--line-2)}
+.pub-sec:first-child{border-top:0}
+.pub-sec-title{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:700;margin-bottom:16px}
+.pub-sec-title i{font-style:normal;font-family:var(--mono);font-size:12px;width:24px;height:24px;border-radius:50%;display:grid;place-items:center;background:var(--accent-soft);color:var(--accent)}
+.label-hint{color:var(--dim);font-size:11px;margin-left:6px}
+.list-editor{display:flex;flex-direction:column;gap:8px}
+.list-row{display:flex;align-items:center;gap:8px}
+.list-idx{width:20px;text-align:center;font-family:var(--mono);font-size:12px;color:var(--dim);flex:none}
+.list-row input{flex:1;min-width:0;height:42px;border-radius:9px;border:1px solid var(--line);background:var(--field);color:var(--text);padding:0 12px;font-size:14px}
+.list-row input:focus{outline:none;border-color:var(--accent-line)}
+.list-add{display:inline-flex;align-items:center;gap:6px;align-self:flex-start;margin-left:28px;padding:6px 2px;font-size:13px;color:var(--accent)}
+.icon-mini{width:32px;height:32px;border-radius:8px;display:grid;place-items:center;color:var(--dim);flex:none}
+.icon-mini:hover{color:var(--risk);background:var(--risk-bg)}
+
+/* 我发布的任务列表 */
+.published-card{display:flex;align-items:center;gap:12px}
+.published-card > svg.ico{color:var(--dim);flex:none}
+.published-card .title{display:block;margin:0;font-size:15px;font-weight:700}
+.published-card .meta{display:flex;gap:10px;margin-top:6px;font-size:12px;color:var(--muted)}
+.published-card.attn{background:var(--tint);box-shadow:inset 0 0 0 1px var(--tint-line)}
+.menu-val.attn{color:var(--accent);font-family:var(--sans);font-weight:600}
+
+/* 任务管理页 */
+.pub-facts{display:grid;grid-template-columns:repeat(3,1fr);margin:14px 0 4px;border-top:1px solid var(--line-2);border-bottom:1px solid var(--line-2)}
+.pub-facts div{padding:12px 0}
+.pub-facts div+div{padding-left:14px;border-left:1px solid var(--line-2)}
+.pub-facts span{display:block;font-size:12px;color:var(--dim)}
+.pub-facts b{display:block;margin-top:3px;font-family:var(--mono);font-size:15px}
+.stage{margin-top:22px}
+.stage-hint{margin:-4px 0 12px}
+.people{display:flex;flex-direction:column;gap:10px}
+.person{display:flex;align-items:flex-start;gap:12px;padding:14px;border-radius:var(--r-m);background:var(--panel)}
+.person .btn{align-self:center}
+.person-note{display:block;margin-top:8px;font-size:13px;color:var(--muted);line-height:1.6}
+.files{display:flex;flex-wrap:wrap}
+.submission-note{margin-top:6px;padding:12px 14px;border-radius:var(--r-m);background:var(--panel);font-size:14px;color:var(--muted);line-height:1.6}

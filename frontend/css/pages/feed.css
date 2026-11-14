@@ -1,0 +1,68 @@
+/* 推荐 */
+#view-feed{padding-bottom:0;overflow:hidden}
+.feed-grid{display:block;height:100%}
+/* 分页视口：手势由 js/pages/feed.js 接管，不用原生滚动 */
+.feed-scroll{height:100%;position:relative;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+.feed-track{height:100%;will-change:transform;backface-visibility:hidden}
+/* 浏览进度：一条固定在视口顶部的细线，用 scaleX 变化，不触发重排 */
+.feed-prog{position:absolute;left:0;right:0;top:0;height:2px;background:rgba(255,255,255,.12);z-index:5;pointer-events:none}
+.feed-prog i{display:block;height:100%;background:var(--accent);transform-origin:left center;transform:scaleX(0);will-change:transform}
+/* 推荐卡片：沿用老版短视频式样式——满屏封面、上下渐暗、信息叠在底部、右侧快捷栏。
+   配色按展柜海报：深蓝黑底、薄荷青主色。 */
+.fcard{
+  --text:#fff; --muted:#C9D3DE; --dim:#93A3B3; --chip-bg:rgba(8,15,25,.55); --line-2:rgba(255,255,255,.16);
+  position:relative;height:100%;color:#fff;
+  display:flex;flex-direction:column;justify-content:flex-end;overflow:hidden;isolation:isolate;background:var(--ink);contain:strict;
+}
+.fcover{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:saturate(1.05);pointer-events:none;-webkit-user-drag:none}
+.fcover.datacover{background:
+  radial-gradient(120% 90% at 70% 0%,rgba(48,228,192,.20),transparent 60%),
+  radial-gradient(90% 80% at 10% 100%,rgba(252,84,114,.14),transparent 60%),
+  linear-gradient(160deg,#0C1824,#060B13)}
+.databars{position:absolute;left:24px;right:24px;bottom:150px;height:250px;display:flex;gap:6px;align-items:flex-end;opacity:.8}
+.databars i{display:block;flex:1;border-radius:2px;background:linear-gradient(180deg,rgba(48,228,192,.34),rgba(255,255,255,.06))}
+.fscrim{position:absolute;inset:0;background:
+  linear-gradient(180deg,rgba(8,15,25,.86) 0%,rgba(8,15,25,.16) 26%,rgba(8,15,25,.30) 55%,rgba(8,15,25,.95) 100%)}
+.ftop{position:absolute;top:0;left:0;right:0;padding:16px 68px 0 16px;display:flex;gap:8px;z-index:3}
+.ftop .chip.cyan{border-color:var(--accent-line)}
+.ftop .chip.coral{border-color:rgba(252,84,114,.4)}
+.fbody{position:relative;z-index:3;padding:0 76px 22px 18px;display:flex;flex-direction:column;gap:10px}
+.fposter{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.fposter .avatar{width:26px;height:26px;font-size:11px;background:rgba(255,255,255,.12);color:#fff}
+.fposter b{font-weight:700;color:#fff;letter-spacing:-.01em}
+.ftitle{font-size:27px;line-height:1.22;letter-spacing:-.03em;font-weight:800;color:#fff;text-shadow:0 1px 8px rgba(0,0,0,.45)}
+.fdesc{font-size:14px;line-height:1.6;color:#B9C6D2;max-width:30ch}
+.fstats{display:flex;gap:16px;flex-wrap:wrap;margin-top:2px}
+.fstat{display:flex;flex-direction:column;gap:1px}
+.fstat b{font-family:var(--mono);font-size:19px;font-weight:600;letter-spacing:-.03em;color:#fff}
+.fstat.money-stat b{color:var(--accent)}
+.fstat span{font-size:11px;color:var(--dim);letter-spacing:.02em}
+.fcta{display:flex;gap:10px;margin-top:6px}
+.fcta .btn{flex:1}
+.fcard .btn.dark{backdrop-filter:none;background:rgba(8,15,25,.72)}
+.frail{position:absolute;right:12px;bottom:26px;z-index:4;display:flex;flex-direction:column;align-items:center;gap:18px}
+.frail button{display:flex;flex-direction:column;align-items:center;gap:4px;color:#DDE5EE;font-size:11px}
+.frail .ring{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;background:rgba(8,15,25,.72);border:1px solid rgba(255,255,255,.16);transition:transform .12s var(--ease),background .16s}
+.frail button:active .ring{transform:scale(.92)}
+.frail button.on .ring{border-color:var(--accent);color:var(--accent);background:rgba(48,228,192,.16)}
+.frail button.on{color:var(--accent)}
+.feed-scroll .fend{background:var(--ink)}
+.fend{height:100%;display:grid;place-items:center;padding:24px}
+
+@media (min-width:900px){
+  #view-feed{padding-bottom:0}
+  .feed-grid{display:grid;grid-template-columns:minmax(0,470px) minmax(0,1fr);gap:0;height:100%;max-width:1180px;margin:0 auto}
+  .feed-scroll{height:100%}
+  .feed-scroll{border-right:1px solid var(--line-2)}
+  .fbody{padding:0 90px 40px 26px}
+  .ftop{padding:22px 90px 0 26px}
+  .fdesc{max-width:34ch}
+  .feed-side{padding:22px 26px;overflow-y:auto;display:flex;flex-direction:column;gap:16px;align-items:flex-start}
+  .feed-side .h2{font-size:16px}
+  .fend{padding:40px}
+}
+.feed-side .panel{width:100%}
+
+/* 矮屏：依次收起次要信息，保证一屏放得下 */
+@media (max-height:640px){ .fdesc{display:none} }
+@media (prefers-reduced-motion:reduce){ .feed-track{transition:none!important} }

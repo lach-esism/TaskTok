@@ -1,11 +1,11 @@
-# TASKWEAVE — 任务分配推荐系统
+# TaskTok — 任务分配推荐系统
 
 本目录集中存放本次新增/生成的全部内容，已从 `AI-Research-SKILLs` skill 仓库中分离出来，独立于原有的 `01-*` ~ `22-*` 与 `0-autoresearch-skill/` skill 内容。
 
 ## 目录
 
 ```text
-TASKWEAVE/
+TaskTok/
 ├── task-recommender/                      # 可运行的 Task Assignment Recommender（FastAPI + 前端）
 ├── specs/                                 # 设计文档与任务链模板库
 ├── plans/                                 # Phase 1/2/3 实施计划

@@ -20,7 +20,7 @@ def test_frontend_served(client):
     assert root.status_code in (302, 307)
     page = client.get("/ui/")
     assert page.status_code == 200
-    assert "TASKWEAVE" in page.text
+    assert "TaskTok" in page.text
     assert "progress-chart" in page.text
     assert "classify-text" in page.text
     assert "acceptance-load" in page.text

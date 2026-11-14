@@ -208,7 +208,7 @@ function bindTabs() {
 }
 
 function bindTheme() {
-  const key = "taskweave-theme";
+  const key = "tasktok-theme";
   if (localStorage.getItem(key) === "light") {
     document.body.classList.add("light");
   }
@@ -2376,7 +2376,7 @@ function demoLog(message, kind = "info") {
 }
 
 async function runDemo() {
-  $("#demo-log").textContent = "TASKWEAVE demo start";
+  $("#demo-log").textContent = "TaskTok demo start";
   const step = async (label, fn, display = (value) => value) => {
     try {
       const result = await fn();

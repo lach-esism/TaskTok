@@ -1672,6 +1672,12 @@ def create_app(
                 template,
                 variant=request.variant,
                 max_nodes=template.get("max_nodes", 10),
+                split=request.split,
+                policy=(
+                    request.policy.model_dump()
+                    if request.policy is not None
+                    else None
+                ),
             )
             draft.quality = quality_score(draft, current)
         except ValueError as error:
@@ -1684,6 +1690,8 @@ def create_app(
             "quality": asdict(draft.quality),
             "nodes": [asdict(node) for node in draft.chain.nodes],
             "critical_path": draft.chain.critical_path,
+            "split_count": draft.split_count,
+            "uncovered_requirements": draft.uncovered_requirements,
         }
 
     @app.get("/chains/{chain_id}")

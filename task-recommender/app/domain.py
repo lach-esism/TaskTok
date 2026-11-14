@@ -162,6 +162,10 @@ class Task:
     budget_max: float = 0.0
     created_at: datetime = field(default_factory=_utcnow)
     required_skill_weights: dict[str, float] = field(default_factory=dict)
+    parent_task_id: str | None = None
+    chain_id: str | None = None
+    subtask_key: str | None = None
+    split_source: str | None = None
 
 
 @dataclass

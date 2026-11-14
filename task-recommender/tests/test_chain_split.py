@@ -1,5 +1,6 @@
 import pytest
 
+from app.chains.decompose import decompose
 from app.chains.split import (
     RequirementItem,
     SplitPolicy,
@@ -9,6 +10,7 @@ from app.chains.split import (
     parse_split_policy,
 )
 from app.chains.split_rules import batch_rule_for, rules_for
+from app.data.templates import load_templates
 
 
 def test_split_policy_defaults():
@@ -154,3 +156,50 @@ def test_same_input_produces_same_split(
         (node.key, round(node.estimated_hours, 4))
         for node in second.chain.nodes
     ]
+
+
+def test_decompose_split_flag_sets_draft_fields(split_task_factory):
+    task = split_task_factory(
+        "后端接口开发；前端页面；联调测试", estimated_hours=48
+    )
+    templates = load_templates(
+        "data/chain_templates/common_task_chains.json"
+    )
+    draft = decompose(
+        task,
+        templates["software_dev"],
+        split=True,
+        policy={"target_hours": 4},
+    )
+    assert draft.split_policy is not None
+    assert draft.split_count == len(draft.chain.nodes)
+    assert all(hasattr(node, "budget") for node in draft.chain.nodes)
+
+
+def test_decompose_without_split_keeps_template_nodes(
+    split_task_factory, split_draft_factory
+):
+    task = split_task_factory("后端接口开发；前端页面", estimated_hours=48)
+    draft = split_draft_factory(task)
+    assert draft.split_policy is None
+    assert draft.split_count == 0
+
+
+def test_api_rejects_invalid_split_policy(client):
+    response = client.post(
+        "/chains/decompose",
+        json={
+            "task_id": "t1",
+            "split": True,
+            "policy": {"min_hours": 10, "target_hours": 8},
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_api_split_returns_nodes(client):
+    response = client.post(
+        "/chains/decompose", json={"task_id": "t1", "split": True}
+    )
+    assert response.status_code == 200
+    assert response.json()["nodes"]

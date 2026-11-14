@@ -245,6 +245,7 @@ def client(small_store: Store, tmp_path) -> TestClient:
             weights_dir=tmp_path,
             events_dir=tmp_path / "events",
             exploration_seed=42,
+            materialization_log=tmp_path / "materialized.jsonl",
         )
     )
 

@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -21,6 +22,12 @@ from app.benchmark.db import BenchmarkRepository, build_benchmark_db
 from app.benchmark.runner import BenchmarkRoundRunner
 from app.chains.compose import compose_templates
 from app.chains.decompose import decompose, quality_score
+from app.chains.materialize import (
+    MATERIALIZATION_LOG,
+    append_materialization_event,
+    build_subtask_task,
+    validate_materialization,
+)
 from app.chains.plan_store import ChainPlanStore
 from app.chains.planner import plan_chain, propagate_breach, replan_chain
 from app.config import APP_VERSION, DEFAULT_WEIGHTS
@@ -466,6 +473,7 @@ def create_app(
     benchmark_db: Path | None = None,
     events_dir: Path | None = None,
     exploration_seed: int | None = None,
+    materialization_log: Path | None = None,
 ) -> FastAPI:
     """Create the Phase 2 application."""
     # Accepted uploads are capped at MAX_UPLOAD_BYTES before form parsing, so
@@ -498,6 +506,10 @@ def create_app(
     app.state.acceptance_model = _build_acceptance_model(store)
     app.state.chains = {}
     app.state.drafts = {}
+    app.state.materializations = {}
+    app.state.materialization_log = (
+        materialization_log or MATERIALIZATION_LOG
+    )
     app.state.plan_store = ChainPlanStore()
     resolved_weights_dir = weights_dir or (
         Path(__file__).resolve().parent.parent / "data" / "weights"
@@ -1705,6 +1717,117 @@ def create_app(
             "critical_path": draft.chain.critical_path,
             "split_count": draft.split_count,
             "uncovered_requirements": draft.uncovered_requirements,
+        }
+
+    @app.get("/chains/drafts/{draft_id}")
+    def get_chain_draft(draft_id: str) -> dict:
+        draft = app.state.drafts.get(draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="draft not found")
+        return {
+            "draft_id": draft.draft_id,
+            "task_id": draft.task_id,
+            "chain_id": draft.chain.chain_id,
+            "template_id": draft.template_id,
+            "variant": draft.variant,
+            "split_count": draft.split_count,
+            "uncovered_requirements": draft.uncovered_requirements,
+            "quality": asdict(draft.quality) if draft.quality else None,
+            "nodes": [asdict(node) for node in draft.chain.nodes],
+            "materialized": draft_id in app.state.materializations,
+        }
+
+    @app.post("/chains/drafts/{draft_id}/materialize")
+    def materialize_chain_draft(draft_id: str) -> dict:
+        draft = app.state.drafts.get(draft_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail="draft not found")
+        if draft_id in app.state.materializations:
+            raise HTTPException(
+                status_code=409, detail="draft already materialized"
+            )
+        current = require_store()
+        parent = current.tasks.get(draft.task_id)
+        if parent is None:
+            raise HTTPException(
+                status_code=404, detail="parent task not found"
+            )
+        has_assignment = any(
+            assignment.task_id == parent.task_id
+            for assignment in current.assignments
+        )
+        planned = [
+            build_subtask_task(parent, node, draft.chain, draft_id)
+            for node in draft.chain.nodes
+        ]
+        errors = validate_materialization(
+            draft, parent, planned, has_assignment
+        )
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+        for item in planned:
+            current.tasks[item.task_id] = item
+        parent.status = "split"
+        record = {
+            "draft_id": draft_id,
+            "chain_id": draft.chain.chain_id,
+            "parent_task_id": parent.task_id,
+            "parent_status": "split",
+            "task_ids": [item.task_id for item in planned],
+            "materialized_at": datetime.now(timezone.utc).isoformat(),
+        }
+        app.state.materializations[draft_id] = record
+        invalidate_service()
+        append_materialization_event(
+            app.state.materialization_log,
+            {"event": "materialize", **record},
+        )
+        return record
+
+    @app.post("/chains/drafts/{draft_id}/materialize/rollback")
+    def rollback_chain_materialization(draft_id: str) -> dict:
+        record = app.state.materializations.get(draft_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail="materialization not found"
+            )
+        current = require_store()
+        assigned = [
+            task_id
+            for task_id in record["task_ids"]
+            if any(
+                assignment.task_id == task_id
+                for assignment in current.assignments
+            )
+        ]
+        if assigned:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "subtasks already assigned",
+                    "task_ids": assigned,
+                },
+            )
+        for task_id in record["task_ids"]:
+            current.tasks.pop(task_id, None)
+        parent = current.tasks.get(record["parent_task_id"])
+        if parent is not None:
+            parent.status = "open"
+        del app.state.materializations[draft_id]
+        invalidate_service()
+        append_materialization_event(
+            app.state.materialization_log,
+            {
+                "event": "undo",
+                "draft_id": draft_id,
+                "task_ids": record["task_ids"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return {
+            "draft_id": draft_id,
+            "task_ids": record["task_ids"],
+            "parent_status": "open",
         }
 
     @app.get("/chains/{chain_id}")

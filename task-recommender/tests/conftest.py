@@ -245,5 +245,76 @@ def client(small_store: Store, tmp_path) -> TestClient:
             weights_dir=tmp_path,
             events_dir=tmp_path / "events",
             exploration_seed=42,
+            materialization_log=tmp_path / "materialized.jsonl",
         )
     )
+
+
+@pytest.fixture
+def split_task_factory():
+    def make(
+        description: str,
+        category: str = "software_dev",
+        estimated_hours: float = 40,
+        budget: float = 20000,
+        **overrides,
+    ):
+        values = dict(
+            task_id="t_split",
+            customer_id="c1",
+            title="测试任务",
+            description=description,
+            category=category,
+            required_skills={"backend": 3},
+            required_level=2,
+            difficulty=3,
+            priority=3,
+            estimated_hours=estimated_hours,
+            deadline=datetime.now(timezone.utc) + timedelta(days=14),
+            region="CN",
+            remote_ok=True,
+            budget=budget,
+        )
+        values.update(overrides)
+        return Task(**values)
+
+    return make
+
+
+@pytest.fixture
+def split_draft_factory():
+    from app.chains.decompose import decompose
+    from app.data.templates import load_templates
+
+    templates = load_templates("data/chain_templates/common_task_chains.json")
+
+    def make(task):
+        return decompose(task, templates[task.category])
+
+    return make
+
+
+@pytest.fixture
+def make_draft():
+    from app.domain import DecompositionDraft, TaskChain
+
+    def make(nodes):
+        chain = TaskChain(
+            chain_id="ch_make",
+            root_task_id="t1",
+            customer_id="c1",
+            deadline=NOW + timedelta(days=7),
+            budget=10000,
+            nodes=list(nodes),
+        )
+        return DecompositionDraft(
+            draft_id="d_make",
+            task_id="t1",
+            template_id="make",
+            variant="standard",
+            chain=chain,
+            requirements=[],
+            coverage={},
+        )
+
+    return make

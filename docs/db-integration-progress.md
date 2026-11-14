@@ -37,4 +37,4 @@ cd task-recommender
 ## 已知问题 / 待办
 
 - “我的”页显示的名字是发包方李洋（前端是“一端两用”同一个人），但数据来自执行者 w0033 的履历。要不要拆成两个身份待定。
-- 远端 PR lach-esism/TaskTok#1（细化评价体系）合入后同步：预计 .gitignore、domain.py、main.py 的 create_app 参数有 3 处叠加式冲突；materializations 需要接入数据库持久化。
+- 远端 PR lach-esism/TaskTok#1（feature/chain-split，任务链动态拆分）已在本地合并：3 处冲突都是两边各加一段，已保留双方；materializations 存进 meta 表的 `chain_materializations`，重启后可恢复和回滚（tests/test_db_materialize.py）。拆解草稿（`app.state.drafts`）仍只在内存，重启后要重新 decompose 才能物化新草稿。

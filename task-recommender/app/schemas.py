@@ -122,11 +122,22 @@ class DecisionRequest(BaseModel):
     comment: str = ""
 
 
+class SplitPolicyRequest(BaseModel):
+    target_hours: float = Field(default=8.0, gt=0)
+    min_hours: float = Field(default=1.0, gt=0)
+    max_hours: float = Field(default=16.0, gt=0)
+    max_pieces: int = Field(default=12, ge=1, le=50)
+    min_batch_size: int = Field(default=50, ge=1)
+    default_batch_size: int = Field(default=500, ge=1)
+
+
 class DecomposeRequest(BaseModel):
     task_id: str
     mode: str = "template"
     variant: str = "standard"
     categories: list[str] | None = None
+    split: bool = False
+    policy: SplitPolicyRequest | None = None
 
 
 class NodeRecommendRequest(BaseModel):

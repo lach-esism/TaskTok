@@ -48,6 +48,9 @@ from app.preference.worker import WorkerPreferenceProfile
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 SCHEMA_VERSION = "1"
+# Chain draft materializations (draft_id -> record) are a small dict; kept in
+# the meta table as one JSON value. The subtasks themselves live in ``tasks``.
+MATERIALIZATIONS_KEY = "chain_materializations"
 
 
 def _iso(value) -> str:
@@ -66,6 +69,7 @@ class LoadedState:
     submissions: dict[str, Submission]
     records: dict[str, list[AcceptanceRecord]]
     final_records: dict[str, AcceptanceRecord]
+    materializations: dict[str, dict] = field(default_factory=dict)
 
 
 # Mutable keyed collections: (table, key column, extra typed columns).
@@ -140,6 +144,7 @@ class Database:
         )
         self._lengths: dict[str, int] = {}
         self._chain_seq = 0
+        self._materializations_doc: str | None = None
 
     # ------------------------------------------------------------------
     def close(self) -> None:
@@ -353,6 +358,7 @@ class Database:
         plan_store: ChainPlanStore | None = None,
         acceptance=None,
         test_assignments: list[Assignment] | None = None,
+        materializations: dict[str, dict] | None = None,
     ) -> int:
         """Write every change since the previous sync in one transaction."""
         with self.lock:
@@ -361,6 +367,7 @@ class Database:
             saved_snapshots = {name: dict(rows) for name, rows in self._snapshots.items()}
             saved_lengths = dict(self._lengths)
             saved_seq = self._chain_seq
+            saved_materializations = self._materializations_doc
             self.conn.execute("BEGIN")
             try:
                 changed = 0
@@ -385,6 +392,16 @@ class Database:
                     changed += self._sync_chains(chains)
                 if plan_store is not None:
                     changed += self._sync_plans(plan_store)
+                if materializations is not None:
+                    doc = json.dumps(materializations, ensure_ascii=False, sort_keys=True)
+                    if doc != self._materializations_doc:
+                        self.conn.execute(
+                            "INSERT INTO meta (key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (MATERIALIZATIONS_KEY, doc),
+                        )
+                        self._materializations_doc = doc
+                        changed += 1
                 if acceptance is not None:
                     changed += self._sync_keyed("acceptance_specs", acceptance.specs)
                     changed += self._sync_keyed("submissions", acceptance.submissions)
@@ -400,6 +417,7 @@ class Database:
                 self._snapshots = saved_snapshots
                 self._lengths = saved_lengths
                 self._chain_seq = saved_seq
+                self._materializations_doc = saved_materializations
                 raise
             return changed
 
@@ -483,6 +501,10 @@ class Database:
                     "#final" if is_final else ""
                 )
 
+            raw = self.get_meta(MATERIALIZATIONS_KEY)
+            materializations = json.loads(raw) if raw else {}
+            self._materializations_doc = raw
+
             return LoadedState(
                 store=store,
                 test_assignments=test,
@@ -493,4 +515,5 @@ class Database:
                 submissions=submissions,
                 records=records,
                 final_records=final_records,
+                materializations=materializations,
             )

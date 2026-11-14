@@ -191,7 +191,7 @@ python scripts/run_demo.py
 - **人 → 任务**：选择 Worker → 推荐开放任务，候选卡片显示任务标题、预算与截止日期；同样复用 `request_id` 与 `/events` 漏斗。
 - **人才库**：以真实简历样式展示候选人；技能分、负载、信誉明细默认隐藏，可切换到平台原始数据。
 - **反馈与权重**：新用户 onboarding、个人权重、学习曲线、进步曲线、全局权重 diff、重估、回滚、学习日志。
-- **任务链**：单模板/多模板组合拆解、节点表、关键路径、计划、计划版本回滚、自动重规划、节点状态锁定。
+- **任务链**：单模板/多模板组合拆解、动态拆分（`split=true`，按需求/模块/批次把大工作拆成 1–12 个可独立派单的小工作）、草稿确认后物化为独立 Task、父任务退出推荐、撤回物化、节点表、关键路径、计划、计划版本回滚、自动重规划、节点状态锁定。
 - **验收闭环**：加载 B2B 调研任务 → 提交合格/缺章节交付物 → 机器校验 → 同行/客户评分 → 接受/返工/驳回 → 查看权重变化和执行者能力。
 - **对答案学习**：一键跑 20 轮，查看 Top-1/Top-5/测试集 Top-1 曲线和逐轮权重更新。
 - **评委演示**：一键跑通「推荐 → 采纳 → 评分 → 权重 diff → 拆解 → 计划 → 重规划 → 回滚」。
@@ -218,7 +218,7 @@ cd task-recommender
 python -m pytest tests/ -q
 ```
 
-当前 423 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、文档上传与解压边界（含 PDF `/Fl`、间接 `/Filter`、长字典间隔、嵌套 Form XObject 与 `/Parent` 继承资源对象模型扫描）、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、10,000 任务大规模 strict 基准、事件/曝光/漏斗（标签派生、批量/体积上限）、选择学习与权重绑定、serving-parity 严格评估与校准、调优权重激活、文档约定、前端静态托管、学习过程演示数据与变量、案例墙、自定义模拟接口、简历推送页面与接口、简历推送 serving-parity（eligibility、探索 propensity、impression/事件、个人权重）、静态+模拟履约能力评价、任务完成度自动初评与手动调整、API 冒烟。
+当前 463 个测试覆盖 Phase 1 + Phase 2 + Phase 3：健康检查、领域模型/Store、合成数据与 ground truth、七维特征、ItemCF、双向推荐与硬约束、任务链、反馈闭环、信誉拆解、权重版本/回滚、AHP/熵权/投影、在线学习、探索与 IPS、画像/分群、三级个性化、双侧偏好、Phase 2/3 评估、组合模板、Beam/MILP、重规划、计划回滚、自然语言任务分类与字段抽取、文档上传与解压边界（含 PDF `/Fl`、间接 `/Filter`、长字典间隔、嵌套 Form XObject 与 `/Parent` 继承资源对象模型扫描）、验收闭环与能力指标、简历视图与原始数据隔离、1000 任务对答案学习基准、10,000 任务大规模 strict 基准、事件/曝光/漏斗（标签派生、批量/体积上限）、选择学习与权重绑定、serving-parity 严格评估与校准、调优权重激活、文档约定、前端静态托管、学习过程演示数据与变量、案例墙、自定义模拟接口、简历推送页面与接口、简历推送 serving-parity（eligibility、探索 propensity、impression/事件、个人权重）、静态+模拟履约能力评价、任务完成度自动初评与手动调整、API 冒烟。
 
 ## 离线评估
 
@@ -337,7 +337,10 @@ python scripts/evaluate_chains.py
 | GET | `/workers/{id}/capability` | 执行者能力指标 |
 | POST | `/recommend/workers` | 任务 → 候选人 Top-N |
 | POST | `/recommend/tasks` | worker → 任务 Top-N |
-| POST | `/chains/decompose` | 模板拆解；`mode=compose` 支持多模板组合 |
+| POST | `/chains/decompose` | 模板拆解；`mode=compose` 支持多模板组合；`split=true` 启用动态拆分与 `policy` |
+| GET | `/chains/drafts/{id}` | 查看拆分草稿（节点、拆分原因、质量、是否已物化） |
+| POST | `/chains/drafts/{id}/materialize` | 物化草稿：创建子任务并把父任务置为 `split` |
+| POST | `/chains/drafts/{id}/materialize/rollback` | 撤回物化（子任务已接单时返回 409） |
 | GET | `/chains/{id}` | 任务链详情（节点/边/关键路径） |
 | POST | `/chains/{id}/plan` | 链级贪心分配计划（保存版本） |
 | GET | `/chains/{id}/plans` | 计划版本列表 |
@@ -379,7 +382,15 @@ curl -X POST http://127.0.0.1:8000/chains/decompose \
   -H "Content-Type: application/json" \
   -d '{"task_id":"t0001","mode":"template","variant":"standard"}'
 
+# 动态拆分：按需求/模块/批次拆成可独立派单的小工作
+curl -X POST http://127.0.0.1:8000/chains/decompose \
+  -H "Content-Type: application/json" \
+  -d '{"task_id":"t0001","split":true,"policy":{"target_hours":8}}'
+
 curl -X POST http://127.0.0.1:8000/chains/<chain_id>/plan
+
+# 确认草稿后物化；父任务状态变为 split，子任务进入推荐与接单链路
+curl -X POST http://127.0.0.1:8000/chains/drafts/<draft_id>/materialize
 ```
 
 ## 任务链模板
@@ -396,6 +407,11 @@ curl -X POST http://127.0.0.1:8000/chains/<chain_id>/plan
 - 可选节点排除后的依赖 bypass
 - `hours_range` 工时区间（存在时取 expected）
 - 关键路径自动重算
+- `split=true` 动态拆分：按描述中的需求/模块/批次拆分、缩小过大节点、合并过小节点、按总工时/预算/工期分配资源；结果先落在草稿，确认后物化
+
+拆分后的父任务 `status="split"`，不再进入推荐；子任务复用现有推荐、接单和验收链路。统计任务数时必须排除 `status="split"`，避免父子重复计数。
+
+离线评估：`python scripts/evaluate_chain_split.py`，读取 `dev_data/chains/split_cases.jsonl`，输出 `reports/chain_split_eval.json/.md`，包含覆盖率增益、可派单率、粒度分布、重复派单数和确定性检查。
 
 ## 目录
 

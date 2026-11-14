@@ -83,6 +83,9 @@ def decompose(
     template: dict,
     variant: str = "standard",
     max_nodes: int = 10,
+    *,
+    split: bool = False,
+    policy: dict | None = None,
 ) -> DecompositionDraft:
     variant_config = template.get("variants", {}).get(variant, {})
     multiplier = float(variant_config.get("hours_multiplier", 1.0))
@@ -186,6 +189,13 @@ def decompose(
     )
     draft.template_category = template.get("category", "")
     draft.coverage = coverage_matrix(draft)
+    if split:
+        from app.chains.split import apply_split, parse_split_policy
+
+        apply_split(draft, task, parse_split_policy(policy))
+        draft.chain.critical_path, _ = compute_critical_path(
+            draft.chain.nodes
+        )
     return draft
 
 

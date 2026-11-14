@@ -17,3 +17,6 @@ task-recommender/data/tasktok.sqlite*
 
 # Template files
 .tmp/
+
+# Local worktrees
+.claude/worktrees/

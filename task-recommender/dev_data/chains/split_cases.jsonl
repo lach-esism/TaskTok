@@ -1,0 +1,12 @@
+{"task_id":"g01","category":"software_dev","title":"会员小程序开发","description":"1. 后端接口开发；2. 前端页面；3. 数据看板；4. 联调测试。","estimated_hours":64,"budget":30000,"deadline_days":30,"required_skills":{"backend":3}}
+{"task_id":"g02","category":"ui_ux_design","title":"SaaS 数据看板体验改版","description":"1. 用户研究；2. 信息架构；3. 线框设计；4. 高保真视觉稿；5. 设计规范。","estimated_hours":60,"budget":18000,"deadline_days":30,"required_skills":{"ui":3}}
+{"task_id":"g03","category":"brand_design","title":"新茶饮品牌视觉升级","description":"1. 品牌定位；2. Logo 概念；3. 包装设计；4. 品牌手册。","estimated_hours":50,"budget":16000,"deadline_days":30,"required_skills":{"brand":3}}
+{"task_id":"g04","category":"content_writing","title":"行业白皮书撰写","description":"1. 选题调研；2. 撰写 3 章正文；3. 编辑润色；4. 发布。","estimated_hours":40,"budget":9000,"deadline_days":21,"required_skills":{"writing":3}}
+{"task_id":"g05","category":"video_production","title":"品牌宣传片制作","description":"1. 脚本；2. 分镜；3. 拍摄；4. 剪辑；5. 字幕。","estimated_hours":56,"budget":20000,"deadline_days":30,"required_skills":{"video_editing":3}}
+{"task_id":"g06","category":"marketing_campaign","title":"新品上市营销活动","description":"1. 目标与策略；2. 创意物料；3. 渠道投放；4. 数据复盘。","estimated_hours":48,"budget":15000,"deadline_days":30,"required_skills":{"marketing":3}}
+{"task_id":"g07","category":"data_annotation","title":"商品图片标注","description":"标注 2500 条数据，含质检与返工。","estimated_hours":60,"budget":12000,"deadline_days":21,"required_skills":{"data_labeling":3}}
+{"task_id":"g08","category":"translation_localization","title":"技术文档本地化","description":"翻译 8000 字技术文档，含术语表与校对。","estimated_hours":48,"budget":14000,"deadline_days":21,"required_skills":{"translation":3}}
+{"task_id":"g09","category":"ecommerce_ops","title":"店铺运营优化","description":"1. 市场调研；2. 商品页优化；3. 视觉素材；4. 活动运营；5. 数据分析。","estimated_hours":52,"budget":16000,"deadline_days":30,"required_skills":{"operations":3}}
+{"task_id":"g10","category":"recruitment","title":"技术团队招聘支持","description":"1. 岗位 JD；2. 人才寻访；3. 简历筛选；4. 面试安排；5. 入职跟进。","estimated_hours":44,"budget":12000,"deadline_days":30,"required_skills":{"sourcing":3}}
+{"task_id":"g11","category":"consulting_research","title":"市场进入调研","description":"1. 范围界定；2. 桌面研究；3. 专家访谈；4. 分析报告；5. 汇报。","estimated_hours":64,"budget":28000,"deadline_days":30,"required_skills":{"research":3}}
+{"task_id":"g12","category":"training_course","title":"新员工培训课程开发","description":"1. 需求分析；2. 课程大纲；3. 内容开发；4. 幻灯片；5. 试讲。","estimated_hours":56,"budget":18000,"deadline_days":30,"required_skills":{"training_design":3}}

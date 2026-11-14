@@ -291,3 +291,29 @@ def split_draft_factory():
         return decompose(task, templates[task.category])
 
     return make
+
+
+@pytest.fixture
+def make_draft():
+    from app.domain import DecompositionDraft, TaskChain
+
+    def make(nodes):
+        chain = TaskChain(
+            chain_id="ch_make",
+            root_task_id="t1",
+            customer_id="c1",
+            deadline=NOW + timedelta(days=7),
+            budget=10000,
+            nodes=list(nodes),
+        )
+        return DecompositionDraft(
+            draft_id="d_make",
+            task_id="t1",
+            template_id="make",
+            variant="standard",
+            chain=chain,
+            requirements=[],
+            coverage={},
+        )
+
+    return make

@@ -178,7 +178,9 @@ python -m pip install -r requirements.txt
 python scripts/run_demo.py
 ```
 
-服务默认监听 `127.0.0.1:8000`。浏览器打开 **`http://127.0.0.1:8000/ui/`** 即可使用前端演示。
+服务默认监听 `127.0.0.1:8000`。浏览器打开 **`http://127.0.0.1:8000/app/`** 使用完整前端（`frontend/`，走 `/market/*` 接口），`/ui/` 是旧演示页。
+
+业务数据存在 SQLite：默认 `data/tasktok.sqlite`，首次启动自动播种，删掉即重置。`TASKTOK_DB=<路径>` 换库，`TASKTOK_DB=`（空）走纯内存。接口清单见 [docs/db-integration-progress.md](../docs/db-integration-progress.md)。
 
 ## 前端演示
 

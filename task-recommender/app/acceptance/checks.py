@@ -111,6 +111,14 @@ def _min_chars(
     return length >= minimum, f"{length}/{minimum} chars"
 
 
+def _min_files(
+    criterion: AcceptanceCriterion, submission: Submission
+) -> tuple[bool, str]:
+    files = [f for f in (submission.artifacts.get("files") or []) if str(f).strip()]
+    minimum = int(criterion.check_config.get("min_files", 1))
+    return len(files) >= minimum, f"{len(files)}/{minimum} files"
+
+
 def _run_machine_criterion(
     criterion: AcceptanceCriterion,
     submission: Submission,
@@ -128,6 +136,8 @@ def _run_machine_criterion(
         passed, evidence = _deadline(criterion, submission, task)
     elif criterion.check_type == "min_chars":
         passed, evidence = _min_chars(criterion, submission)
+    elif criterion.check_type == "min_files":
+        passed, evidence = _min_files(criterion, submission)
     else:
         raise ValueError(
             f"unsupported machine check: {criterion.check_type}"

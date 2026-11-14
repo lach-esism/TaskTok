@@ -14,6 +14,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.concurrency import run_in_threadpool
 from starlette.formparsers import MultiPartParser
 
 from app.acceptance.service import AcceptanceService
@@ -27,6 +28,7 @@ from app.config import APP_VERSION, DEFAULT_WEIGHTS
 from app.data.store import Store
 from app.data.synthetic import generate_dataset
 from app.data.templates import load_templates
+from app.db.bootstrap import open_database
 from app.domain import (
     Impression,
     RecommendationEvent,
@@ -52,6 +54,8 @@ from app.learning.choice import (
     build_pairs,
 )
 from app.learning.exploration import ExplorationPolicy
+from app.market import DEMO_CUSTOMER_ID, DEMO_WORKER_ID, MarketService
+from app.market.service import MarketError
 from app.learning.online import OnlineWeightLearner
 from app.learning.weights import AHP_PRIOR, project_weights_with_report
 from app.semantic import SemanticMatcher
@@ -111,6 +115,8 @@ TEMPLATE_PATH = (
 )
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+# TaskTok product frontend at the repository root (served at /app).
+MARKET_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 BENCHMARK_DB_PATH = (
     Path(__file__).resolve().parent.parent
     / "data"
@@ -466,8 +472,18 @@ def create_app(
     benchmark_db: Path | None = None,
     events_dir: Path | None = None,
     exploration_seed: int | None = None,
+    db_path: Path | str | None = None,
 ) -> FastAPI:
-    """Create the Phase 2 application."""
+    """Create the Phase 2 application.
+
+    ``db_path`` (or env ``TASKTOK_DB`` when no ``store`` is passed) enables
+    the SQLite business database: seeded on first start, restored on later
+    starts, and written after every successful write request.
+    """
+    if db_path is None and store is None:
+        db_path = os.environ.get("TASKTOK_DB") or None
+    database = None
+    loaded = None
     # Accepted uploads are capped at MAX_UPLOAD_BYTES before form parsing, so
     # this spool threshold keeps the accepted file parts in RAM.
     MultiPartParser.spool_max_size = upload_extract.MAX_UPLOAD_BYTES
@@ -480,6 +496,10 @@ def create_app(
         limit=MAX_EVENTS_BODY_BYTES,
     )
     test_assignments = []
+    if db_path is not None:
+        if store is not None:
+            raise ValueError("pass either store or db_path, not both")
+        database, loaded, store, test_assignments = open_database(db_path)
     if store is None:
         dataset = generate_dataset()
         store = Store(
@@ -533,6 +553,40 @@ def create_app(
         epsilon=0.10, seed=exploration_seed
     )
     app.state.service_cache = None
+    app.state.db = database
+    if loaded is not None:
+        app.state.chains.update(loaded.chains)
+        app.state.plan_store._versions.update(loaded.plan_versions)
+        app.state.plan_store._active.update(loaded.plan_active)
+        app.state.acceptance.specs.update(loaded.specs)
+        app.state.acceptance.submissions.update(loaded.submissions)
+        app.state.acceptance.records.update(loaded.records)
+        app.state.acceptance.final_records.update(loaded.final_records)
+
+    def persist() -> None:
+        """Write everything changed since the last sync to the database."""
+        if app.state.db is None:
+            return
+        app.state.db.sync(
+            app.state.store,
+            chains=app.state.chains,
+            plan_store=app.state.plan_store,
+            acceptance=app.state.acceptance,
+            test_assignments=app.state.test_assignments,
+        )
+
+    app.state.persist = persist
+
+    if database is not None:
+        @app.middleware("http")
+        async def _persist_writes(request: Request, call_next):
+            response = await call_next(request)
+            if (
+                request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and response.status_code < 400
+            ):
+                await run_in_threadpool(persist)
+            return response
 
     def invalidate_service() -> None:
         """Drop the cached ranker after assignments/feedback/weights change."""
@@ -1100,6 +1154,11 @@ def create_app(
 
     @app.post("/feedback")
     def create_feedback(request: FeedbackRequest) -> dict:
+        return apply_feedback(request)
+
+    def apply_feedback(request: FeedbackRequest) -> dict:
+        """Record feedback and update reputation/preferences (also used by
+        the marketplace acceptance flow)."""
         current = require_store()
         service = FeedbackService(current)
         try:
@@ -1811,6 +1870,120 @@ def create_app(
             "worker_id": node.assigned_worker_id,
         }
 
+    # ------------------------------------------------------------------
+    # Marketplace flow for the TaskTok frontend (frontend/ at /app)
+    # ------------------------------------------------------------------
+    app.state.market = MarketService(
+        require_store,
+        active_service,
+        app.state.acceptance,
+        app.state.events,
+        app.state.exploration,
+        app.state.templates,
+        apply_feedback,
+        invalidate_service,
+    )
+
+    def market_call(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except MarketError as error:
+            raise HTTPException(status_code=error.status, detail=error.message)
+
+    market = app.state.market
+    if database is not None and loaded is None:
+        # Fresh database: put the demo worker's workspace into every state.
+        market.seed_demo()
+        persist()
+
+    @app.get("/market/feed")
+    def market_feed(worker_id: str = DEMO_WORKER_ID) -> dict:
+        feed = market_call(market.feed, worker_id)
+        persist()  # GET is not covered by the write middleware; keep the impression
+        return feed
+
+    @app.get("/market/tasks/{task_id}")
+    def market_task(task_id: str) -> dict:
+        return market_call(market.detail, task_id)
+
+    @app.post("/market/tasks")
+    def market_publish(payload: dict, customer_id: str = DEMO_CUSTOMER_ID) -> dict:
+        return market_call(market.publish, payload, customer_id)
+
+    @app.patch("/market/tasks/{task_id}")
+    def market_patch(task_id: str, payload: dict) -> dict:
+        return market_call(market.patch, task_id, payload)
+
+    @app.get("/market/tasks/{task_id}/applicants")
+    def market_applicants(task_id: str) -> list[dict]:
+        return market_call(market.applicants, task_id)
+
+    @app.post("/market/tasks/{task_id}/applications")
+    def market_apply(task_id: str, payload: dict | None = None) -> dict:
+        payload = payload or {}
+        return market_call(
+            market.apply,
+            task_id,
+            payload.get("worker_id") or DEMO_WORKER_ID,
+            str(payload.get("note") or ""),
+            payload.get("request_id"),
+        )
+
+    @app.delete("/market/tasks/{task_id}/applications")
+    def market_withdraw(task_id: str, worker_id: str = DEMO_WORKER_ID) -> dict:
+        return market_call(market.withdraw, task_id, worker_id)
+
+    @app.post("/market/tasks/{task_id}/select")
+    def market_select(task_id: str, payload: dict) -> dict:
+        return market_call(market.select, task_id, str(payload.get("worker_id") or ""))
+
+    @app.post("/market/tasks/{task_id}/decline")
+    def market_decline(task_id: str, payload: dict) -> dict:
+        return market_call(market.decline, task_id, str(payload.get("worker_id") or ""))
+
+    @app.post("/market/tasks/{task_id}/submission")
+    def market_submit(task_id: str, payload: dict) -> dict:
+        return market_call(
+            market.submit,
+            task_id,
+            payload.get("worker_id") or DEMO_WORKER_ID,
+            payload.get("files") or [],
+            str(payload.get("note") or ""),
+        )
+
+    @app.post("/market/tasks/{task_id}/simulate-delivery")
+    def market_simulate(task_id: str) -> dict:
+        return market_call(market.simulate_delivery, task_id)
+
+    @app.post("/market/tasks/{task_id}/review")
+    def market_review(task_id: str, payload: dict) -> dict:
+        if payload.get("decision") == "rework":
+            return market_call(market.rework, task_id, str(payload.get("reason") or ""))
+        return market_call(market.review_pass, task_id, list(payload.get("passed") or []))
+
+    @app.get("/market/workers/{worker_id}/applicant")
+    def market_applicant(worker_id: str) -> dict:
+        return market_call(market.applicant, worker_id)
+
+    @app.get("/market/work-items")
+    def market_work_items(worker_id: str = DEMO_WORKER_ID) -> dict:
+        return market_call(market.work_items, worker_id)
+
+    @app.get("/market/published")
+    def market_published(customer_id: str = DEMO_CUSTOMER_ID) -> list[dict]:
+        return market_call(market.published, customer_id)
+
+    @app.get("/market/me")
+    def market_me(worker_id: str = DEMO_WORKER_ID) -> dict:
+        return market_call(market.me, worker_id)
+
+    if MARKET_FRONTEND_DIR.exists():
+        app.mount(
+            "/app",
+            StaticFiles(directory=MARKET_FRONTEND_DIR, html=True),
+            name="app",
+        )
+
     if FRONTEND_DIR.exists():
         app.mount(
             "/ui",
@@ -1818,9 +1991,11 @@ def create_app(
             name="ui",
         )
 
-        @app.get("/")
-        def root() -> RedirectResponse:
-            return RedirectResponse(url="/ui/")
+    @app.get("/")
+    def root() -> RedirectResponse:
+        # 根路径进新前端（frontend/）；旧的推荐引擎演示页仍在 /ui/
+        target = "/app/" if MARKET_FRONTEND_DIR.exists() else "/ui/"
+        return RedirectResponse(url=target)
 
     @app.post(
         "/chains/{chain_id}/nodes/{node_id}/recommend",

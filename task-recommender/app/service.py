@@ -383,12 +383,12 @@ class RecommendationService:
             score = fuse_scores(features, weights)
             cold_start = not self.store.worker_assignments(worker.worker_id)
             reasons = [
-                f"skill={features['skill']:.2f}",
-                f"reputation={features['reputation']:.2f}",
-                f"expertise={features['expertise']:.2f}",
+                f"技能匹配 {features['skill']:.2f}",
+                f"历史口碑 {features['reputation']:.2f}",
+                f"同类经验 {features['expertise']:.2f}",
             ]
             if cold_start:
-                reasons.append("cold start: no assignment history")
+                reasons.append("新人：暂无历史派单")
             candidates.append(
                 ScoredCandidate(
                     candidate_id=worker.worker_id,
@@ -472,12 +472,12 @@ class RecommendationService:
             )
             score = fuse_scores(features, weights)
             reasons = [
-                f"skill={features['skill']:.2f}",
-                f"preference={features['preference']:.2f}",
-                f"load={features['load']:.2f}",
+                f"技能匹配 {features['skill']:.2f}",
+                f"偏好契合 {features['preference']:.2f}",
+                f"负荷余量 {features['load']:.2f}",
             ]
             if cold_start:
-                reasons.append("cold start: no assignment history")
+                reasons.append("新人：暂无历史派单")
             candidates.append(
                 ScoredCandidate(
                     candidate_id=task.task_id,

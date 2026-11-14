@@ -162,6 +162,31 @@ class Task:
     budget_max: float = 0.0
     created_at: datetime = field(default_factory=_utcnow)
     required_skill_weights: dict[str, float] = field(default_factory=dict)
+    # Marketplace presentation data set by the publisher (verify method,
+    # deliverables, acceptance notes, checklist). Not used for ranking.
+    meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class Application:
+    """A worker's request to take an open task (marketplace flow).
+
+    ``pending`` → ``accepted`` (customer selected this worker, an
+    ``Assignment`` exists) | ``rejected`` (another worker was selected) |
+    ``withdrawn`` (worker cancelled).
+    """
+
+    application_id: str
+    task_id: str
+    worker_id: str
+    status: str = "pending"
+    note: str = ""
+    source: str = "self"   # self (worker applied) | invited (recommended)
+    request_id: str | None = None
+    score: float | None = None
+    assignment_id: str | None = None
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
 
 
 @dataclass

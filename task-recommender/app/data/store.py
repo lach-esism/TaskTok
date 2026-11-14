@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from app.domain import (
+    Application,
     Assignment,
     Customer,
     Feedback,
@@ -48,6 +49,7 @@ class Store:
         customer_preferences: dict[str, CustomerPreferenceProfile] | None = None,
         events: list[RecommendationEvent] | None = None,
         impressions: list[Impression] | None = None,
+        applications: dict[str, Application] | None = None,
     ) -> None:
         self.workers = {worker.worker_id: worker for worker in workers}
         self.customers = {customer.customer_id: customer for customer in customers}
@@ -63,6 +65,7 @@ class Store:
         self.customer_preferences = dict(customer_preferences or {})
         self.events = list(events or [])
         self.impressions = list(impressions or [])
+        self.applications = dict(applications or {})
         # Incremental indexes. Records are only appended (or the list is
         # replaced); both cases are detected here so repeated request-path
         # calls do not rescan the whole history.

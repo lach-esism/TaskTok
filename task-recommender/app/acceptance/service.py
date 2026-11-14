@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 from app.acceptance.checks import run_machine_checks
-from app.acceptance.specs import build_research_spec
+from app.acceptance.specs import build_generic_spec, build_research_spec
 from app.data.store import Store
 from app.domain import (
     AcceptanceRecord,
@@ -73,12 +73,10 @@ class AcceptanceService:
         existing = self.specs.get(task.task_id)
         if existing is not None:
             return existing
-        if task.category != "consulting_research":
-            raise ValueError(
-                "acceptance specs currently support consulting_research "
-                "tasks only"
-            )
-        spec = build_research_spec(task.task_id)
+        if task.category == "consulting_research":
+            spec = build_research_spec(task.task_id)
+        else:
+            spec = build_generic_spec(task.task_id)
         self.specs[task.task_id] = spec
         return spec
 

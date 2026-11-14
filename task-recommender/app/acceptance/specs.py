@@ -103,6 +103,66 @@ def research_criteria() -> list[AcceptanceCriterion]:
     return criteria
 
 
+GENERIC_SPEC_VERSION = 1
+
+
+def generic_criteria() -> list[AcceptanceCriterion]:
+    """Category-agnostic criteria for marketplace deliveries.
+
+    Machine layer only checks what every delivery has (at least one
+    deliverable file and the deadline); quality is judged by the customer.
+    """
+    return [
+        AcceptanceCriterion(
+            key="deliverables",
+            label="至少提交一个交付文件",
+            dimension="completeness",
+            layer="machine",
+            required=True,
+            weight=0.15,
+            check_type="min_files",
+            check_config={"min_files": 1},
+        ),
+        AcceptanceCriterion(
+            key="deadline",
+            label="在截止时间前提交",
+            dimension="timeliness",
+            layer="machine",
+            required=False,
+            weight=0.10,
+            check_type="deadline",
+            check_config={},
+        ),
+        AcceptanceCriterion(
+            key="quality",
+            label="交付质量符合要求",
+            dimension="accuracy",
+            layer="customer",
+            weight=0.40,
+            check_type="manual",
+        ),
+        AcceptanceCriterion(
+            key="completeness",
+            label="交付物齐全、可直接使用",
+            dimension="completeness",
+            layer="customer",
+            weight=0.35,
+            check_type="manual",
+        ),
+    ]
+
+
+def build_generic_spec(task_id: str) -> AcceptanceSpec:
+    return AcceptanceSpec(
+        spec_id=uuid.uuid4().hex,
+        task_id=task_id,
+        version=GENERIC_SPEC_VERSION,
+        criteria=generic_criteria(),
+        accept_threshold=0.80,
+        rework_threshold=0.50,
+    )
+
+
 def build_research_spec(task_id: str) -> AcceptanceSpec:
     return AcceptanceSpec(
         spec_id=uuid.uuid4().hex,

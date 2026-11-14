@@ -122,6 +122,68 @@ def test_no_evidence_falls_back_to_template(
     draft = apply_split(split_draft_factory(task), task, SplitPolicy())
     assert all(node.split_source == "template" for node in draft.chain.nodes)
     assert draft.split_count == len(draft.chain.nodes)
+    assert all(node.confidence < 1.0 for node in draft.chain.nodes)
+    assert all(
+        node.split_reason == "无结构化需求，使用模板"
+        for node in draft.chain.nodes
+    )
+
+
+def test_batch_reason_uses_clamped_piece_count():
+    from app.chains.split import _split_count
+    from app.domain import SubTask
+
+    node = SubTask(
+        subtask_id="s1",
+        chain_id="c1",
+        key="batch_annotation",
+        title="标注",
+        node_type="task",
+        estimated_hours=60.0,
+        required_skills={},
+        depends_on=[],
+        acceptance=[],
+    )
+    count, reason, source = _split_count(
+        node,
+        (100000, "条"),
+        SplitPolicy(),
+        8.0,
+        "data_annotation",
+    )
+    assert count == 12
+    assert "每批 8334 条" in reason
+    assert source == "batch"
+
+
+def test_merge_does_not_exceed_max_hours(split_task_factory):
+    from app.chains.split import _merge_tiny
+    from app.domain import SubTask
+
+    predecessor = SubTask(
+        subtask_id="s1",
+        chain_id="c1",
+        key="a",
+        title="A",
+        node_type="task",
+        estimated_hours=16.0,
+        required_skills={},
+        depends_on=[],
+        acceptance=[],
+    )
+    tiny = SubTask(
+        subtask_id="s2",
+        chain_id="c1",
+        key="b",
+        title="B",
+        node_type="task",
+        estimated_hours=0.9,
+        required_skills={},
+        depends_on=["a"],
+        acceptance=[],
+    )
+    nodes = _merge_tiny([predecessor, tiny], SplitPolicy())
+    assert [node.key for node in nodes] == ["a", "b"]
 
 
 def test_many_modules_converge_or_raise(

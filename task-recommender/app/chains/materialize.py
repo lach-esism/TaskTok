@@ -107,6 +107,8 @@ def validate_materialization(
     if not planned:
         errors.append("no subtasks to materialize")
         return errors
+    if parent.status != "open":
+        errors.append("parent task is not open")
 
     validation = validate_dag(draft.chain.nodes)
     if not validation.valid:

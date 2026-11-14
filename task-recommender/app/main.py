@@ -1752,6 +1752,18 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail="parent task not found"
             )
+        if any(
+            record["parent_task_id"] == parent.task_id
+            for record in app.state.materializations.values()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="parent task already materialized",
+            )
+        if parent.status != "open":
+            raise HTTPException(
+                status_code=422, detail="parent task is not open"
+            )
         has_assignment = any(
             assignment.task_id == parent.task_id
             for assignment in current.assignments
@@ -1811,9 +1823,13 @@ def create_app(
         for task_id in record["task_ids"]:
             current.tasks.pop(task_id, None)
         parent = current.tasks.get(record["parent_task_id"])
-        if parent is not None:
-            parent.status = "open"
         del app.state.materializations[draft_id]
+        still_materialized = any(
+            other["parent_task_id"] == record["parent_task_id"]
+            for other in app.state.materializations.values()
+        )
+        if parent is not None and not still_materialized:
+            parent.status = "open"
         invalidate_service()
         append_materialization_event(
             app.state.materialization_log,

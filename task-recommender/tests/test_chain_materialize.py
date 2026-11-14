@@ -180,6 +180,30 @@ def test_rollback_restores_parent(client):
     )
 
 
+def test_materialize_rejects_non_open_parent(client):
+    draft_id, _ = _split_draft(client)
+    client.app.state.store.tasks["t1"].status = "completed"
+    response = client.post(f"/chains/drafts/{draft_id}/materialize")
+    assert response.status_code == 422
+
+
+def test_second_materialization_for_same_parent_is_rejected(client):
+    first_id, _ = _split_draft(client)
+    second_id, _ = _split_draft(client)
+    assert (
+        client.post(
+            f"/chains/drafts/{first_id}/materialize"
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            f"/chains/drafts/{second_id}/materialize"
+        ).status_code
+        == 409
+    )
+
+
 def test_rollback_rejected_when_subtask_assigned(client):
     from datetime import datetime, timezone
 

@@ -296,7 +296,9 @@ def _split_count(
 ) -> tuple[int, str, str]:
     if quantity is not None and quantity[0] >= 2 * policy.min_batch_size:
         batch_size = batch_rule_for(category).default_batch_size
-        count = math.ceil(quantity[0] / batch_size)
+        count = min(
+            math.ceil(quantity[0] / batch_size), policy.max_pieces
+        )
         if count >= 2:
             per_batch = math.ceil(quantity[0] / count)
             return (
@@ -310,7 +312,10 @@ def _split_count(
         or node.estimated_hours <= policy.max_hours
     ):
         return 1, "", node.split_source
-    count = max(2, math.ceil(node.estimated_hours / target_hours))
+    count = min(
+        max(2, math.ceil(node.estimated_hours / target_hours)),
+        policy.max_pieces,
+    )
     return (
         count,
         f"{node.estimated_hours:.1f} 小时超过 {policy.max_hours:.1f}，"
@@ -418,6 +423,11 @@ def _merge_tiny(nodes: list[SubTask], policy: SplitPolicy) -> list[SubTask]:
                 item for item in nodes if predecessor.key in item.depends_on
             ]
             if [item.key for item in successors] != [node.key]:
+                continue
+            if (
+                predecessor.estimated_hours + node.estimated_hours
+                > policy.max_hours
+            ):
                 continue
             predecessor.estimated_hours = round(
                 predecessor.estimated_hours + node.estimated_hours, 4
@@ -580,6 +590,14 @@ def apply_split(
     quantities = _accumulate_quantities(nodes, items, rules)
     _scale_hours(nodes, task.estimated_hours)
     nodes = _build_nodes(nodes, quantities, policy, task.category)
+    has_evidence = any(
+        item.module_key is not None for item in items
+    ) or bool(quantities)
+    if not has_evidence:
+        for node in nodes:
+            node.confidence = min(node.confidence, 0.8)
+            if not node.split_reason:
+                node.split_reason = "无结构化需求，使用模板"
     _allocate_budget(nodes, task.budget)
     _assign_deadlines(nodes, task.deadline)
 

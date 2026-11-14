@@ -390,6 +390,12 @@ class SubTask:
     risk_flags: list[str] = field(default_factory=list)
     status: str = "pending"
     assigned_worker_id: str | None = None
+    budget: float = 0.0
+    deadline: datetime | None = None
+    split_source: str = "template"
+    split_reason: str = ""
+    confidence: float = 1.0
+    parent_key: str | None = None
 
 
 @dataclass
@@ -441,6 +447,9 @@ class DecompositionDraft:
     requirements: list[str]
     coverage: dict[str, list[str]]
     quality: "DecompositionQuality | None" = None
+    split_policy: dict | None = None
+    split_count: int = 0
+    uncovered_requirements: list[str] = field(default_factory=list)
 
 
 @dataclass

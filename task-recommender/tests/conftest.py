@@ -278,3 +278,16 @@ def split_task_factory():
         return Task(**values)
 
     return make
+
+
+@pytest.fixture
+def split_draft_factory():
+    from app.chains.decompose import decompose
+    from app.data.templates import load_templates
+
+    templates = load_templates("data/chain_templates/common_task_chains.json")
+
+    def make(task):
+        return decompose(task, templates[task.category])
+
+    return make

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 
-from app.chains.split_rules import ModuleRule, rules_for
-from app.domain import Task
+from app.chains.dag import critical_path, topological_order, validate_dag
+from app.chains.split_rules import ModuleRule, batch_rule_for, rules_for
+from app.domain import ChainEdge, DecompositionDraft, SubTask, Task
 
 _FLOAT_FIELDS = ("target_hours", "min_hours", "max_hours")
 _INT_FIELDS = ("max_pieces", "min_batch_size", "default_batch_size")
@@ -142,3 +144,404 @@ def extract_structured_requirements(task: Task) -> list[RequirementItem]:
             )
         )
     return items
+
+
+def _copy_node(node: SubTask) -> SubTask:
+    return replace(
+        node,
+        required_skills=dict(node.required_skills),
+        depends_on=list(node.depends_on),
+        acceptance=list(node.acceptance),
+        risk_flags=list(node.risk_flags),
+    )
+
+
+def _terminals(nodes: list[SubTask]) -> set[str]:
+    keys = {node.key for node in nodes}
+    for node in nodes:
+        for dependency in node.depends_on:
+            keys.discard(dependency)
+    return keys
+
+
+def _add_module_nodes(
+    nodes: list[SubTask],
+    items: list[RequirementItem],
+    rules: tuple[ModuleRule, ...],
+    policy: SplitPolicy,
+) -> list[SubTask]:
+    by_key = {rule.key: rule for rule in rules}
+    pending: dict[str, list[str]] = {}
+    for item in items:
+        if item.module_key is None:
+            continue
+        rule = by_key.get(item.module_key)
+        if rule is None:
+            continue
+        covered = any(
+            node.key == rule.key or rule.label in node.title for node in nodes
+        )
+        if not covered:
+            pending.setdefault(rule.key, []).append(item.text)
+    if not pending:
+        return nodes
+
+    chain_id = nodes[0].chain_id if nodes else ""
+    root = topological_order(nodes)[0]
+    terminals = _terminals(nodes)
+    used = {node.key for node in nodes}
+    created: list[SubTask] = []
+    for module_key, texts in pending.items():
+        rule = by_key[module_key]
+        key = f"module_{module_key}"
+        while key in used:
+            key = f"{key}_x"
+        used.add(key)
+        created.append(
+            SubTask(
+                subtask_id=f"{chain_id}_{key}",
+                chain_id=chain_id,
+                key=key,
+                title=rule.label,
+                node_type="task",
+                estimated_hours=policy.target_hours,
+                required_skills=dict(rule.skills),
+                depends_on=[root],
+                acceptance=list(texts),
+                split_source="module",
+                split_reason="；".join(texts),
+                confidence=0.7,
+            )
+        )
+    for node in nodes:
+        if node.key in terminals:
+            node.depends_on = [
+                *node.depends_on,
+                *(created_node.key for created_node in created),
+            ]
+    return [*nodes, *created]
+
+
+def _accumulate_quantities(
+    nodes: list[SubTask],
+    items: list[RequirementItem],
+    rules: tuple[ModuleRule, ...],
+) -> dict[str, tuple[int, str | None]]:
+    by_key = {rule.key: rule for rule in rules}
+    node_by_key = {node.key: node for node in nodes}
+    quantities: dict[str, tuple[int, str | None]] = {}
+    for item in items:
+        if item.quantity is None:
+            continue
+        rule = by_key.get(item.module_key) if item.module_key else None
+        target: SubTask | None = None
+        if rule is not None:
+            target = node_by_key.get(rule.key) or next(
+                (node for node in nodes if rule.label in node.title), None
+            )
+            if target is None:
+                target = node_by_key.get(f"module_{rule.key}")
+        if target is None:
+            candidates = [
+                node for node in nodes if node.node_type != "delivery"
+            ]
+            if not candidates:
+                continue
+            target = sorted(
+                candidates, key=lambda node: (-node.estimated_hours, node.key)
+            )[0]
+        total, unit = quantities.get(
+            target.key, (0, item.unit)
+        )
+        quantities[target.key] = (
+            total + item.quantity,
+            unit or item.unit,
+        )
+    return quantities
+
+
+def _scale_hours(nodes: list[SubTask], target_hours: float) -> None:
+    total = sum(node.estimated_hours for node in nodes)
+    if target_hours <= 0 or total <= 0:
+        return
+    factor = target_hours / total
+    for node in nodes:
+        node.estimated_hours = round(node.estimated_hours * factor, 4)
+    difference = target_hours - sum(
+        node.estimated_hours for node in nodes
+    )
+    for node in reversed(nodes):
+        if node.node_type != "delivery":
+            node.estimated_hours = round(
+                node.estimated_hours + difference, 4
+            )
+            break
+
+
+def _split_count(
+    node: SubTask,
+    quantity: tuple[int, str | None] | None,
+    policy: SplitPolicy,
+    target_hours: float,
+    category: str | None,
+) -> tuple[int, str, str]:
+    if quantity is not None and quantity[0] >= 2 * policy.min_batch_size:
+        batch_size = batch_rule_for(category).default_batch_size
+        count = math.ceil(quantity[0] / batch_size)
+        if count >= 2:
+            per_batch = math.ceil(quantity[0] / count)
+            return (
+                count,
+                f"{quantity[0]} {quantity[1] or ''}，每批 "
+                f"{per_batch} {quantity[1] or ''}".strip(),
+                "batch",
+            )
+    if (
+        node.node_type in {"review", "delivery"}
+        or node.estimated_hours <= policy.max_hours
+    ):
+        return 1, "", node.split_source
+    count = max(2, math.ceil(node.estimated_hours / target_hours))
+    return (
+        count,
+        f"{node.estimated_hours:.1f} 小时超过 {policy.max_hours:.1f}，"
+        f"按 {target_hours:.1f} 小时拆分",
+        node.split_source,
+    )
+
+
+def _split_pass(
+    nodes: list[SubTask],
+    quantities: dict[str, tuple[int, str | None]],
+    policy: SplitPolicy,
+    target_hours: float,
+    category: str | None,
+) -> list[SubTask]:
+    order = topological_order(nodes)
+    by_key = {node.key: node for node in nodes}
+    used = {node.key for node in nodes}
+    replacements: dict[str, list[SubTask]] = {}
+    result: list[SubTask] = []
+    for key in order:
+        node = by_key[key]
+        count, reason, source = _split_count(
+            node, quantities.get(key), policy, target_hours, category
+        )
+        count = min(count, policy.max_pieces)
+        if count <= 1:
+            result.append(node)
+            continue
+        children: list[SubTask] = []
+        remaining = node.estimated_hours
+        for index in range(1, count + 1):
+            if index < count:
+                hours = round(node.estimated_hours / count, 4)
+            else:
+                hours = round(remaining, 4)
+            remaining = round(remaining - hours, 4)
+            child_key = f"{node.key}_{index}"
+            while child_key in used:
+                child_key = f"{child_key}_x"
+            used.add(child_key)
+            children.append(
+                SubTask(
+                    subtask_id=f"{node.chain_id}_{child_key}",
+                    chain_id=node.chain_id,
+                    key=child_key,
+                    title=f"{node.title}（{index}/{count}）",
+                    node_type=node.node_type,
+                    estimated_hours=hours,
+                    required_skills=dict(node.required_skills),
+                    depends_on=list(node.depends_on),
+                    acceptance=[
+                        *node.acceptance,
+                        f"第 {index}/{count} 批",
+                    ],
+                    optional=node.optional,
+                    parallel_group=node.key,
+                    risk_flags=list(node.risk_flags),
+                    budget=node.budget,
+                    deadline=node.deadline,
+                    split_source=source,
+                    split_reason=reason,
+                    confidence=node.confidence,
+                    parent_key=node.key,
+                )
+            )
+        replacements[node.key] = children
+        result.extend(children)
+
+    for node in result:
+        rewritten: list[str] = []
+        for dependency in node.depends_on:
+            children = replacements.get(dependency)
+            if children:
+                rewritten.extend(child.key for child in children)
+            else:
+                rewritten.append(dependency)
+        node.depends_on = rewritten
+    return result
+
+
+def _merge_tiny(nodes: list[SubTask], policy: SplitPolicy) -> list[SubTask]:
+    changed = True
+    while changed:
+        changed = False
+        order = topological_order(nodes)
+        by_key = {node.key: node for node in nodes}
+        for key in order:
+            node = by_key.get(key)
+            if (
+                node is None
+                or node.estimated_hours >= policy.min_hours
+                or node.node_type == "delivery"
+            ):
+                continue
+            predecessors = [
+                item for item in nodes if item.key in node.depends_on
+            ]
+            if len(predecessors) != 1:
+                continue
+            predecessor = predecessors[0]
+            if predecessor.node_type != node.node_type:
+                continue
+            successors = [
+                item for item in nodes if predecessor.key in item.depends_on
+            ]
+            if [item.key for item in successors] != [node.key]:
+                continue
+            predecessor.estimated_hours = round(
+                predecessor.estimated_hours + node.estimated_hours, 4
+            )
+            predecessor.acceptance = list(
+                dict.fromkeys([*predecessor.acceptance, *node.acceptance])
+            )
+            for item in nodes:
+                if node.key in item.depends_on:
+                    item.depends_on = [
+                        predecessor.key if dependency == node.key
+                        else dependency
+                        for dependency in item.depends_on
+                    ]
+            nodes.remove(node)
+            changed = True
+            break
+    return nodes
+
+
+def _build_nodes(
+    base_nodes: list[SubTask],
+    quantities: dict[str, tuple[int, str | None]],
+    policy: SplitPolicy,
+    category: str | None,
+) -> list[SubTask]:
+    for attempt in range(4):
+        target_hours = policy.target_hours * (1.25 ** attempt)
+        nodes = [_copy_node(node) for node in base_nodes]
+        nodes = _split_pass(
+            nodes, quantities, policy, target_hours, category
+        )
+        nodes = _merge_tiny(nodes, policy)
+        if len(nodes) <= policy.max_pieces:
+            return nodes
+
+    nodes = [_copy_node(node) for node in base_nodes]
+    nodes = _split_pass(
+        nodes, quantities, policy, policy.target_hours, category
+    )
+    nodes = _merge_tiny(nodes, policy)
+    while len(nodes) > policy.max_pieces:
+        removable = [
+            node
+            for node in nodes
+            if node.split_source in {"requirement", "module"}
+        ]
+        if not removable:
+            raise ValueError("unable to split within max_pieces")
+        victim = min(
+            removable, key=lambda node: (node.confidence, node.key)
+        )
+        nodes.remove(victim)
+        for node in nodes:
+            if victim.key in node.depends_on:
+                node.depends_on = [
+                    dependency
+                    for dependency in node.depends_on
+                    if dependency != victim.key
+                ]
+    return nodes
+
+
+def _tokens(text: str) -> list[str]:
+    lowered = text.lower().strip()
+    tokens = [
+        lowered[index:index + 2]
+        for index in range(max(0, len(lowered) - 1))
+        if lowered[index:index + 2].strip()
+    ]
+    return tokens or ([lowered] if lowered else [])
+
+
+def _coverage(
+    nodes: list[SubTask], items: list[RequirementItem]
+) -> tuple[dict[str, list[str]], list[str]]:
+    coverage: dict[str, list[str]] = {}
+    uncovered: list[str] = []
+    for item in items:
+        tokens = _tokens(item.text)
+        matches = [
+            node.key
+            for node in nodes
+            if any(
+                token
+                in f"{node.title} {' '.join(node.acceptance)}".lower()
+                for token in tokens
+            )
+        ]
+        coverage[item.text] = matches
+        if not matches:
+            uncovered.append(item.text)
+    return coverage, uncovered
+
+
+def apply_split(
+    draft: DecompositionDraft,
+    task: Task,
+    policy: SplitPolicy,
+) -> DecompositionDraft:
+    """Split a template draft into independently dispatchable subtasks."""
+    items = extract_structured_requirements(task)
+    rules = rules_for(task.category)
+    nodes = [_copy_node(node) for node in draft.chain.nodes]
+    nodes = _add_module_nodes(nodes, items, rules, policy)
+    quantities = _accumulate_quantities(nodes, items, rules)
+    _scale_hours(nodes, task.estimated_hours)
+    nodes = _build_nodes(nodes, quantities, policy, task.category)
+
+    chain_id = draft.chain.chain_id
+    edges = [
+        ChainEdge(
+            chain_id=chain_id,
+            from_node=dependency,
+            to_node=node.key,
+        )
+        for node in nodes
+        for dependency in node.depends_on
+    ]
+    draft.chain.nodes = nodes
+    draft.chain.edges = edges
+    validation = validate_dag(nodes)
+    if not validation.valid:
+        raise ValueError(
+            "invalid chain after split: " + "; ".join(validation.errors)
+        )
+    path, _ = critical_path(nodes)
+    draft.chain.critical_path = path
+
+    coverage, uncovered = _coverage(nodes, items)
+    draft.requirements = [item.text for item in items]
+    draft.coverage = coverage
+    draft.uncovered_requirements = uncovered
+    draft.split_policy = asdict(policy)
+    draft.split_count = len(nodes)
+    return draft

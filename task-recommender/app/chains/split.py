@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
 
 from app.chains.dag import critical_path, topological_order, validate_dag
 from app.chains.split_rules import ModuleRule, batch_rule_for, rules_for
@@ -482,6 +483,60 @@ def _tokens(text: str) -> list[str]:
     return tokens or ([lowered] if lowered else [])
 
 
+def _allocate_budget(nodes: list[SubTask], total_budget: float) -> None:
+    total_hours = sum(node.estimated_hours for node in nodes)
+    if total_budget <= 0 or total_hours <= 0:
+        for node in nodes:
+            node.budget = 0.0
+        return
+    order = topological_order(nodes)
+    by_key = {node.key: node for node in nodes}
+    allocated = 0.0
+    for index, key in enumerate(order):
+        node = by_key[key]
+        if index == len(order) - 1:
+            node.budget = round(max(0.0, total_budget - allocated), 2)
+        else:
+            node.budget = round(
+                total_budget * node.estimated_hours / total_hours, 2
+            )
+            allocated = round(allocated + node.budget, 2)
+
+
+def _as_aware(value: datetime) -> datetime:
+    return (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value
+    )
+
+
+def _assign_deadlines(
+    nodes: list[SubTask], parent_deadline: datetime
+) -> None:
+    deadline = _as_aware(parent_deadline)
+    order = topological_order(nodes)
+    by_key = {node.key: node for node in nodes}
+    successors: dict[str, list[str]] = {key: [] for key in by_key}
+    for node in nodes:
+        for dependency in node.depends_on:
+            successors[dependency].append(node.key)
+    after_hours: dict[str, float] = {}
+    for key in reversed(order):
+        after_hours[key] = max(
+            (
+                by_key[successor].estimated_hours
+                + after_hours[successor]
+                for successor in successors[key]
+            ),
+            default=0.0,
+        )
+    for key in order:
+        by_key[key].deadline = deadline - timedelta(
+            hours=after_hours[key]
+        )
+
+
 def _coverage(
     nodes: list[SubTask], items: list[RequirementItem]
 ) -> tuple[dict[str, list[str]], list[str]]:
@@ -517,6 +572,8 @@ def apply_split(
     quantities = _accumulate_quantities(nodes, items, rules)
     _scale_hours(nodes, task.estimated_hours)
     nodes = _build_nodes(nodes, quantities, policy, task.category)
+    _allocate_budget(nodes, task.budget)
+    _assign_deadlines(nodes, task.deadline)
 
     chain_id = draft.chain.chain_id
     edges = [

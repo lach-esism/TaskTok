@@ -76,4 +76,4 @@ def test_readme_test_count_is_current():
     match = re.search(r"当前 (\d+) 个测试", _readme())
     assert match is not None
     # Exact, not a lower bound: adding tests must update README or this fails.
-    assert int(match.group(1)) == 423
+    assert int(match.group(1)) == 459
